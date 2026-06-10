@@ -1,0 +1,32 @@
+# Logs
+*.log
+
+# Cache
+.iism-cache.json
+
+# Temp response files
+*-response.html
+
+# OS
+.DS_Store
+
+# Playwright
+.playwright-mcp/
+
+# Claude
+.claude/
+
+# Screenshots
+screenshots/
+
+# Node (unused)
+node_modules/
+package.json
+package-lock.json
+iism-bot.js
+
+# IDE
+.vscode/
+.idea/
+config.json
+documents/*.png
