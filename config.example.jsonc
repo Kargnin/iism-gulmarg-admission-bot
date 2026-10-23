@@ -1,0 +1,74 @@
+// IISM Gulmarg booking bot - one person's config.
+//
+// Copy this file to config.jsonc (or any name, then run with --config <file>)
+// and replace every FILL_ME - those are the fields the form marks as mandatory (*).
+// Lines starting with // are comments.
+{
+  "applicant": {
+    "name": "FILL_ME",
+    "fatherName": "FILL_ME",
+    "dateOfBirth": "FILL_ME",            // dd/mm/yyyy, e.g. 15/05/1998
+    "nationality": "Indian",
+    "email": "FILL_ME",                  // the payment link is sent here
+    "education": "Graduation",           // High School, Intermediate, Graduation or Post graduation
+    "diet": "Vegetarian",                // Vegetarian or Non-Vegetarian
+    "bloodGroup": "FILL_ME",             // e.g. B+
+    "emergencyContactName": "FILL_ME",
+    "emergencyContactPhone": "FILL_ME",
+
+    // optional (not marked mandatory on the form)
+    "domicile": "",
+    "medicalCategory": "",
+    "height": "",                        // cm
+    "weight": "",                        // kg
+    "waist": "",                         // inches
+    "shoeSize": ""                       // UK size
+  },
+
+  "address": {
+    "houseNo": "FILL_ME",
+    "street": "FILL_ME",
+    "district": "FILL_ME",
+    "state": "FILL_ME",                  // e.g. Maharashtra, Delhi, Karnataka
+    "pincode": "FILL_ME"
+  },
+
+  // The site allows ONE booking per phone number. The 1st number goes after your
+  // best choice that still has seats, the 2nd number after the next choice, and so
+  // on - so you end up with one booking per number, best choices first.
+  // Numbers the site says are already used are skipped.
+  "phoneNumbers": ["FILL_ME"],
+
+  // Your choices, best first. Each one is "<batch> <level or course>".
+  //   Gulmarg: G1 20 Dec-02 Jan, G2 03-16 Jan, G3 17-30 Jan, G4 31 Jan-13 Feb,
+  //            G5 14-27 Feb, G6 28 Feb-13 Mar          Kargil: K1 08-21 Feb, K2 22 Feb-07 Mar
+  //   Levels: Basic, Intermediate, Advance.  Other courses: "G4 Snowboarding", "G5 MOI".
+  // The bot keeps trying a choice until the site shows it is full, then moves to the next.
+  "coursePriorities": ["G2 Basic", "G3 Basic", "G6 Basic"],
+
+  // Stop after this many bookings. 0 = one booking per phone number.
+  "maxBookings": 0,
+
+  // Folder with your documents. "~" is your home folder; names below are inside it.
+  // The site wants JPG/PNG under 500 KB - on a Mac, PDFs and big images are
+  // converted automatically (your originals are not touched).
+  "documentsDir": "~/Documents/IISM",
+  "documents": {
+    "photo": "photo.jpg",                // mandatory
+    "signature": "signature.jpg",        // mandatory
+    "dobProof": "FILL_ME",               // mandatory: Class X marksheet, birth certificate, passport...
+    "educationProof": "FILL_ME",         // mandatory: latest marksheet / degree
+    "parentSignature": "",               // only if the participant is under 18
+    "domicileProof": "",                 // optional
+    "skiingCertificate": "",             // for Intermediate / Advance: your previous course certificate
+    "employmentProof": ""                // optional
+  },
+
+  // Optional tuning - the defaults are fine for booking day.
+  "bot": {
+    "parallel": true,                    // work on several numbers at once (false = one number after another)
+    "notify": true,                      // Mac notification + beep when a seat is booked
+    "parentSignatureFallback": true      // if the site insists on a parent/guardian signature from an
+                                         // adult, resend with your own signature in that slot
+  }
+}
