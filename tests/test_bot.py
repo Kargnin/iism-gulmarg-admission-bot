@@ -26,10 +26,10 @@ spec = importlib.util.spec_from_file_location("iism_bot", HERE.parent / "iism-bo
 bot = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bot)
 
-FAST = {"parallel": True, "notify": False, "preventSleep": False, "startEarlySec": 0, "prePollSec": 0.1,
+FAST = {"parallel": True, "notify": False, "preventSleep": False, "startEarlySec": 0, "pollSec": 0.1,
         "requestTimeoutSec": 2, "submitTimeoutSec": 2, "retryDelaySec": 0.01, "maxRetryDelaySec": 0.05,
-        "fullConfirmations": 2, "openGraceSec": 1, "recheckBlockedSec": 0.3, "maxRejections": 3,
-        "rejectedRetrySec": 0.05, "statusEverySec": 999}
+        "fullConfirmations": 2, "unlistedGraceSec": 1, "seatGraceSec": 1, "recheckBlockedSec": 0.3,
+        "maxRejections": 3, "rejectedRetrySec": 0.05, "statusEverySec": 999}
 PHONES = ["9000000011", "9000000012", "9000000013"]
 
 
@@ -184,6 +184,27 @@ class Matching(unittest.TestCase):
         self.assertEqual(bot.parse_phone("+91 98765 43210"), "9876543210")
         self.assertEqual(bot.parse_phone("098765-43210"), "9876543210")
         self.assertIsNone(bot.parse_phone("12345"))
+
+
+class OpenAndFullRules(unittest.TestCase):
+    def test_rules(self):
+        b = offline_bot()
+        b.opt.update(fullConfirmations=1, unlistedGraceSec=60, seatGraceSec=60)
+        t = b.targets[0]
+        # before any snow course is listed nothing counts - the site may just be late
+        self.assertEqual([b.full_allowed(k) for k in ("shown", "gone", "unlisted")], [False, False, False])
+        self.assertTrue(b.full_allowed("submit"))  # the site refusing a submit always counts
+        b.saw_season()
+        self.assertTrue(b.full_allowed("gone"))        # was listed, now taken off: full
+        self.assertFalse(b.full_allowed("unlisted"))   # never listed: courses come one by one
+        self.assertFalse(b.full_allowed("shown"))      # 0 seats, but no seats seen anywhere yet
+        b.saw_seats(None)
+        self.assertTrue(b.full_allowed("shown"))       # other batches have seats: 0 means full
+        self.assertEqual(b.report_full(t, "0 seats", "shown"), "full")
+        b.saw_seats(t)                                 # seats again: back in play
+        self.assertNotIn(t.index, b.blocked)
+        b.season_seen -= 61
+        self.assertTrue(b.full_allowed("unlisted"))
 
 
 class MockMatchesRealSite(unittest.TestCase):
@@ -347,6 +368,44 @@ class EndToEnd(unittest.TestCase):
         b = self.run_with(PHONES[:1], ["G2 Basic"], bookingOpensAt=when)
         self.assertEqual([x["target"] for x in b.bookings], ["G2 Basic"])
         self.assertGreaterEqual(time.time(), opens)
+
+    def test_courses_listed_earlier_than_announced(self):
+        self.site.opens_at = time.time() + 0.5
+        announced = (bot.now_ist() + timedelta(seconds=120)).isoformat()
+        started = time.time()
+        b = self.run_with(PHONES[:1], ["G2 Basic"], bookingOpensAt=announced, bot={"startEarlySec": 600})
+        self.assertEqual([x["target"] for x in b.bookings], ["G2 Basic"])
+        self.assertLess(time.time() - started, 30)  # did not wait for the announced time
+
+    def test_courses_listed_later_than_announced(self):
+        self.site.opens_at = time.time() + 2.5
+        announced = (bot.now_ist() - timedelta(seconds=30)).isoformat()
+        b = self.run_with(PHONES[:1], ["G2 Basic", "G3 Basic"], bookingOpensAt=announced)
+        self.assertEqual([x["target"] for x in b.bookings], ["G2 Basic"])  # nothing was given up on meanwhile
+        self.assertEqual(b.blocked, {})
+
+    def test_courses_listed_one_by_one(self):
+        later = self.key("K1")[0]
+        self.site.course_opens[later] = time.time() + 2  # the other snow courses are listed right away
+        b = self.run_with(PHONES[:1], ["K1 Basic", "G6 Basic"], bot={"unlistedGraceSec": 10})
+        self.assertEqual([x["target"] for x in b.bookings], ["K1 Basic"])
+
+    def test_new_course_brings_back_a_choice_given_up_on(self):
+        later = self.key("K1")[0]
+        self.site.course_opens[later] = time.time() + 2
+        b = self.run_with(PHONES[:2], ["K1 Basic", "G6 Basic"],
+                          bot={"unlistedGraceSec": 0.2, "recheckBlockedSec": 600})
+        self.assertIn("K1 Basic", [x["target"] for x in b.bookings])
+
+    def test_full_batch_taken_off_the_list(self):
+        self.site.hide_full = True
+        g2 = self.key("G2")[2]
+        for key in self.site.seats:
+            if key[2] == g2:
+                self.site.seats[key] = 0  # every level of G2 is full, so the batch is not shown
+        b = self.run_with(PHONES[:1], ["G2 Basic", "G3 Basic"])
+        self.assertEqual([x["target"] for x in b.bookings], ["G3 Basic"])
+        self.assertTrue(b.blocked[0]["why"].startswith("not listed"))
 
     def test_full_choices_are_rechecked_until_seats_appear(self):
         self.site.seats[self.key("G2")] = 0

@@ -72,14 +72,15 @@ BOT_DEFAULTS = {
     "parallel": True,            # book for several numbers at the same time
     "notify": True,              # Mac notification + terminal bell on a booking
     "preventSleep": True,        # keep the Mac awake while the bot runs (caffeinate)
-    "startEarlySec": 120,        # start this long before the opening time
-    "prePollSec": 10,            # how often to look while booking is not open yet
+    "startEarlySec": 600,        # start looking this long before the published opening time
+    "pollSec": 2,                # until the snow courses are listed, look this often (one number at a time)
     "requestTimeoutSec": 45,
     "submitTimeoutSec": 120,
     "retryDelaySec": 1.0,        # first retry delay; grows with repeated failures ...
     "maxRetryDelaySec": 10.0,    # ... up to this
     "fullConfirmations": 2,      # a choice must look full this many times before moving on
-    "openGraceSec": 900,         # after opening, "0 seats" alone counts as "not open yet" this long
+    "unlistedGraceSec": 300,     # once courses are listed, a batch that never showed up gets this long
+    "seatGraceSec": 120,         # "0 seats" while no batch shows seats counts as full only after this long
     "recheckBlockedSec": 60,     # when every choice is full, look at them again this often
     "maxRejections": 3,          # site rejected the form this often for a choice -> move on
     "rejectedRetrySec": 5,       # pause after the site rejected the form
@@ -211,11 +212,13 @@ class NotOpen(Exception):
 
 
 class TargetFull(Exception):
-    """This choice shows no seats (or is no longer listed)."""
+    """This choice shows no seats, or is not on the list."""
 
-    def __init__(self, message, at_submit=False):
+    def __init__(self, message, kind="shown"):
         super().__init__(message)
-        self.at_submit = at_submit  # the site refused the submit itself, whatever the seat count says
+        # "shown": 0 seats shown; "gone": was listed, now isn't; "unlisted": not listed yet;
+        # "submit": the site refused the submit itself, whatever the seat count says
+        self.kind = kind
 
 
 class Rejected(Exception):
@@ -525,6 +528,12 @@ def match_batch(options, target):
         if score > best_score:
             best, best_score = (value, text), score
     return best
+
+
+def is_season_batch(text, batches):
+    """Whether a dropdown text is one of this season's batches (by its start date)."""
+    found = dates_in(text)
+    return any(date_match(found, b["from"]) == 2 for b in batches.values())
 
 
 def match_choice(options, wanted, aliases=()):
@@ -1227,6 +1236,8 @@ class Session:
         self.blank_returns = 0
         self.static = {}        # page name -> messages that are part of the page itself
         self.http = None
+        self.fresh_needed = True  # the next attempt starts from scratch (see cascade)
+        self.attempt_target = None
         self.restart()
 
     def restart(self, keep=False):
@@ -1236,7 +1247,7 @@ class Session:
             self.entry = None
         self.page = None        # latest admission form page
         self.form_url = None
-        self.steps = []         # cascade steps already applied to self.page
+        self.steps = []         # steps of the current attempt already done on self.page
         self.cursor = 0
 
     # -- plumbing ------------------------------------------------------------
@@ -1311,7 +1322,7 @@ class Session:
             if page.name == FORM_PAGE:
                 self.verdict(page, full_ok=False)
                 self.entry = None
-                self.page, self.form_url, self.steps = page, page.url, []
+                self.page, self.form_url = page, page.url
                 return page
             if page.name == INSTRUCTIONS_PAGE:
                 self.form_url = None
@@ -1346,7 +1357,8 @@ class Session:
         return nxt
 
     def step(self, key, action):
-        """Run a cascade step unless an earlier attempt already got through it."""
+        """Run one step of this attempt, unless a retry of the same attempt already got through it
+        (after a timeout or a 5xx we pick up at the step that failed, on the same session)."""
         i = self.cursor
         self.cursor += 1
         if self.steps[i:i + 1] == [key] and self.page is not None:
@@ -1357,31 +1369,39 @@ class Session:
         return self.page
 
     def cascade(self, target):
-        """Choose course, level, batch, state and date of birth for this target."""
+        """Choose course, level, batch, state and date of birth for this target.
+
+        Each new attempt starts from scratch - new session, mobile number, terms - because the
+        site only shows newly listed courses to a fresh visit (reloading the form isn't enough),
+        courses appear one by one, and they vanish from the list once full. Only a retry after a
+        crash or timeout continues the attempt in progress."""
         bot = self.bot
-        page = self.open_form()
-        courses = course_candidates(page.options("ddlCourse"), target, bot.course_hint.get(target.index))
-        if not courses:
-            self.page = None  # reload the form next time; courses may not be published yet
-            raise NotOpen(f"no course on the form looks like {target.kind}" + listing(page, "ddlCourse"))
-        found, any_batches = None, False
-        for value, text in courses:
-            self.cursor = 0
+        if self.fresh_needed or self.attempt_target is not target:
+            self.restart()
+            self.fresh_needed, self.attempt_target = False, target
+        self.cursor = 0
+        page = self.step(("form",), lambda p: self.open_form())
+        course_options = page.options("ddlCourse")
+        bot.saw_courses(course_options)
+        if bot.season_seen is None and not bot.scan_due(course_options):
+            raise NotOpen("the snow courses are not listed yet" + listing(page, "ddlCourse"))
+        found = None
+        for value, text in course_candidates(course_options, target, bot.course_hint.get(target.index)):
+            self.cursor = 1
             page = self.step(("course", value), lambda p, v=value: self.select(
                 p, "ddlCourse", dict(first_values(p, "ddlCourseLevel", "ddlScheduleCourse"), ddlCourse=v)))
             batches = page.options("ddlScheduleCourse")
-            any_batches = any_batches or bool(real_options(batches))
+            if any(is_season_batch(t, bot.s.batches) for _, t in real_options(batches)):
+                bot.saw_season()
             batch = match_batch(batches, target)
             if batch:
                 found = ((value, text), batch)
                 break
         if not found:
-            # reload the form next time: the course list is filled when the page is first
-            # loaded, so courses published later only show up on a fresh page
-            self.page, self.steps = None, []
-            if not any_batches:
-                raise NotOpen("no batches are listed yet")
-            raise TargetFull(f"{target.when()} is not in the batch list" + listing(page, "ddlScheduleCourse"))
+            if bot.season_seen is None:
+                raise NotOpen("the snow courses are not listed yet" + listing(page, "ddlCourse"))
+            raise TargetFull(f"{target.when()} is not listed" + listing(page, "ddlScheduleCourse"),
+                             kind=bot.unlisted_kind(target))
         course, batch = found
         bot.course_hint[target.index] = course[0]
 
@@ -1390,8 +1410,9 @@ class Session:
         if real_options(level_options):
             level = match_level(level_options, target, loose=kind_score(course[1], target.kind) > 0)
             if level is None:
-                self.steps = []
-                raise TargetFull(f"level {target.level or target.kind} is not listed" + listing(page, "ddlCourseLevel"))
+                raise TargetFull(f"level {target.level or target.kind} is not listed" + listing(page, "ddlCourseLevel"),
+                                 kind=bot.unlisted_kind(target))
+        bot.saw_listed(target)
         values = {"ddlScheduleCourse": batch[0]}
         if level:
             values["ddlCourseLevel"] = level[0]
@@ -1400,9 +1421,8 @@ class Session:
         seats = to_int(page.value("txtAvailableSeat"))
         if seats == 0:
             if bot.needs_evidence():
-                self.probe(batch[0], values)
-            del self.steps[1:]
-            raise TargetFull("0 seats left")
+                self.probe(page, batch[0], values)
+            raise TargetFull("0 seats left", kind="shown")
         if seats:
             bot.saw_seats(target)
 
@@ -1419,19 +1439,17 @@ class Session:
         said = self.msgs(page)
         echoed = page.value("txtDateOfBirth")
         if has_any(" | ".join(said).lower(), AGE_PHRASES) or (echoed is not None and not echoed.strip()):
-            del self.steps[3:]
             raise Rejected(f"date of birth not accepted for {target.label}: {'; '.join(said) or 'date cleared'}",
                            final=True)
         return Selection(course, level, batch, state, seats, page.value("txtCourseFee"), page)
 
-    def probe(self, skip, values):
-        """0 seats this soon after opening can just mean the site is not really open
-        yet: look at up to two other batches to learn whether anything is bookable."""
-        others = [v for v, _ in real_options(self.page.options("ddlScheduleCourse")) if v != skip][:2]
-        del self.steps[1:]
+    def probe(self, page, skip, values):
+        """0 seats right after the courses appear can just mean seats aren't loaded yet:
+        look at up to two other batches to learn whether anything is bookable."""
+        others = [v for v, _ in real_options(page.options("ddlScheduleCourse")) if v != skip][:2]
         for value in others:
-            self.page = self.select(self.page, "ddlScheduleCourse", dict(values, ddlScheduleCourse=value))
-            if (to_int(self.page.value("txtAvailableSeat")) or 0) > 0:
+            page = self.select(page, "ddlScheduleCourse", dict(values, ddlScheduleCourse=value))
+            if (to_int(page.value("txtAvailableSeat")) or 0) > 0:
                 self.bot.saw_seats(None)
                 return
 
@@ -1523,8 +1541,7 @@ class Session:
         if has_any(said, PHONE_USED_PHRASES):
             raise PhoneUsed(reason)
         if has_any(said, FULL_PHRASES):
-            self.steps = []
-            raise TargetFull(f"site says: {reason}", at_submit=True)
+            raise TargetFull(f"site says: {reason}", kind="submit")
         if has_any(said, CLOSED_PHRASES):
             raise NotOpen(f"site says: {reason}")
         if resp.status >= 400 or not resp.is_aspx:
@@ -1533,13 +1550,9 @@ class Session:
             title = resp.title()
             raise Transient(f"submit failed: HTTP {resp.status}" + (f" ({title[:80]})" if title else ""))
         if resp.name in (INSTRUCTIONS_PAGE, CRITERIA_PAGE):
-            self.entry, self.page, self.steps = resp, None, []
+            self.entry, self.page = resp, None
             raise SessionLost("the site sent us back to the start after submitting", resume=True)
         if resp.name == FORM_PAGE:
-            # the form came back: resubmit from it if it still holds our choices, else choose again
-            self.page = resp
-            if resp.value("ddlCourse") != sel.course[0] or resp.value("ddlScheduleCourse") != sel.batch[0]:
-                self.steps = []
             bot = self.bot
             if (has_any(" ".join(msgs).lower(), ("parent", "guardian")) and not bot.parent_fallback
                     and not bot.s.docs.get("parentSignature") and bot.s.docs.get("signature")
@@ -1603,13 +1616,18 @@ class Bot:
         self.state = State(self.out_dir / "state.json", enabled=not dry_run)
         self.bookings = []
         self.booked = {}       # target index -> booking
-        self.blocked = {}      # target index -> {"why", "last"}: full or rejected, re-checked slowly
+        self.blocked = {}      # target index -> {"why", "kind", "last"}: full or rejected, re-checked slowly
         self.full_seen = {}
         self.rejections = {}
         self.claims = {}       # target index -> worker name
         self.phone_state = {p: "free" for p in self.phones}
         self.pending = {}      # phone -> label of a submit whose answer we never saw
-        self.open_evidence = False
+        self.season_seen = None   # when the snow courses first showed up on the form (monotonic)
+        self.known_courses = set()
+        self.listed_once = set()  # targets whose batch has been on the list at some point
+        self.open_evidence = False  # some batch has shown seats
+        self.next_poll = 0.0      # see claim_poll
+        self.last_scan = None     # see scan_due
         self.parent_fallback = False  # send the applicant's signature as the parent/guardian one
         self.course_hint = {}
         self.status = {}
@@ -1645,12 +1663,11 @@ class Bot:
         return delay * random.uniform(0.7, 1.3)
 
     def poll_delay(self):
-        """How long to wait before looking again when nothing is bookable yet. Before opening:
-        every prePollSec, every 2 s in the last 30 s, and never sleeping past the opening moment."""
-        left = (self.opens_at - now_ist()).total_seconds()
-        if left <= 0:
-            return self.backoff(1)
-        return max(0.05, min(left, 2.0 if left <= 30 else self.opt["prePollSec"]))
+        """Wait before looking again while nothing is bookable: every pollSec - whatever the clock
+        says, the site may open early or late - or every 30 s when started long before the
+        published opening time (e.g. with --now)."""
+        early = (self.opens_at - now_ist()).total_seconds() - self.opt["startEarlySec"]
+        return 30.0 if early > 60 else self.opt["pollSec"]
 
     def note(self, who, message, every=60):
         """Log a message, but the same one at most once a minute per worker."""
@@ -1684,6 +1701,8 @@ class Bot:
     def status_line(self):
         with self.lock:
             parts = [f"booked {len(self.bookings)}/{self.wanted}"]
+            if self.season_seen is None:
+                parts.append(f"snow courses not listed yet (checking every {self.opt['pollSec']}s)")
             parts += [f"{w}: {text}" for w, text in sorted(self.status.items())]
             full = [self.targets[i].label for i in sorted(self.blocked)]
             if full:
@@ -1774,12 +1793,14 @@ class Bot:
             for t in free:
                 if t.index not in self.blocked:
                     return self._claim(t.index, worker)
-            # everything left is full (or keeps being rejected): look again now and then,
-            # seats come back when other people's bookings lapse
+            # everything left is full, not listed or keeps being rejected: look again now and
+            # then - seats come back when bookings lapse, and a choice not listed may still be
+            # published (those are looked at every pollSec, so a newly listed course is noticed)
             now = time.monotonic()
             for t in free:
                 b = self.blocked[t.index]
-                if now - b["last"] >= self.opt["recheckBlockedSec"]:
+                every = self.opt["pollSec"] if b.get("kind") == "unlisted" else self.opt["recheckBlockedSec"]
+                if now - b["last"] >= every:
                     b["last"] = now
                     return self._claim(t.index, worker)
             self.release_claims(worker)
@@ -1791,38 +1812,103 @@ class Bot:
                 if w == worker:
                     del self.claims[i]
 
-    def counts_as_full(self):
-        now = now_ist()
-        if now < self.opens_at:
-            return False
-        return self.open_evidence or now >= self.opens_at + timedelta(seconds=self.opt["openGraceSec"])
+    # -- when is the site open, and when is a choice full -------------------
+    # Decided by what the site shows, not by the clock: the courses may be published early or
+    # late, one after another, and a course or batch disappears from the list once it is full.
+
+    def claim_poll(self):
+        """Until the snow courses show up, only one number at a time does the full
+        verify-and-look cycle (every pollSec); the rest wait for its news."""
+        with self.lock:
+            now = time.monotonic()
+            if now < self.next_poll:
+                return False
+            self.next_poll = now + self.poll_delay()
+            return True
+
+    def scan_due(self, course_options):
+        """Before the snow courses show up, look inside the listed courses only when the list
+        changes (or every 30 s); otherwise the verify-and-look cycle alone is enough."""
+        key = tuple(real_options(course_options))
+        with self.lock:
+            now = time.monotonic()
+            if self.last_scan and self.last_scan[0] == key and now - self.last_scan[1] < 30:
+                return False
+            self.last_scan = (key, now)
+            return True
+
+    def saw_courses(self, options):
+        """Note the course list of a freshly verified form. A snow course on it means the season is
+        published. A course that wasn't there before may hold a batch we stopped looking for."""
+        names = {t for _, t in real_options(options)}
+        with self.lock:
+            new = sorted(names - self.known_courses) if self.known_courses else []
+            self.known_courses |= names
+            reopened = [i for i, b in self.blocked.items() if b["kind"] == "unlisted"] if new else []
+            for i in reopened:
+                del self.blocked[i]
+                self.full_seen.pop((i, "unlisted"), None)
+        if new:
+            self.log.info("New on the course list: " + ", ".join(new)
+                          + (f" - looking again for {', '.join(self.targets[i].label for i in reopened)}" if reopened else ""))
+        if any(kind_score(t, kind) > 0 for t in names for kind in KIND_PATTERNS):
+            self.saw_season()
+
+    def saw_season(self):
+        with self.lock:
+            if self.season_seen is not None:
+                return
+            self.season_seen = time.monotonic()
+        self.log.banner(["The snow courses are on the list now - booking."])
+
+    def saw_listed(self, target):
+        with self.lock:
+            self.listed_once.add(target.index)
+
+    def unlisted_kind(self, target):
+        return "gone" if target.index in self.listed_once else "unlisted"
+
+    def full_allowed(self, kind):
+        """Whether a "no seats" sighting of this kind counts yet."""
+        if kind == "submit":
+            return True  # the site refused the submit itself
+        if self.season_seen is None:
+            return False  # nothing is published yet - the site may just be late
+        if kind == "gone":
+            return True  # it was on the list and has been taken off: full
+        listed_for = time.monotonic() - self.season_seen
+        if kind == "shown":  # 0 seats: right away if other batches show seats, else after a grace
+            return self.open_evidence or listed_for >= self.opt["seatGraceSec"]
+        return listed_for >= self.opt["unlistedGraceSec"]  # never listed: courses come one by one
 
     def needs_evidence(self):
-        return not self.open_evidence and now_ist() >= self.opens_at
+        return not self.open_evidence and self.season_seen is not None
 
     def saw_seats(self, target):
         with self.lock:
             self.open_evidence = True
             if target is not None:
-                # a seat count above 0 cancels earlier "0 seats" sightings, but not the site
+                # seats on show cancel earlier "0 seats" / "not listed" sightings, but not the site
                 # refusing a submit for lack of seats (the count shown can be stale)
-                self.full_seen.pop((target.index, "shown"), None)
-                if target.index in self.blocked and self.blocked[target.index]["why"].startswith("full"):
+                for kind in ("shown", "gone", "unlisted"):
+                    self.full_seen.pop((target.index, kind), None)
+                if self.blocked.get(target.index, {}).get("kind") in ("shown", "gone", "unlisted"):
                     del self.blocked[target.index]
                     self.log.info(f"{target.label} shows seats again")
 
-    def report_full(self, target, why, at_submit=False):
-        """Returns 'full' (move on), 'counted' (look again) or 'early' (not open yet)."""
+    def report_full(self, target, why, kind="shown"):
+        """Returns 'full' (move on), 'counted' (look again) or 'early' (doesn't count yet)."""
         with self.lock:
-            if not self.counts_as_full() and not at_submit:
+            if not self.full_allowed(kind):
                 return "early"
-            key = (target.index, "submit" if at_submit else "shown")
-            seen = self.full_seen[key] = self.full_seen.get(key, 0) + 1
+            seen = self.full_seen[(target.index, kind)] = self.full_seen.get((target.index, kind), 0) + 1
             if seen < self.opt["fullConfirmations"] and target.index not in self.blocked:
                 return "counted"
+            what = "not on the list" if kind == "unlisted" else "FULL"
             if target.index not in self.blocked:
-                self.log.warn(f"{target.label} ({target.when()}) is FULL: {why} - moving on to the next choice")
-            self.blocked[target.index] = {"why": f"full: {why}", "last": time.monotonic()}
+                self.log.warn(f"{target.label} ({target.when()}) is {what}: {why} - moving on to the next choice")
+            self.blocked[target.index] = {"why": f"{'not listed' if kind == 'unlisted' else 'full'}: {why}",
+                                          "kind": kind, "last": time.monotonic()}
             self.claims.pop(target.index, None)
             return "full"
 
@@ -1833,7 +1919,8 @@ class Bot:
                 self.log.error(f"{target.label}: " + ("not possible for this applicant" if final else
                                f"the site rejected the form {count} times") + " - moving on. "
                                "Fix the config and restart if this is about your details.")
-                self.blocked[target.index] = {"why": f"rejected: {why}", "last": time.monotonic()}
+                self.blocked[target.index] = {"why": f"rejected: {why}", "kind": "rejected",
+                                              "last": time.monotonic()}
                 self.claims.pop(target.index, None)
                 self.rejections[target.index] = 0
 
@@ -1933,6 +2020,10 @@ class Worker(threading.Thread):
                 bot.set_status(self.name, f"{mask(phone)} waiting - every open choice is booked, full or taken")
                 bot.sleep(min(5.0, bot.opt["recheckBlockedSec"]))
                 continue
+            if bot.season_seen is None and session.fresh_needed and not bot.claim_poll():  # retries skip the queue
+                bot.set_status(self.name, f"{mask(phone)} -> {target.label}: waiting for the snow courses to be listed")
+                bot.sleep(0.25)
+                continue
             if target is not current:
                 log.info(f"{who}going for {target.label} ({target.when()})")
                 current, attempts = target, 0
@@ -1945,32 +2036,36 @@ class Worker(threading.Thread):
                 bot.phone_used(phone, session.unconfirmed, str(e))
                 return
             except TargetFull as e:
-                verdict = bot.report_full(target, str(e), e.at_submit)
+                session.fresh_needed = True
+                verdict = bot.report_full(target, str(e), e.kind)
                 if verdict == "early":
-                    bot.note(who, f"{target.label}: {e} - booking is not open yet, checking again until it is")
+                    bot.note(who, f"{target.label}: {e} - not counting it as full yet, checking again")
                 elif verdict == "counted":
                     log.info(f"{who}{target.label}: {e} - checking again")
-                bot.sleep(bot.poll_delay() if verdict != "full" else 0)
+                bot.sleep(0 if verdict == "full" else bot.poll_delay())
             except NotOpen as e:
+                session.fresh_needed = True
                 bot.note(who, f"not open yet: {e}")
-                bot.sleep(bot.poll_delay())
+                if bot.season_seen is not None:  # before that, claim_poll paces the checks
+                    bot.sleep(bot.poll_delay())
             except SessionLost as e:
-                log.info(f"{who}{e} - verifying the number again")
-                session.restart(keep=e.resume)
+                session.fresh_needed = True
+                log.info(f"{who}{e} - starting over with the number")
                 bot.sleep(bot.backoff(1))
             except Rejected as e:
+                session.fresh_needed = True
                 log.error(f"{who}{target.label}: site rejected the form: {e}")
                 bot.report_rejected(target, str(e), e.final)
                 bot.sleep(0 if e.final else bot.opt["rejectedRetrySec"])
             except Transient as e:
+                # retry the step that failed; start over only if the same attempt keeps failing
                 fails = 1 if session.progress > progress else fails + 1
+                session.fresh_needed = session.fresh_needed or fails >= 6
                 log.info(f"{who}{e} - retrying" + (f" ({fails} failures in a row)" if fails > 1 else ""))
-                if fails % 25 == 0:
-                    session.restart()
                 bot.sleep(bot.backoff(fails))
             except Exception:
+                session.fresh_needed = True
                 log.error(f"{who}unexpected problem, starting over:\n{traceback.format_exc(limit=6)}")
-                session.restart()
                 bot.sleep(bot.backoff(5))
             else:
                 bot.record_booking(phone, target, info)
@@ -1992,7 +2087,8 @@ def describe_plan(settings, log, dry_run=False):
 
 
 def wait_for_opening(settings, log, stop):
-    """Sleep until shortly before booking opens (wall clock, survives Mac sleep)."""
+    """Sleep until startEarlySec before the announced opening (wall clock, survives Mac sleep).
+    From then on the bot looks every pollSec and books whenever the courses actually appear."""
     if settings.opens_at is None:
         return
     start_at = settings.opens_at - timedelta(seconds=settings.opt["startEarlySec"])
@@ -2004,8 +2100,9 @@ def wait_for_opening(settings, log, stop):
         every = 60 if left < 900 else 900
         if time.monotonic() - last_said >= every or last_said == 0:
             last_said = time.monotonic()
-            log.info(f"Booking opens {fmt_when(settings.opens_at)}. Starting in {fmt_duration(left)} - "
-                     "keep this window open and the laptop awake.")
+            log.info(f"Booking is announced for {fmt_when(settings.opens_at)}. Looking for the snow courses from "
+                     f"{start_at.astimezone(IST):%H:%M} (in {fmt_duration(left)}) - keep this window open and the "
+                     "laptop awake.")
         if stop.wait(min(30, left)):
             return
 
@@ -2100,10 +2197,10 @@ def run_discover(bot, phone):
     log.info(f"Courses on the form: {len(courses)}")
     for value, text in courses:
         def choose(v=value):
+            session.restart()
             p = session.open_form()
-            session.page = session.select(p, "ddlCourse",
-                                          dict(first_values(p, "ddlCourseLevel", "ddlScheduleCourse"), ddlCourse=v))
-            return session.page
+            return session.select(p, "ddlCourse",
+                                  dict(first_values(p, "ddlCourseLevel", "ddlScheduleCourse"), ddlCourse=v))
         try:
             p = with_retries(bot, choose)
         except (TargetFull, NotOpen) as e:
@@ -2113,10 +2210,8 @@ def run_discover(bot, phone):
         log.info(f"      levels:  {' | '.join(t for _, t in real_options(p.options('ddlCourseLevel'))) or '-'}")
         for v, t in real_options(p.options("ddlScheduleCourse")):
             log.info(f"      batch:   {t}")
-    session.steps = []
     log.info("Your choices on today's site:")
     for target in bot.targets:
-        session.steps = []
         try:
             sel = with_retries(bot, lambda: session.cascade(target))
             log.info(f"  {target.label:<18} -> {sel}")

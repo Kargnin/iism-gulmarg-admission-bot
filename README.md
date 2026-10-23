@@ -95,12 +95,29 @@ away with the applicant's own signature in that slot. Set `"parentSignatureFallb
 
 Nothing has to be run beforehand: the bot does everything itself when you start it.
 
-1. Before 10:00, plug in the laptop and run `python3 iism-bot.py`. It checks your config and documents, waits, starts
-   at 09:58, keeps the Mac awake, and looks at the form every few seconds (every 2 s in the last 30 s). Don't close the lid.
-2. At 10:00 the snow courses appear and it books straight away. It prints a status line every 30 s, and a banner plus a
-   Mac notification for every booking.
+1. Some time before 10:00, plug in the laptop and run `python3 iism-bot.py`. It checks your config and documents, keeps
+   the Mac awake, and from 09:50 starts looking for the snow courses. Don't close the lid.
+2. It books as soon as the courses are actually on the site, whether that's early, at 10:00 or late. It prints a status
+   line every 30 s, and a banner plus a Mac notification for every booking.
 3. Afterwards, watch the email for the payment link(s). The fee is non-refundable, the site allows one course per person
    per year, and unpaid bookings lapse, so pay only for the batch you will attend.
+
+### How it copes with the site on the day
+
+- **Opening time is just a hint.** The bot starts looking 10 minutes early (`startEarlySec`) and keeps looking every
+  2 s (`pollSec`) until the snow courses appear, however late that is. Nothing is skipped as "full" before then.
+- **The site only shows new courses to a fresh visit.** Reloading the form isn't enough: you have to enter the mobile
+  number and accept the terms again. So every new attempt starts from scratch, with a new session, the mobile number,
+  the terms, and then the current course list. Until the courses appear, only one of your numbers does this every 2 s;
+  once they're listed, all numbers book in parallel.
+- **Crashes don't throw work away.** If a request times out or the site answers 500/503 in the middle of an attempt, the
+  bot retries that step on the same session instead of starting over. After 6 failures in a row it starts afresh.
+- **Courses come one by one.** If your choice's batch isn't listed yet while other snow courses are, the bot keeps
+  checking it for up to 5 minutes (`unlistedGraceSec`) before moving to your next choice. Even then it keeps looking, and
+  goes straight back if a new course appears on the list.
+- **Full courses disappear.** A batch that was listed and has been taken off the list counts as full right away. So
+  does "0 seats" once other batches show seats, or 2 minutes after the courses appeared (`seatGraceSec`). So does the
+  site saying "no seats" when you submit. Full choices are still rechecked every minute in case seats come back.
 
 Optional extras (the run itself doesn't depend on them):
 
@@ -108,7 +125,7 @@ Optional extras (the run itself doesn't depend on them):
 |---|---|
 | `python3 iism-bot.py --check` | check config and documents and that the site answers, any time before (sends nothing) |
 | `python3 iism-bot.py --discover [--phone N]` | walk the live form and list what it offers (never submits; useless before 10:00 since the snow courses aren't listed yet) |
-| `python3 iism-bot.py --now` | book, starting immediately instead of waiting for 09:58 |
+| `python3 iism-bot.py --now` | book, starting immediately instead of waiting until 10 minutes before opening |
 | `python3 iism-bot.py --dry-run` | full run that stops right before each final submit |
 | `python3 iism-bot.py --reset-state` | forget saved progress for this config |
 
@@ -126,9 +143,9 @@ Plain HTTP, like a browser without JavaScript:
 4. Submit: every field, the documents, `chkIAgree`, `btnSubmit`.
 
 Every reload posts back exactly what the page contained, so hidden and validation fields stay correct. Dropdown
-choices are matched against what the site actually lists. Any step that fails is retried from where it stopped, not
-from the beginning. Before opening time, "no seats" means "not open yet", so nothing gets marked full. A batch only counts
-as full after the site shows it full twice.
+choices are matched against what the site actually lists. Each attempt starts with steps 1–2 on a new session (that's
+the only way to see newly listed courses). A crash in the middle is retried from the step that failed. A batch only
+counts as full after the site shows it full twice.
 
 What is known about the site and what is assumed: the pages, fields, validators, reloads and messages up to the
 submit were copied from the live site on 23 Oct 2026. The submit's success page and the wording for a used number or a
@@ -148,8 +165,11 @@ python3 -m unittest discover -s tests -v
 Rehearse a whole booking locally, crashes included:
 
 ```bash
-python3 tests/mock_site.py --port 8765 --chaos 0.4 --opens-in 60
+python3 tests/mock_site.py --port 8765 --chaos 0.4 --opens-in 60 --stagger 20 --hide-full
 ```
+
+(`--opens-in`: seconds until the snow courses appear; `--stagger`: they appear 20 s apart; `--hide-full`: full
+batches drop off the list. Like the real site, it shows new courses only to a fresh visit.)
 
 ```bash
 python3 iism-bot.py --base-url http://127.0.0.1:8765 --now

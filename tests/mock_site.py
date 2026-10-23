@@ -285,6 +285,8 @@ class Site:
         self.full_style = full_style      # "label" or "alert"
         self.success_style = success_style  # "redirect", "alert" or "payment"
         self.shown_seats = {}             # seat counts the batch page shows instead of the real ones (stale)
+        self.course_opens = {}            # course value -> epoch seconds it gets listed (default: opens_at)
+        self.hide_full = False            # take full batches (and fully booked courses) off the list
         self.check_used_at_start = True   # False: a used number gets through verification, refused at submit
         self.fail_success_page = 0        # this many success pages fail to load (503) after the redirect
         # The form asks for a parent/guardian signature "if participant is under 18", but its required check
@@ -589,13 +591,31 @@ class Handler(BaseHTTPRequestHandler):
         if values.get("__EVENTTARGET") != "lnkbtnNext" or values.get("chkAccept") != "on":
             return self.send(200, self.criteria(sess["mobile"], "Please accept the terms and conditions."))
         sess["accepted"] = True
+        # The course list a visit gets is fixed here: reloading the form later doesn't show newly
+        # listed courses, only starting over (mobile number + terms) does.
+        sess["courses"] = self.listed_now()
         self.redirect(f"/admission_form.aspx?mobile={sess['mobile']}")
 
     # -- the admission form ---------------------------------------------------
 
+    def open_batches(self, cv):
+        """Batches of a course on show; with hide_full, a batch with no seats left at any level is gone."""
+        course = self.site.courses[cv]
+        if not self.site.hide_full:
+            return course["batches"]
+        return [b for b in course["batches"]
+                if any(self.site.seats.get((cv, lv, b[0]), 0) > 0 for lv, _ in course["levels"])]
+
     def listed_now(self):
-        is_open = time.time() >= self.site.opens_at
-        return [cv for cv, c in self.site.courses.items() if is_open or c.get("always")]
+        site, now = self.site, time.time()
+        listed = []
+        for cv, c in site.courses.items():
+            if not (c.get("always") or now >= site.course_opens.get(cv, site.opens_at)):
+                continue  # not published yet
+            if site.hide_full and c["kind"] != "adventure" and not self.open_batches(cv):
+                continue  # every batch is full: the course is taken off the list
+            listed.append(cv)
+        return listed
 
     def state_of(self, v, listed):
         """Course, level and batch the posted values point at (None where nothing valid is chosen)."""
@@ -646,7 +666,8 @@ class Handler(BaseHTTPRequestHandler):
         selects = {
             "ddlCourse": [("0", "Select Course")] + [(cv, self.site.courses[cv]["name"]) for cv in listed],
             "ddlCourseLevel": [("0", "Select Course Level")] + (course["levels"] if course else []),
-            "ddlScheduleCourse": [("0", "Select Schedule Course")] + ([b[:2] for b in course["batches"]] if course else []),
+            "ddlScheduleCourse": [("0", "Select Schedule Course")] + (
+                [b[:2] for b in self.open_batches(v["ddlCourse"])] if course else []),
             "ddlState": STATES, "ddlEduationQualification": EDUCATION, "ddlVegetarianOrNon": DIET,
         }
         token = self.viewstate({name: [o for o, _ in opts] for name, opts in selects.items()}, listed)
@@ -724,7 +745,7 @@ class Handler(BaseHTTPRequestHandler):
     def get_form(self, sess, query):
         if not sess["accepted"] or sess["mobile"] != query.get("mobile"):
             return self.redirect("/Admission_instructions.aspx")
-        self.send(200, self.form(sess["mobile"], {}, self.listed_now()))
+        self.send(200, self.form(sess["mobile"], {}, sess.get("courses", [])))
 
     def post_form(self, sess, query, v, files):
         site = self.site
@@ -862,10 +883,16 @@ def main():
     ap.add_argument("--full", default="", help="comma-separated batch values with no seats, e.g. 71,72")
     ap.add_argument("--parent-signature-required", action="store_true",
                     help="refuse adults' forms without a parent/guardian signature")
+    ap.add_argument("--stagger", type=float, default=0, help="seconds between the snow courses appearing one by one")
+    ap.add_argument("--hide-full", action="store_true", help="take full batches and courses off the list")
     args = ap.parse_args()
     site = Site(layout=args.layout, chaos=args.chaos, session_loss=args.session_loss, restarts=args.restarts,
                 opens_at=time.time() + args.opens_in)
     site.parent_signature_required = args.parent_signature_required
+    site.hide_full = args.hide_full
+    snow = [cv for cv, c in site.courses.items() if c["kind"] != "adventure"]
+    for n, cv in enumerate(snow):
+        site.course_opens[cv] = site.opens_at + n * args.stagger
     full = {s for s in args.full.split(",") if s}
     for key in site.seats:
         if site.courses[key[0]]["kind"] != "adventure":
