@@ -321,6 +321,7 @@ class EndToEnd(unittest.TestCase):
                 b = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], bot={"parallel": False})
                 self.assertEqual(self.booked(b), [("G2 Basic", PHONES[1], "confirmed")])
                 self.assertEqual(b.phone_state[PHONES[0]], "used")
+                self.assertIn("NEEDS YOUR ATTENTION: number ..0011 is already registered", (self.out / "bot.log").read_text())
 
     def test_number_refused_at_submit_is_not_a_booking(self):
         self.site.used = {PHONES[0]}
@@ -352,6 +353,7 @@ class EndToEnd(unittest.TestCase):
         self.site.slow_seconds = 2.5
         b = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], timeout=150)
         self.assertEqual(sorted(x["target"] for x in b.bookings), ["G2 Basic", "G3 Basic"])
+        self.assertNotIn("NEEDS YOUR ATTENTION", (self.out / "bot.log").read_text())  # server trouble: no alerts
         self.assertEqual(self.applied(), sorted([self.key("G2"), self.key("G3")]))
 
     def test_lost_reply_after_submit_counts_as_booked(self):
@@ -396,6 +398,31 @@ class EndToEnd(unittest.TestCase):
         b = self.run_with(PHONES[:2], ["K1 Basic", "G6 Basic"],
                           bot={"unlistedGraceSec": 0.2, "recheckBlockedSec": 600})
         self.assertIn("K1 Basic", [x["target"] for x in b.bookings])
+
+    def test_alert_when_a_batch_cannot_be_found(self):
+        moved = {"from": "2027-01-05", "location": "Gulmarg", "level": "Basic", "label": "G2 moved"}  # not on the site
+        b = self.run_with(PHONES[:1], [moved], timeout=3, bot={"missingAlertSec": 0.5})
+        self.assertEqual(b.bookings, [])
+        self.assertEqual(b.alerted, {0})
+        log = (self.out / "bot.log").read_text()
+        self.assertEqual(log.count("NEEDS YOUR ATTENTION: can't find G2 moved"), 1)  # once, not on every check
+        self.assertIn("Course from 03 Jan to 16 Jan 2027", log)  # shows what the site lists
+
+    def test_alert_when_a_level_cannot_be_found(self):
+        b = self.run_with(PHONES[:1], [{"batch": "G2", "levelText": "Expert", "label": "G2 Expert"}],
+                          timeout=3, bot={"missingAlertSec": 0.5})
+        self.assertEqual(b.bookings, [])
+        self.assertEqual(b.alerted, {0})
+        self.assertIn("levels", (self.out / "bot.log").read_text())
+
+    def test_refused_number_is_announced_then_skipped(self):
+        self.site.refuse_numbers = {PHONES[0]: "Please Enter Valid Mobile No."}
+        b = self.run_with(PHONES[:2], ["G2 Basic"], bot={"parallel": False})
+        self.assertEqual(self.booked(b), [("G2 Basic", PHONES[1], "confirmed")])
+        log = (self.out / "bot.log").read_text()
+        self.assertEqual(log.count("NEEDS YOUR ATTENTION: the site refuses number ..0011"), 2)  # warning, then dropped
+        self.assertIn("Number ..0011 is skipped for the rest of this run", log)
+        self.assertIn("check phoneNumbers in your config", log)
 
     def test_full_batch_taken_off_the_list(self):
         self.site.hide_full = True
@@ -446,6 +473,7 @@ class EndToEnd(unittest.TestCase):
         b = self.run_with(PHONES[:1], ["G2 Basic", "G3 Basic"], applicant={"dateOfBirth": "15/05/1970"}, timeout=5)
         self.assertEqual(b.bookings, [])
         self.assertEqual(sorted(i for i, x in b.blocked.items() if "Age Allow 10 To 40" in x["why"]), [0, 1])
+        self.assertIn("isn't possible for this applicant", (self.out / "bot.log").read_text())
         self.assertEqual(self.site.applications, [])
 
     def test_dry_run_submits_nothing(self):
@@ -461,6 +489,9 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(b.bookings, [])
         self.assertTrue(b.blocked[0]["why"].startswith("rejected"))
         self.assertIn("Please Enter Valid Email ID", b.blocked[0]["why"])
+        log = (self.out / "bot.log").read_text()
+        self.assertEqual(log.count("NEEDS YOUR ATTENTION: the site refused the form"), 1)  # once, not every retry
+        self.assertIn("check applicant.email in your config", log)
 
     def test_missing_required_document_is_caught_before_booking(self):
         cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"])

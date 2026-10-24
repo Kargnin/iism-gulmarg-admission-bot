@@ -286,6 +286,7 @@ class Site:
         self.success_style = success_style  # "redirect", "alert" or "payment"
         self.shown_seats = {}             # seat counts the batch page shows instead of the real ones (stale)
         self.course_opens = {}            # course value -> epoch seconds it gets listed (default: opens_at)
+        self.refuse_numbers = {}          # mobile -> message the first page answers it with (e.g. "invalid")
         self.hide_full = False            # take full batches (and fully booked courses) off the list
         self.check_used_at_start = True   # False: a used number gets through verification, refused at submit
         self.fail_success_page = 0        # this many success pages fail to load (503) after the redirect
@@ -558,6 +559,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, self.instructions())
         if not re.fullmatch(r"\d{10}", mobile):
             return self.send(200, self.instructions("Please Enter Valid Mobile No."))
+        if mobile in self.site.refuse_numbers:
+            return self.send(200, self.instructions(self.site.refuse_numbers[mobile]))
         if mobile in self.site.used and self.site.check_used_at_start:
             msg = "This Mobile No. is already registered."
             if self.site.used_style == "alert":

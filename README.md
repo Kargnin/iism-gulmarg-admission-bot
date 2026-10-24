@@ -119,6 +119,23 @@ Nothing has to be run beforehand: the bot does everything itself when you start 
   does "0 seats" once other batches show seats, or 2 minutes after the courses appeared (`seatGraceSec`). So does the
   site saying "no seats" when you submit. Full choices are still rechecked every minute in case seats come back.
 
+### Alerts: when you need to step in
+
+Server trouble is never alerted: timeouts, 500/503, error pages, lost sessions, "not open yet" and "full" are simply
+retried. Anything only you can fix gets a **NEEDS YOUR ATTENTION** banner in the terminal, a beep and a Mac
+notification. The banner shows what the site said and which config key to fix:
+
+- the site refuses the form over a field ("Please Enter Valid Email ID", a document's type or size, a missing upload)
+- your state, education or diet isn't one of the site's options
+- your age is outside a course's limit, so that choice is skipped
+- the site refuses one of your mobile numbers with a message (after 3 times, that number is dropped for this run)
+- a number turns out to be already registered (it's skipped, the others carry on)
+- the snow courses are listed but one of your choices still can't be found after 30 s (`missingAlertSec`), shown
+  with every course and batch the site lists
+
+Each alert appears once, and again at most every 10 minutes if the problem keeps happening. The bot keeps going
+meanwhile. Fix the config and restart with `python3 iism-bot.py --now`; bookings made so far are kept.
+
 Optional extras (the run itself doesn't depend on them):
 
 | Command | |

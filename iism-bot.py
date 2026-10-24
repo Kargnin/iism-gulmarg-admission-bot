@@ -82,6 +82,7 @@ BOT_DEFAULTS = {
     "unlistedGraceSec": 300,     # once courses are listed, a batch that never showed up gets this long
     "seatGraceSec": 120,         # "0 seats" while no batch shows seats counts as full only after this long
     "recheckBlockedSec": 60,     # when every choice is full, look at them again this often
+    "missingAlertSec": 30,       # courses listed but a choice still can't be found after this long: alert
     "maxRejections": 3,          # site rejected the form this often for a choice -> move on
     "rejectedRetrySec": 5,       # pause after the site rejected the form
     # The form's own check asks for a parent/guardian signature even from adults. If the site
@@ -151,6 +152,41 @@ SUCCESS_PHRASES = [
     "successfully saved", "application received",
 ]
 AGE_PHRASES = ["age allow", "not eligible", "age should", "age must", "age limit", "invalid date"]
+
+# Words in the site's (or our own) message -> what in the config to look at. Most specific first.
+FIX_HINTS = [
+    (("address.state",), "address.state"), (("applicant.education",), "applicant.education"),
+    (("applicant.diet",), "applicant.diet"),
+    (("email",), "applicant.email"),
+    (("upload date of birth",), "documents.dobProof"),
+    (("dateofbirth", "date of birth", "dd/mm/yyyy", "your age", "age allow"), "applicant.dateOfBirth"),
+    (("photo of applicant",), "documents.photo"),
+    (("signature of applicant",), "documents.signature"),
+    (("parent", "guardian"), "documents.parentSignature"),
+    (("passbook",), "documents.educationProof"),            # (sic) the site's message for the education upload
+    (("eduation qualification", "education qualification"), "applicant.education"),
+    (("domicile",), "applicant.domicile / documents.domicileProof"),
+    (("1mb", "file size", "files & size", "only ."), "the document files (JPG/PNG under 500 KB)"),
+    (("father",), "applicant.fatherName"), (("enter name",), "applicant.name"),
+    (("nationality",), "applicant.nationality"), (("house", "apartment"), "address.houseNo"),
+    (("street", "village", "colony"), "address.street"), (("district",), "address.district"),
+    (("pincode", "pin code"), "address.pincode"), (("mobile",), "phoneNumbers"),
+    (("blood",), "applicant.bloodGroup"), (("emergency contact name",), "applicant.emergencyContactName"),
+    (("emergency contact phone",), "applicant.emergencyContactPhone"), (("state",), "address.state"),
+    (("vegetarian",), "applicant.diet"),
+]
+RESTART_HINT = "then restart with:  python3 iism-bot.py --now   (bookings made so far are kept)"
+
+
+def fix_hint(message):
+    said = message.lower()
+    keys = []
+    for words, key in FIX_HINTS:
+        if has_any(said, words) and key not in keys:
+            keys.append(key)
+    if keys:
+        return f"check {', '.join(keys)} in your config, {RESTART_HINT}"
+    return f"read the message above (and the saved page in runs/), fix your config, {RESTART_HINT}"
 FULL_PHRASES = [
     "no seat", "seats are full", "seat is full", "seats full", "seat full",
     "seat not available", "seats not available", "no vacanc", "vacancies are full",
@@ -191,6 +227,15 @@ class Transient(Exception):
     """Temporary trouble (network, 5xx, error page): retry the same step."""
 
 
+class Refused(Transient):
+    """The site answered with a message instead of moving on - not a server error, so something
+    we send may need fixing. Retried like Transient, but counted and announced."""
+
+    def __init__(self, message, what):
+        super().__init__(message)
+        self.what = what  # "number": the mobile number was refused; "criteria": the terms page
+
+
 class Resend(Transient):
     """The site refused the form for something we can fix ourselves: send it again."""
 
@@ -214,11 +259,12 @@ class NotOpen(Exception):
 class TargetFull(Exception):
     """This choice shows no seats, or is not on the list."""
 
-    def __init__(self, message, kind="shown"):
+    def __init__(self, message, kind="shown", site_lists=None):
         super().__init__(message)
         # "shown": 0 seats shown; "gone": was listed, now isn't; "unlisted": not listed yet;
         # "submit": the site refused the submit itself, whatever the seat count says
         self.kind = kind
+        self.site_lists = site_lists or []  # what the site showed instead, for the "can't find it" alert
 
 
 class Rejected(Exception):
@@ -503,7 +549,7 @@ def match_level(options, target, loose):
         pick = next((o for o in real if kind_score(o[1], target.kind) > 0), None)
         if pick is None and loose and real:
             pick = real[0]  # e.g. the only level of the snowboarding course
-    if pick is None and real and all(norm(t) in GENERIC_LEVELS for _, t in real):
+    if pick is None and not target.level_text and real and all(norm(t) in GENERIC_LEVELS for _, t in real):
         pick = real[0]  # the course has no real levels, just "None"
     return pick
 
@@ -962,12 +1008,12 @@ class Log:
             self.write(level, line)
 
 
-def notify(title, message):
+def notify(title, message, sound="Glass"):
     sys.stdout.write("\a")
     sys.stdout.flush()
     if sys.platform == "darwin" and shutil.which("osascript"):
         script = (f"display notification {json.dumps(message, ensure_ascii=False)} "
-                  f"with title {json.dumps(title, ensure_ascii=False)} sound name \"Glass\"")
+                  f"with title {json.dumps(title, ensure_ascii=False)} sound name {json.dumps(sound)}")
         try:
             subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
@@ -1321,6 +1367,7 @@ class Session:
             page = self.entry
             if page.name == FORM_PAGE:
                 self.verdict(page, full_ok=False)
+                self.bot.number_accepted(self.phone)
                 self.entry = None
                 self.page, self.form_url = page, page.url
                 return page
@@ -1330,13 +1377,17 @@ class Session:
                 self.entry = nxt
                 said = self.verdict(nxt, deep=nxt.name == INSTRUCTIONS_PAGE, full_ok=False)
                 if nxt.name == INSTRUCTIONS_PAGE:
-                    raise Transient("mobile verification did not go through" + (f": {'; '.join(said)}" if said else ""))
+                    if said:
+                        raise Refused(f"the site refused mobile number {mask(self.phone)}: {'; '.join(said)}", "number")
+                    raise Transient("mobile verification did not go through")
             elif page.name == CRITERIA_PAGE:
                 nxt = self.checked(self.postback(page, "lnkbtnNext", {"chkAccept": "on"}))
                 self.entry = nxt
                 said = self.verdict(nxt, deep=nxt.name == CRITERIA_PAGE, full_ok=False)
                 if nxt.name == CRITERIA_PAGE:
-                    raise Transient("the criteria page did not move on" + (f": {'; '.join(said)}" if said else ""))
+                    if said:
+                        raise Refused(f"the terms page did not move on: {'; '.join(said)}", "criteria")
+                    raise Transient("the criteria page did not move on")
             else:
                 self.entry = None
                 raise Transient(f"unexpected page '{page.name}'")
@@ -1385,12 +1436,13 @@ class Session:
         bot.saw_courses(course_options)
         if bot.season_seen is None and not bot.scan_due(course_options):
             raise NotOpen("the snow courses are not listed yet" + listing(page, "ddlCourse"))
-        found = None
+        found, seen = None, {}  # seen: course -> its batches, to show if the choice can't be found
         for value, text in course_candidates(course_options, target, bot.course_hint.get(target.index)):
             self.cursor = 1
             page = self.step(("course", value), lambda p, v=value: self.select(
                 p, "ddlCourse", dict(first_values(p, "ddlCourseLevel", "ddlScheduleCourse"), ddlCourse=v)))
             batches = page.options("ddlScheduleCourse")
+            seen[text] = [t for _, t in real_options(batches)]
             if any(is_season_batch(t, bot.s.batches) for _, t in real_options(batches)):
                 bot.saw_season()
             batch = match_batch(batches, target)
@@ -1400,8 +1452,12 @@ class Session:
         if not found:
             if bot.season_seen is None:
                 raise NotOpen("the snow courses are not listed yet" + listing(page, "ddlCourse"))
+            lists = [f"{course}: {' | '.join(found_batches) or '(no batches)'}" for course, found_batches in seen.items()]
+            others = [t for _, t in real_options(course_options) if t not in seen]
+            if others:
+                lists.append("not opened (another kind of course): " + " | ".join(others))
             raise TargetFull(f"{target.when()} is not listed" + listing(page, "ddlScheduleCourse"),
-                             kind=bot.unlisted_kind(target))
+                             kind=bot.unlisted_kind(target), site_lists=lists)
         course, batch = found
         bot.course_hint[target.index] = course[0]
 
@@ -1410,8 +1466,9 @@ class Session:
         if real_options(level_options):
             level = match_level(level_options, target, loose=kind_score(course[1], target.kind) > 0)
             if level is None:
+                levels = " | ".join(t for _, t in real_options(level_options))
                 raise TargetFull(f"level {target.level or target.kind} is not listed" + listing(page, "ddlCourseLevel"),
-                                 kind=bot.unlisted_kind(target))
+                                 kind=bot.unlisted_kind(target), site_lists=[f"{course[1]} / {batch[1]}: levels {levels}"])
         bot.saw_listed(target)
         values = {"ddlScheduleCourse": batch[0]}
         if level:
@@ -1431,7 +1488,7 @@ class Session:
         if state_options is not None:
             state = match_choice(state_options, bot.s.state, state_aliases(bot.s.state))
             if state is None:
-                raise Rejected(f"state \"{bot.s.state}\" is not in the site's list" + listing(page, "ddlState"))
+                raise Rejected(f"address.state \"{bot.s.state}\" is not in the site's list" + listing(page, "ddlState"))
             page = self.step(("state", state[0]), lambda p: self.select(p, "ddlState", {"ddlState": state[0]}))
         dob = bot.s.applicant.get("dateOfBirth", "")
         page = self.step(("dob", dob), lambda p: self.select(p, "txtDateOfBirth", {"txtDateOfBirth": dob}))
@@ -1463,14 +1520,15 @@ class Session:
             values["ddlCourseLevel"] = sel.level[0]
         if sel.state:
             values["ddlState"] = sel.state[0]
-        for field, wanted in (("ddlEduationQualification", bot.s.education), ("ddlVegetarianOrNon", bot.s.diet)):
+        for field, key, wanted in (("ddlEduationQualification", "applicant.education", bot.s.education),
+                                   ("ddlVegetarianOrNon", "applicant.diet", bot.s.diet)):
             options = page.options(field)
             if options is None:
                 values[field] = wanted
                 continue
             pick = match_choice(options, wanted)
             if pick is None:
-                raise Rejected(f"\"{wanted}\" is not an option for {field}" + listing(page, field))
+                raise Rejected(f"{key} \"{wanted}\" is not one of the site's options" + listing(page, field))
             values[field] = pick[0]
         files = {}
         for key, input_name, flag, _ in DOCUMENTS:
@@ -1628,6 +1686,9 @@ class Bot:
         self.open_evidence = False  # some batch has shown seats
         self.next_poll = 0.0      # see claim_poll
         self.last_scan = None     # see scan_due
+        self.alerted = set()      # choices we raised the "can't find it" alert for
+        self.attention_seen = {}  # issue -> when it was last announced (see attention)
+        self.refusals = {}        # (phone, what) -> refusals in a row (see Refused)
         self.parent_fallback = False  # send the applicant's signature as the parent/guardian one
         self.course_hint = {}
         self.status = {}
@@ -1775,6 +1836,30 @@ class Bot:
                                                     "at": now_ist().isoformat(timespec="seconds")}
                 self.state.save()
         self.log.warn(f"Number {mask(phone)} is already used on the site ({why}) - switching to the next number")
+        self.attention(("used", phone), f"number {mask(phone)} is already registered on the site",
+                       [f"Site says: {why}", "It is skipped; your other numbers carry on."],
+                       f"if that's unexpected, check phoneNumbers (or add another number), {RESTART_HINT}")
+
+    def number_refused(self, phone, what, why):
+        """The site keeps answering our mobile number (or the terms page) with a message.
+        Announce it after 2 in a row; give up on the number after maxRejections."""
+        with self.lock:
+            count = self.refusals[(phone, what)] = self.refusals.get((phone, what), 0) + 1
+            give_up = what == "number" and count >= self.opt["maxRejections"]
+            if give_up:
+                self.phone_state[phone] = "used"  # this run only - not saved, the next run tries it again
+        if count >= 2:
+            subject = f"the site refuses number {mask(phone)}" if what == "number" else "the terms page won't move on"
+            lines = [f"Site says: {why.split(': ', 1)[-1]}", f"That's {count} times in a row."]
+            if give_up:
+                lines.append(f"Number {mask(phone)} is skipped for the rest of this run; your other numbers carry on.")
+            self.attention(("refused", phone, what, give_up), subject, lines, fix_hint(why))
+        return give_up
+
+    def number_accepted(self, phone):
+        with self.lock:
+            for key in [k for k in self.refusals if k[0] == phone]:
+                del self.refusals[key]
 
     # -- choices -------------------------------------------------------------
 
@@ -1853,6 +1938,40 @@ class Bot:
                           + (f" - looking again for {', '.join(self.targets[i].label for i in reopened)}" if reopened else ""))
         if any(kind_score(t, kind) > 0 for t in names for kind in KIND_PATTERNS):
             self.saw_season()
+
+    def attention(self, key, title, lines, fix):
+        """Something only a person can fix - config, documents, a refused number: banner, beep and
+        Mac notification. Server trouble never comes here, that is simply retried. The same issue
+        is announced again at most every 10 minutes while it keeps happening."""
+        now = time.monotonic()
+        with self.lock:
+            if now - self.attention_seen.get(key, -1e9) < 600:
+                return
+            self.attention_seen[key] = now
+        body = [f"NEEDS YOUR ATTENTION: {title}"] + list(lines) + [f"To fix: {fix}", "The bot keeps going meanwhile."]
+        self.log.banner(body, "ERROR")
+        if self.opt.get("notify"):
+            threading.Thread(target=notify, args=(f"IISM bot: {title}"[:120], "Needs your attention - see the terminal",
+                                                  "Basso"), daemon=True).start()
+
+    def check_missing(self, target, kind, site_lists):
+        """Courses are listed but this choice still can't be matched: most likely its dates or
+        names differ from what we expect. Alert with what the site lists while the bot keeps trying."""
+        with self.lock:
+            if (kind != "unlisted" or self.season_seen is None or target.index in self.alerted
+                    or time.monotonic() - self.season_seen < self.opt["missingAlertSec"]):
+                return
+            self.alerted.add(target.index)
+        waited = int(time.monotonic() - self.season_seen)
+        wanted = f"a {target.kind} batch starting {target.start:%d %b %Y}" + (f", level {target.level}" if target.level else "")
+        lines = [f"The snow courses have been listed for {waited}s, but nothing matches this choice ({wanted}).",
+                 "The site lists:"]
+        lines += [f"  {line}" for line in site_lists] or ["  (nothing)"]
+        example = (f'{{"batch": "{target.batch_id or "G2"}", "level": "{target.level or "Basic"}", '
+                   '"courseText": "...", "batchText": "..."}')
+        self.attention(("missing", target.index), f"can't find {target.label} ({target.when()}) on the site", lines,
+                       f"correct the dates in schedule.json, or give this choice the site's own words in your config, "
+                       f"e.g. {example}, {RESTART_HINT}")
 
     def saw_season(self):
         with self.lock:
@@ -2037,6 +2156,7 @@ class Worker(threading.Thread):
                 return
             except TargetFull as e:
                 session.fresh_needed = True
+                bot.check_missing(target, e.kind, e.site_lists)
                 verdict = bot.report_full(target, str(e), e.kind)
                 if verdict == "early":
                     bot.note(who, f"{target.label}: {e} - not counting it as full yet, checking again")
@@ -2056,7 +2176,21 @@ class Worker(threading.Thread):
                 session.fresh_needed = True
                 log.error(f"{who}{target.label}: site rejected the form: {e}")
                 bot.report_rejected(target, str(e), e.final)
+                why = re.sub(r"\s*\(page saved: [^)]*\)", "", str(e))
+                if e.final:
+                    bot.attention(("rejected", why), f"{target.label} isn't possible for this applicant",
+                                  [f"Site says: {why}", "This choice is skipped; the bot moves on to your next one."],
+                                  "nothing, if the details in your config are right; otherwise " + fix_hint(why))
+                else:
+                    bot.attention(("rejected", why), f"the site refused the form for {target.label}",
+                                  [f"Site says: {why}", "Retrying won't help until this is fixed."], fix_hint(why))
                 bot.sleep(0 if e.final else bot.opt["rejectedRetrySec"])
+            except Refused as e:
+                session.fresh_needed = True
+                log.warn(f"{who}{e}")
+                if bot.number_refused(phone, e.what, str(e)):
+                    return  # skip this number; the worker takes the next one
+                bot.sleep(bot.opt["rejectedRetrySec"])
             except Transient as e:
                 # retry the step that failed; start over only if the same attempt keeps failing
                 fails = 1 if session.progress > progress else fails + 1
