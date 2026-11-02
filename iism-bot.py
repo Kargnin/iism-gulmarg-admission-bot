@@ -2050,11 +2050,13 @@ class Session:
 
         def note_request_started():
             nonlocal request_started
+            if bot.stop.is_set():
+                raise Cancelled()
             request_started = True
 
         bot.mark_submitting(self.phone, target)
-        bot.log.info(f"{self.who}SUBMITTING {target.label}: {sel}")
         try:
+            bot.log.info(f"{self.who}SUBMITTING {target.label}: {sel}")
             resp = self.postback(page, "", values, files=files, timeout=bot.opt["submitTimeoutSec"],
                                  on_start=note_request_started)
             saved = bot.save_page(self.who, f"submit-{target.label}", resp)
@@ -2083,7 +2085,7 @@ class Session:
             raise Uncertain(str(exc)) from exc
         return result
 
-    def judge_submit(self, resp, target, sel, saved, sent_files=()):
+    def judge_submit(self, resp, target, sel, saved, sent_files):
         self.http.check_destination(resp.url)
         parsed = urllib.parse.urlparse(resp.url)
         query = {k.lower(): v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}

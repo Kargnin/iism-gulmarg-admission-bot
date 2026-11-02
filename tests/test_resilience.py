@@ -329,6 +329,55 @@ class Resilience(unittest.TestCase):
         self.assertFalse(any(item["submit"] for item in site.request_log))
         self.assertEqual(site.applications, [])
 
+    def test_cancellation_at_final_start_callback_clears_pending_without_send(self):
+        site, url = self.local_site()
+        settings = bot.parse_settings(make_config(self.root, PHONES[:1], ["G2 Basic"]), None)[0]
+        out = self.root / "start-callback-cancel"
+        self.assertEqual(bot.prepare_documents(settings, out)[0], [])
+        instance = bot.Bot(settings, out, base_url=url, log=bot.Log(echo=False))
+        original_postback = bot.Session.postback
+        callback_reached = []
+
+        def cancel_at_start(session, page, event, values, files=None, timeout=None, on_start=None):
+            if values.get("btnSubmit"):
+                callback_reached.append(True)
+                session.bot.stop.set()
+                on_start()
+            return original_postback(session, page, event, values, files=files, timeout=timeout,
+                                     on_start=on_start)
+
+        with mock.patch.object(bot.Session, "postback", cancel_at_start):
+            instance.run()
+        self.assertEqual(callback_reached, [True])
+        self.assertEqual(instance.pending, {})
+        self.assertFalse(any(item.get("status") == "submitting" for item in instance.state.data["phones"].values()))
+        self.assertFalse(any(item["submit"] for item in site.request_log))
+        self.assertEqual(site.applications, [])
+
+    def test_submit_log_failure_clears_prestart_pending_marker(self):
+        site, url = self.local_site()
+        settings = bot.parse_settings(make_config(self.root, PHONES[:1], ["G2 Basic"]), None)[0]
+        out = self.root / "submit-log-failure"
+        self.assertEqual(bot.prepare_documents(settings, out)[0], [])
+        instance = bot.Bot(settings, out, base_url=url, log=bot.Log(echo=False))
+        original_info = instance.log.info
+        failed = []
+
+        def fail_once(message):
+            if "SUBMITTING" in message and not failed:
+                failed.append(True)
+                instance.stop.set()
+                raise OSError("broken log stream")
+            return original_info(message)
+
+        with mock.patch.object(instance.log, "info", fail_once):
+            instance.run()
+        self.assertEqual(failed, [True])
+        self.assertEqual(instance.pending, {})
+        self.assertFalse(any(item.get("status") == "submitting" for item in instance.state.data["phones"].values()))
+        self.assertFalse(any(item["submit"] for item in site.request_log))
+        self.assertEqual(site.applications, [])
+
     def test_inflight_cancellation_preserves_pending_for_feedback(self):
         site, url = self.local_site()
         settings = bot.parse_settings(make_config(self.root, PHONES[:1], ["G2 Basic"]), None)[0]
@@ -545,7 +594,7 @@ class Resilience(unittest.TestCase):
             with self.subTest(path=path):
                 page = bot.Page(f"http://127.0.0.1:9/{path}", status, body)
                 with self.assertRaises(bot.Transient):
-                    session.judge_submit(page, instance.targets[0], None, None)
+                    session.judge_submit(page, instance.targets[0], None, None, set())
 
     def test_explicit_historical_success_does_not_require_an_id(self):
         instance = offline_bot()
@@ -554,7 +603,7 @@ class Resilience(unittest.TestCase):
                         '<form><input name="__VIEWSTATE" value="a"><span id="lblMsg">'
                         'Admission Form submitted successfully, Payment details have been sent on your registered email.'
                         '</span></form>')
-        result = session.judge_submit(page, instance.targets[0], None, None)
+        result = session.judge_submit(page, instance.targets[0], None, None, set())
         self.assertEqual(result["applicationId"], "")
         self.assertIn("submitted successfully", result["message"])
 
