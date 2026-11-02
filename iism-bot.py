@@ -109,6 +109,11 @@ BOT_NUMBER_MINIMUMS = {
     "statusEverySec": (0, False),
 }
 
+CONFIG_ROOT_KEYS = {
+    "applicant", "address", "phoneNumbers", "coursePriorities", "maxBookings",
+    "bookingOpensAt", "scheduleFile", "batches", "documentsDir", "documents", "bot",
+}
+
 # config value -> text box on admission_form.aspx
 TEXT_FIELDS = [
     ("txtName", "applicant", "name"),
@@ -322,6 +327,14 @@ def now_ist():
 
 def age_on(born, day):
     return day.year - born.year - ((day.month, day.day) < (born.month, born.day))
+
+
+def document_applies(key, target, dob):
+    if key == "parentSignature":
+        return bool(dob and age_on(dob, target.start) < 18)
+    if key == "skiingCertificate":
+        return target.kind == "Snow Skiing" and target.level in ("Intermediate", "Advance")
+    return True
 
 
 def fmt_when(moment):
@@ -771,12 +784,52 @@ def parse_phone(raw):
     return digits if len(digits) == 10 else None
 
 
+def validate_batch_records(records, where):
+    if not isinstance(records, dict):
+        raise ConfigError(f"{where} must be an object")
+    for bid, record in records.items():
+        if not isinstance(bid, str) or not bid.strip():
+            raise ConfigError(f"{where} has an invalid batch code {bid!r}")
+        if not isinstance(record, dict):
+            raise ConfigError(f"{where}.{bid} must be an object")
+        offers = record.get("offers", [])
+        if not isinstance(offers, list) or any(not isinstance(item, str) for item in offers):
+            raise ConfigError(f"{where}.{bid}.offers must be a list of course names")
+    return records
+
+
+def validate_config_structure(cfg):
+    if not isinstance(cfg, dict):
+        raise ConfigError("config root must be an object")
+    unknown = sorted((key for key in cfg if key not in CONFIG_ROOT_KEYS), key=str)
+    if unknown:
+        raise ConfigError("config has unknown option(s): " + ", ".join(map(str, unknown)))
+    for key in ("applicant", "address", "documents", "bot", "batches"):
+        if key in cfg and not isinstance(cfg[key], dict):
+            raise ConfigError(f"{key} must be an object")
+    for key in ("phoneNumbers", "coursePriorities"):
+        if key in cfg and not isinstance(cfg[key], list):
+            raise ConfigError(f"{key} must be a list")
+    for key in ("bookingOpensAt", "scheduleFile", "documentsDir"):
+        if key in cfg and not isinstance(cfg[key], str):
+            raise ConfigError(f"{key} must be text")
+    for key, value in cfg.get("documents", {}).items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ConfigError("documents must map document names to file paths")
+    if "batches" in cfg:
+        validate_batch_records(cfg["batches"], "batches")
+
+
 def load_season(cfg, config_dir):
     path = resolve_path(cfg["scheduleFile"], config_dir) if cfg.get("scheduleFile") else SCRIPT_DIR / "schedule.json"
     data = load_jsonc(path) if path.exists() else {}
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path}: schedule root must be an object")
     batches = {}
-    merged = dict(data.get("batches") or {})
-    merged.update(cfg.get("batches") or {})
+    scheduled = data["batches"] if "batches" in data else {}
+    configured = cfg["batches"] if "batches" in cfg else {}
+    merged = dict(validate_batch_records(scheduled, f"{path}: batches"))
+    merged.update(validate_batch_records(configured, "batches"))
     for bid, b in merged.items():
         start = parse_day(b.get("from"))
         if start is None:
@@ -810,10 +863,6 @@ def validate_tuning(cfg, errors):
 
     opt = dict(BOT_DEFAULTS)
     raw_opt = cfg.get("bot", {})
-    if not isinstance(raw_opt, dict):
-        errors.append("bot must be an object")
-        return wanted, opt
-
     unknown = sorted((key for key in raw_opt if key not in BOT_DEFAULTS), key=str)
     if unknown:
         errors.append("bot has unknown option(s): " + ", ".join(map(str, unknown)))
@@ -848,6 +897,7 @@ def validate_tuning(cfg, errors):
 
 
 def parse_settings(cfg, config_path):
+    validate_config_structure(cfg)
     errors, warnings = [], []
     s = Settings()
     s.config_path = Path(config_path) if config_path else None
@@ -923,11 +973,9 @@ def parse_settings(cfg, config_path):
         s.targets.append(t)
     if not s.targets and not any(p.startswith("coursePriorities") for p in placeholders):
         errors.append("coursePriorities is empty - list your choices, e.g. [\"G2 Basic\", \"G3 Basic\"]")
-    if any(t.level in ("Intermediate", "Advance") for t in s.targets) and not (cfg.get("documents") or {}).get("skiingCertificate"):
+    if (any(document_applies("skiingCertificate", t, s.dob) for t in s.targets)
+            and not cfg.get("documents", {}).get("skiingCertificate")):
         warnings.append("Intermediate/Advance choices need your previous course certificate in documents.skiingCertificate")
-
-    # the parent/guardian signature is only for participants under 18 (by the first chosen batch)
-    s.minor = bool(s.dob and s.targets and age_on(s.dob, min(t.start for t in s.targets)) < 18)
 
     wanted, s.opt = validate_tuning(cfg, errors)
     s.max_bookings = min(wanted or len(s.phones), len(s.phones) or 1, len(s.targets) or 1)
@@ -991,14 +1039,18 @@ def prepare_documents(settings, out_dir):
     """Fill settings.docs with upload-ready files. Returns (problems, notes)."""
     problems, notes = [], []
     settings.docs = {}
+    preparation_id = uuid.uuid4().hex
     for key, _, _, required in DOCUMENTS:
+        applies = any(document_applies(key, target, settings.dob) for target in settings.targets)
+        if key in ("parentSignature", "skiingCertificate") and not applies:
+            continue
         src = settings.doc_sources.get(key)
         if src is None:
             if key in settings.doc_placeholders:  # reported already
                 continue
             if required is True:
                 problems.append(f"documents.{key} is not set (the form requires it)")
-            elif required == "minor" and settings.minor:
+            elif required == "minor":
                 problems.append(f"documents.{key} is not set (needed because the applicant is under 18)")
             continue
         if not src.is_file():
@@ -1015,15 +1067,22 @@ def prepare_documents(settings, out_dir):
             problems.append(f"documents.{key}: {src.name} {why}; the site needs JPG/PNG under 500 KB - "
                             "convert it (e.g. export as JPG) and point the config at the new file")
             continue
-        dst = out_dir / "upload-ready" / f"{key}.jpg"
+        dst = out_dir / "upload-ready" / f"{key}-{preparation_id}.jpg"
+        pending = out_dir / "upload-ready" / f".{key}-{preparation_id}.jpg.tmp"
         try:
-            convert_to_jpeg(src, dst)
+            convert_to_jpeg(src, pending)
+            os.replace(pending, dst)
         except ConfigError as e:
             problems.append(f"documents.{key}: {e}")
             continue
         except (OSError, subprocess.SubprocessError) as e:
             problems.append(f"documents.{key}: converting {src.name} failed: {e}")
             continue
+        finally:
+            try:
+                pending.unlink()
+            except FileNotFoundError:
+                pass
         settings.docs[key] = dst
         page_note = " (first page)" if src.suffix.lower() == ".pdf" else ""
         notes.append(f"{key}: {src.name} {why} -> converted{page_note} to {dst} ({dst.stat().st_size // 1000} KB)")
@@ -1321,9 +1380,6 @@ class Selection:
         self.course, self.level, self.batch, self.state = course, level, batch, state
         self.seats, self.fee, self.page = seats, fee, page
 
-    def is_basic(self):
-        return self.level is not None and "basic" in norm(self.level[1])
-
     def __str__(self):
         parts = [f"course '{self.course[1]}'"]
         if self.level:
@@ -1594,7 +1650,7 @@ class Session:
         files = {}
         for key, input_name, flag, _ in DOCUMENTS:
             path = bot.s.docs.get(key)
-            if key == "skiingCertificate" and sel.is_basic():
+            if not document_applies(key, target, bot.s.dob):
                 path = None
             if key == "parentSignature" and path is None and bot.parent_fallback:
                 path = bot.s.docs.get("signature")

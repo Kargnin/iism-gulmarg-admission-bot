@@ -7,6 +7,7 @@ a copy of the real site's pages and flow.
 """
 
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -225,11 +226,37 @@ class ConfigurationAndDocuments(unittest.TestCase):
                 errors = self.errors_for(path, value)
                 self.assertTrue(any(path.split(".")[-1] in error for error in errors), errors)
 
+    def test_rejects_unknown_root_option_before_network(self):
         with tempfile.TemporaryDirectory() as folder:
-            cfg = make_config(Path(folder), PHONES[:1], ["G2 Basic"])
-            cfg["bot"] = "parallel"
-            errors = bot.parse_settings(cfg, None)[1]
-            self.assertTrue(any("bot must be an object" in error for error in errors), errors)
+            tmp = Path(folder)
+            cfg = make_config(tmp, PHONES[:2], ["G2 Basic", "G3 Basic"])
+            cfg["maxBooking"] = 1
+            path = tmp / "config.json"
+            path.write_text(json.dumps(cfg))
+            with mock.patch.object(bot, "Http") as http:
+                self.assertEqual(bot.main(["--check", "--config", str(path)]), 2)
+            http.assert_not_called()
+
+    def test_rejects_malformed_config_containers_and_batch_records(self):
+        cases = [
+            ("applicant", []),
+            ("address", []),
+            ("phoneNumbers", {}),
+            ("coursePriorities", {}),
+            ("documents", []),
+            ("bot", []),
+            ("batches", []),
+            ("batches", {"G2": []}),
+            ("batches", {"G2": {"from": "2027-01-03", "offers": "Snow Skiing"}}),
+        ]
+        for key, value in cases:
+            with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as folder:
+                cfg = make_config(Path(folder), PHONES[:1], ["G2 Basic"])
+                cfg[key] = value
+                with self.assertRaises(bot.ConfigError):
+                    bot.parse_settings(cfg, None)
+        with self.assertRaises(bot.ConfigError):
+            bot.parse_settings([], None)
 
     def test_rejects_non_finite_and_out_of_range_tuning(self):
         cases = [
@@ -260,18 +287,19 @@ class ConfigurationAndDocuments(unittest.TestCase):
             errors = bot.parse_settings(cfg, None)[1]
             self.assertTrue(any("maxRetryDelaySec" in error for error in errors), errors)
 
-    def test_changed_document_source_is_always_reconverted(self):
+    def test_converted_document_paths_remain_immutable_through_multipart(self):
         with tempfile.TemporaryDirectory() as folder:
             tmp = Path(folder)
-            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"])
             first = tmp / "docs" / "photo-a.pdf"
             second = tmp / "docs" / "photo-b.pdf"
+            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"])
             first.write_bytes(b"first applicant")
             second.write_bytes(b"second applicant")
-            os.utime(second, (1, 1))
             cfg["documents"]["photo"] = first.name
-            settings, errors, _ = bot.parse_settings(cfg, None)
-            self.assertEqual(errors, [])
+            first_settings, first_errors, _ = bot.parse_settings(cfg, None)
+            cfg["documents"]["photo"] = second.name
+            second_settings, second_errors, _ = bot.parse_settings(cfg, None)
+            self.assertEqual(first_errors + second_errors, [])
 
             def convert(src, dst):
                 dst.parent.mkdir(parents=True, exist_ok=True)
@@ -281,15 +309,27 @@ class ConfigurationAndDocuments(unittest.TestCase):
             out = tmp / "run"
             with mock.patch.object(bot, "can_convert", return_value=True), \
                     mock.patch.object(bot, "convert_to_jpeg", side_effect=convert) as converter:
-                problems, _ = bot.prepare_documents(settings, out)
-                self.assertEqual(problems, [])
-                settings.doc_sources["photo"] = second
-                problems, _ = bot.prepare_documents(settings, out)
+                first_problems, _ = bot.prepare_documents(first_settings, out)
+                first_prepared = first_settings.docs["photo"]
+                second_problems, _ = bot.prepare_documents(second_settings, out)
+                second_prepared = second_settings.docs["photo"]
 
-            converted = out / "upload-ready" / "photo.jpg"
-            self.assertEqual(problems, [])
-            self.assertEqual(converted.read_bytes(), second.read_bytes())
+            self.assertEqual(first_problems + second_problems, [])
+            self.assertNotEqual(first_prepared, second_prepared)
+            self.assertEqual(first_prepared.read_bytes(), first.read_bytes())
+            self.assertEqual(second_prepared.read_bytes(), second.read_bytes())
             self.assertEqual(converter.call_count, 2)
+            self.assertFalse(any(path.name.startswith(".") for path in (out / "upload-ready").iterdir()))
+
+            page = bot.Page("https://example.test/admission_form.aspx", 200,
+                            '<form action="admission_form.aspx" enctype="multipart/form-data">'
+                            '<input type="file" name="FupPhototOfApplicant" /></form>')
+            session = object.__new__(bot.Session)
+            session.http = mock.Mock()
+            session.postback(page, "", {}, files={"FupPhototOfApplicant": first_prepared})
+            multipart_body = session.http.send.call_args.args[2]
+            self.assertIn(first.read_bytes(), multipart_body)
+            self.assertNotIn(second.read_bytes(), multipart_body)
 
     def test_long_outage_backoff_stays_capped(self):
         instance = object.__new__(bot.Bot)
@@ -580,6 +620,35 @@ class EndToEnd(unittest.TestCase):
             self.assertIn("Age Allow 18 To 40", b.blocked[0]["why"])
         else:
             self.assertEqual([x["target"] for x in b.bookings], ["G5 MOI"])
+
+    def test_conditional_documents_follow_each_target(self):
+        phones = PHONES + ["9000000014"]
+        priorities = ["G2 Basic", "G3 Intermediate", "G4 Snowboarding", "G5 MOI"]
+        cfg = make_config(self.tmp, phones, priorities, applicant={"dateOfBirth": "10/01/2009"})
+        cfg["documents"].update({"parentSignature": "parent.png", "skiingCertificate": "parent.png"})
+        b = run_bot(cfg, self.url, self.out)
+        self.assertEqual(len(b.bookings), 4)
+
+        basic = self.key("G2")
+        intermediate = self.key("G3", "Intermediate")
+        if self.layout == "levels":
+            boarding = self.key("G4", "Snow Boarding")
+            moi = self.key("G5", "MOI")
+        else:
+            boarding = self.key("G4", "None", "board")
+            moi = self.key("G5", "None", "moi")
+        applications = {(item["course"], item["level"], item["schedule"]): item
+                        for item in self.site.snapshot()["applications"]}
+        parent = "FupParentGuardianSignature"
+        certificate = "FupAnyAdventureCoursePhoto"
+
+        self.assertIn(parent, applications[basic]["files"])
+        self.assertNotIn(certificate, applications[basic]["files"])
+        self.assertNotIn(parent, applications[intermediate]["files"])
+        self.assertIn(certificate, applications[intermediate]["files"])
+        for key in (boarding, moi):
+            self.assertNotIn(parent, applications[key]["files"])
+            self.assertNotIn(certificate, applications[key]["files"])
 
     def test_too_old_for_everything_gives_up_on_each_choice(self):
         b = self.run_with(PHONES[:1], ["G2 Basic", "G3 Basic"], applicant={"dateOfBirth": "15/05/1970"}, timeout=5)
