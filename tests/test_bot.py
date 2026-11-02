@@ -478,6 +478,65 @@ class ConfigurationAndDocuments(unittest.TestCase):
             self.assertEqual(settings.batches["G2"]["location"], "Kargil")
             self.assertEqual(settings.targets[0].start, date(2028, 1, 4))
 
+    def test_site_numeric_fields_require_ascii_without_restricting_unicode_text(self):
+        cases = (
+            ("dob", lambda cfg: cfg["applicant"].update(dateOfBirth="١٥/٠٥/١٩٩٨"), "dateOfBirth"),
+            ("pin", lambda cfg: cfg["address"].update(pincode="٤١١٠٠١"), "pincode"),
+            ("emergency", lambda cfg: cfg["applicant"].update(emergencyContactPhone="٩٠٠٠٠٠٠٠٠١"),
+             "emergencyContactPhone"),
+            ("phone", lambda cfg: cfg.update(phoneNumbers=["٩٠٠٠٠٠٠٠١١"]), "phone number"),
+            ("mixed-phone", lambda cfg: cfg.update(phoneNumbers=["²9000000011"]), "phone number"),
+        )
+        for label, mutate, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as folder:
+                cfg = make_config(Path(folder), PHONES[:1], ["G2 Basic"])
+                mutate(cfg)
+                errors = bot.parse_settings(cfg, None)[1]
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = make_config(Path(folder), ["+91 90000-00011"], ["G2 Basic"])
+            cfg["applicant"].update(name="नन्दिनी 李", fatherName="父親 李")
+            cfg["address"].update(houseNo="七", street="桜通り", district="Pune")
+            settings, errors, _ = bot.parse_settings(cfg, None)
+            self.assertEqual(errors, [])
+            self.assertEqual(settings.phones, [PHONES[0]])
+            self.assertEqual(settings.applicant["name"], "नन्दिनी 李")
+            self.assertEqual(settings.form_values["txtStreetVillageColony"], "桜通り")
+
+    def test_booking_open_requires_an_explicit_time_but_keeps_supported_timestamps(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], bookingOpensAt="2026-11-12")
+            path = tmp / "date-only.json"
+            path.write_text(json.dumps(cfg))
+            with mock.patch.object(bot, "Http") as http:
+                self.assertEqual(bot.main(["--check", "--config", str(path)]), 2)
+            http.assert_not_called()
+
+            schedule = tmp / "date-only-schedule.json"
+            schedule.write_text(json.dumps({
+                "bookingOpensAt": "2026-11-12",
+                "batches": {"G2": {"from": "2027-01-03", "to": "2027-01-16", "location": "Gulmarg"}},
+            }))
+            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(schedule))
+            cfg.pop("bookingOpensAt")
+            with self.assertRaisesRegex(bot.ConfigError, "must include an explicit time"):
+                bot.parse_settings(cfg, None)
+
+            cases = (
+                ("2026-11-12T07:05:00", timedelta(hours=5, minutes=30), (7, 5)),
+                ("2026-11-12 00:15", timedelta(hours=5, minutes=30), (0, 15)),
+                ("2026-11-12T06:45:00+04:00", timedelta(hours=4), (6, 45)),
+            )
+            for value, offset, clock in cases:
+                with self.subTest(value=value):
+                    cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], bookingOpensAt=value)
+                    settings, errors, _ = bot.parse_settings(cfg, None)
+                    self.assertEqual(errors, [])
+                    self.assertEqual(settings.opens_at.utcoffset(), offset)
+                    self.assertEqual((settings.opens_at.hour, settings.opens_at.minute), clock)
+
     def test_rejects_unreadable_configured_dates_and_missing_schedule(self):
         with tempfile.TemporaryDirectory() as folder:
             tmp = Path(folder)

@@ -1293,17 +1293,25 @@ class Resilience(unittest.TestCase):
         session = bot.Session(instance, PHONES[0], "")
         for body in (
                 "Application submitted successfully",
-                "<html><body>Application was rejected. It was submitted successfully.</body></html>"):
+                "Application was submitted",
+                "Was submitted",
+                "<html><body>Application was rejected. It was submitted successfully.</body></html>",
+                '<html><body><span id="lblMsg">Too many requests</span>'
+                '<p>Application was submitted</p></body></html>',
+                '<html><body><span id="lblMsg">This Mobile No. is already registered.</span>'
+                '<p>It was submitted</p></body></html>'):
             with self.subTest(body=body):
                 page = bot.Page("http://127.0.0.1:9/admission_form.aspx", 429, body)
                 with self.assertRaises(bot.Uncertain):
                     session.judge_submit(page, instance.targets[0], None, None, set())
 
-        negative = bot.Page(
-            "http://127.0.0.1:9/admission_form.aspx", 429,
-            "Application was not submitted successfully because the request was rate limited")
-        with self.assertRaises(bot.RateLimited):
-            session.judge_submit(negative, instance.targets[0], None, None, set())
+        for body in (
+                "Application was not submitted successfully because the request was rate limited",
+                "Application was submitted unsuccessfully because the request was rate limited"):
+            with self.subTest(negative_body=body):
+                negative = bot.Page("http://127.0.0.1:9/admission_form.aspx", 429, body)
+                with self.assertRaises(bot.RateLimited):
+                    session.judge_submit(negative, instance.targets[0], None, None, set())
 
         static_form = bot.Page(
             "http://127.0.0.1:9/admission_form.aspx", 429,
@@ -1312,12 +1320,33 @@ class Resilience(unittest.TestCase):
         with self.assertRaises(bot.RateLimited):
             session.judge_submit(static_form, instance.targets[0], None, None, set())
 
+        completed_only = bot.Page(
+            "http://127.0.0.1:9/AdmissionFormSuccess.aspx", 200, "Application was submitted")
+        with self.assertRaises(bot.Transient):
+            session.judge_submit(completed_only, instance.targets[0], None, None, set())
+
+        for negative_evidence in (
+                '<span id="lblMsg">This Mobile No. is already registered.</span>',
+                '<span id="lblMsg">Seat not available.</span>',
+                '<span id="lblMsg">Registration is closed.</span>',
+                '<script>rfvtxtName.errormessage = "Please Enter Name.";'
+                'rfvtxtName.isvalid = "False";</script>'):
+            with self.subTest(negative_evidence=negative_evidence):
+                page = bot.Page(
+                    "http://127.0.0.1:9/admission_form.aspx", 200,
+                    f'<html><body>{negative_evidence}<p>It was submitted</p></body></html>')
+                with self.assertRaises(bot.Uncertain):
+                    session.judge_submit(page, instance.targets[0], None, None, set())
+
     def test_unstructured_direct_429_after_commit_requires_feedback_without_reserve(self):
         original_redirect = mock_site.Handler.redirect
         cases = (
             ("plain", "Application submitted successfully", "text/plain; charset=utf-8"),
+            ("plain-completed", "Application was submitted", "text/plain; charset=utf-8"),
             ("html", "<html><body>Application was rejected. It was submitted successfully.</body></html>",
              "text/html; charset=utf-8"),
+            ("labeled-html", '<html><body><span id="lblMsg">Too many requests</span>'
+             '<p>Application was submitted</p></body></html>', "text/html; charset=utf-8"),
         )
         for label, body, content_type in cases:
             with self.subTest(label=label):

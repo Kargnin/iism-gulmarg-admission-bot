@@ -224,6 +224,11 @@ AFFIRMATIVE_OUTCOME_PATTERNS = (
     r"(?:(?:has|have)\s+been\s+|was\s+)?successfully\s+(?:registered|saved)",
     COMPLETION_REFERENCE_PATTERN,
 )
+CONFLICT_ONLY_COMPLETION_PATTERNS = (
+    r"(?:(?:(?:the|your|this)\s+)?(?:admission\s+form|application|form|registration)|it)?\s*"
+    r"(?:(?:has|have|had)\s+been|(?:is|was|were))\s+(?:submitted|registered|saved)",
+)
+COMPLETION_EVIDENCE_PATTERNS = AFFIRMATIVE_OUTCOME_PATTERNS + CONFLICT_ONLY_COMPLETION_PATTERNS
 AFFIRMATIVE_RECEIPT_SUFFIX = (
     r"(?:(?:,\s*|\.\s+)payment\s+(?:details|link)\s+(?:has|have)\s+been\s+sent"
     r"(?:\s+(?:to|on)\s+(?:your\s+)?(?:registered\s+)?(?:email|email\s+id))?)?\.?"
@@ -1044,7 +1049,10 @@ def parse_priority(item, index, batches):
 
 
 def parse_phone(raw):
-    digits = re.sub(r"\D", "", str(raw))
+    text = str(raw)
+    if any(char.isnumeric() and char not in "0123456789" for char in text):
+        return None
+    digits = re.sub(r"[^0-9]", "", text)
     if len(digits) == 12 and digits.startswith("91"):
         digits = digits[2:]
     elif len(digits) == 11 and digits.startswith("0"):
@@ -1156,8 +1164,12 @@ def load_season(cfg, config_dir):
     opens = cfg.get("bookingOpensAt") or data.get("bookingOpensAt")
     opens_at = None
     if opens:
+        opens_text = str(opens).strip()
+        if not re.search(r"[Tt ][0-9]{2}:?[0-9]{2}", opens_text):
+            raise ConfigError(f"bookingOpensAt \"{opens}\" must include an explicit time, "
+                              "e.g. 2026-11-12T10:00:00+05:30")
         try:
-            opens_at = datetime.fromisoformat(str(opens))
+            opens_at = datetime.fromisoformat(opens_text)
         except ValueError:
             raise ConfigError(f"bookingOpensAt \"{opens}\" should look like 2026-11-12T10:00:00+05:30")
         if opens_at.tzinfo is None:
@@ -1235,27 +1247,28 @@ def parse_settings(cfg, config_path):
     s.dob = None
     dob_text = s.applicant.get("dateOfBirth", "")
     if dob_text and "FILL_ME" not in dob_text:
-        m = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4})", dob_text)
+        m = re.fullmatch(r"([0-9]{2})/([0-9]{2})/([0-9]{4})", dob_text)
         try:
             s.dob = date(int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else None
         except ValueError:
             s.dob = None
         if s.dob is None:
-            errors.append(f"applicant.dateOfBirth \"{dob_text}\" must be dd/mm/yyyy, e.g. 15/05/1998")
+            errors.append(f"applicant.dateOfBirth \"{dob_text}\" must use ASCII digits in dd/mm/yyyy, "
+                          "e.g. 15/05/1998")
     rules = load_jsonc(SCRIPT_DIR / "form-rules.json")
     email = s.applicant.get("email", "")
     if email and "FILL_ME" not in email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         errors.append(f"applicant.email \"{email}\" does not look like an email address")
     pin = str(addr.get("pincode") or "")
-    if pin and "FILL_ME" not in pin and not re.fullmatch(r"\d{6}", pin.strip()):
-        errors.append(f"address.pincode \"{pin}\" must be 6 digits")
+    if pin and "FILL_ME" not in pin and not re.fullmatch(r"[0-9]{6}", pin.strip()):
+        errors.append(f"address.pincode \"{pin}\" must be 6 ASCII digits")
     if email and "FILL_ME" not in email and not re.fullmatch(rules["emailPattern"], email):
         errors.append("applicant.email does not satisfy the current form's email validator")
     if s.dob and s.dob > now_ist().date():
         errors.append("applicant.dateOfBirth is in the future")
     emergency = a.get("emergencyContactPhone", "")
-    if emergency and "FILL_ME" not in emergency and not re.fullmatch(r"\d{10}", emergency):
-        errors.append("applicant.emergencyContactPhone must be 10 digits")
+    if emergency and "FILL_ME" not in emergency and not re.fullmatch(r"[0-9]{10}", emergency):
+        errors.append("applicant.emergencyContactPhone must be 10 ASCII digits")
     for field, value in s.form_values.items():
         if len(value) > rules["maxLengths"].get(field, sys.maxsize):
             errors.append(f"{field} exceeds the live form's {rules['maxLengths'][field]} character limit")
@@ -1284,7 +1297,7 @@ def parse_settings(cfg, config_path):
             continue
         phone = parse_phone(raw)
         if phone is None:
-            errors.append(f"phone number \"{raw}\" is not a 10-digit Indian mobile number")
+            errors.append(f"phone number \"{raw}\" is not a 10-digit Indian mobile number using ASCII digits")
         elif phone in s.phones:
             errors.append(f"phone number {raw} is listed twice; primary and reserve numbers must be unique")
         else:
@@ -1905,7 +1918,7 @@ def completion_reference_negated(prefix):
         r"(?:\s+(?:be|been))?$",
         r"\bcannot(?:\s+be)?$",
         r"\b(?:unable|failed)\s+to(?:\s+be)?$",
-        r"\bno$",
+        r"\b(?:no|nothing|none|neither)$",
         rf"\bno\s+{subject}(?:\s+(?:has|have|is|was))?(?:\s+(?:be|been))?$",
         rf"\b(?:cannot|could\s+not|did\s+not)\s+(?:confirm|verify)(?:\s+that)?"
         rf"(?:\s+{subject})?(?:\s+(?:has|have|is|was))?(?:\s+(?:be|been))?$",
@@ -1915,12 +1928,14 @@ def completion_reference_negated(prefix):
 
 def affirmative_evidence(text):
     for envelope in outcome_envelopes(text):
-        for pattern in AFFIRMATIVE_OUTCOME_PATTERNS:
+        for pattern in COMPLETION_EVIDENCE_PATTERNS:
             for match in re.finditer(rf"(?<!\w)(?:{pattern})(?!\w)", envelope):
                 prefix = envelope[:match.start()]
                 local_prefix = re.split(r"[.!?;|]+", prefix)[-1]
                 suffix = envelope[match.end():]
                 if match.group(0).endswith("submitted") and re.match(r"\s+successfully\b", suffix):
+                    continue
+                if re.match(r"\s+(?:not\s+successfully|unsuccessfully)\b", suffix):
                     continue
                 if completion_reference_negated(prefix):
                     continue
@@ -2503,7 +2518,7 @@ class Session:
         msgs = self.msgs(resp) if resp.is_aspx else server_messages(resp.body)
         said = " | ".join(msgs).lower()
         own_page = resp.name in (INSTRUCTIONS_PAGE, CRITERIA_PAGE, FORM_PAGE)
-        text = resp.text().lower() if not own_page or (not resp.is_aspx and not msgs) else ""
+        text = "" if resp.is_aspx and own_page else resp.text().lower()
         evidence = " | ".join(item for item in (said, text) if item)
         path = parsed.path.lower()
         actual_page = path.rsplit("/", 1)[-1]
