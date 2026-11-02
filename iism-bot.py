@@ -207,6 +207,10 @@ OUTCOME_CONTRACTIONS = (
     ("wasn't", "was not"), ("weren't", "were not"), ("won't", "will not"),
     ("wouldn't", "would not"),
 )
+COMPLETION_REFERENCE_PATTERN = (
+    r"(?:submitted\s+successfully|successfully\s+submitted|registered\s+successfully|"
+    r"successfully\s+registered|saved\s+successfully|successfully\s+saved)"
+)
 AFFIRMATIVE_OUTCOME_PATTERNS = (
     r"(?:(?:the|your)\s+)?(?:admission\s+form|application|form)\s+"
     r"(?:(?:has|have)\s+been\s+|was\s+)?submitted\s+successfully",
@@ -218,12 +222,27 @@ AFFIRMATIVE_OUTCOME_PATTERNS = (
     r"(?:(?:has|have)\s+been\s+|was\s+)?(?:registered|saved)\s+successfully",
     r"(?:(?:the|your)\s+)?(?:application|form|registration)\s+"
     r"(?:(?:has|have)\s+been\s+|was\s+)?successfully\s+(?:registered|saved)",
-    r"(?:submitted\s+successfully|successfully\s+submitted|registered\s+successfully|"
-    r"successfully\s+registered|saved\s+successfully|successfully\s+saved)",
+    COMPLETION_REFERENCE_PATTERN,
 )
 AFFIRMATIVE_RECEIPT_SUFFIX = (
     r"(?:(?:,\s*|\.\s+)payment\s+(?:details|link)\s+(?:has|have)\s+been\s+sent"
     r"(?:\s+(?:to|on)\s+(?:your\s+)?(?:registered\s+)?(?:email|email\s+id))?)?\.?"
+)
+NEGATED_OUTCOME_SUBJECT = (
+    r"(?:(?:(?:the|your|this)\s+)?(?:admission\s+form|application|form|registration)|it)"
+)
+NEGATED_OUTCOME_MODIFIERS = r"(?:(?:in\s+fact|actually|yet|ever|under\s+any\s+circumstances)\s+)*"
+NEGATIVE_ONLY_OUTCOME_PATTERNS = (
+    rf"(?:{NEGATED_OUTCOME_SUBJECT}\s+)?"
+    rf"(?:(?:has|have|had|is|was|were|will|would|could|should|can|may|might|does|did)\s+)?"
+    rf"(?:not|never)\s+{NEGATED_OUTCOME_MODIFIERS}(?:(?:be|been)\s+)?{COMPLETION_REFERENCE_PATTERN}",
+    rf"{NEGATED_OUTCOME_SUBJECT}\s+(?:cannot|(?:is|was|were)\s+unable\s+to|failed\s+to)\s+"
+    rf"(?:be\s+)?{COMPLETION_REFERENCE_PATTERN}",
+    rf"(?:we|the\s+site|this\s+page)\s+(?:cannot|could\s+not|did\s+not)\s+(?:confirm|verify)\s+"
+    rf"(?:that\s+)?(?:{NEGATED_OUTCOME_SUBJECT}\s+)?(?:(?:has|have|was|is)\s+)?"
+    rf"(?:(?:be|been)\s+)?{COMPLETION_REFERENCE_PATTERN}",
+    r"no\s+(?:(?:the|your|this)\s+)?(?:admission\s+form|application|form|registration)\s+"
+    r"(?:has|have)\s+been\s+(?:submitted|registered|saved)",
 )
 AGE_PHRASES = ["age allow", "not eligible", "age should", "age must", "age limit", "invalid date"]
 
@@ -1854,7 +1873,8 @@ def response_retry_after(page):
 
 
 def normalize_outcome_text(text):
-    normalized = str(text or "").lower().replace("’", "'").replace("‘", "'")
+    normalized = (str(text or "").lower().replace("’", "'").replace("‘", "'")
+                  .replace("“", '"').replace("”", '"'))
     for contraction, expanded in OUTCOME_CONTRACTIONS:
         normalized = re.sub(rf"\b{re.escape(contraction)}\b", expanded, normalized)
     return " ".join(normalized.split())
@@ -1886,27 +1906,27 @@ def affirmative_success(text):
     return None
 
 
+def negative_only_outcome(text):
+    normalized = normalize_outcome_text(text).strip()
+    return any(re.fullmatch(rf"(?:{pattern})\.?", normalized) is not None
+               for pattern in NEGATIVE_ONLY_OUTCOME_PATTERNS)
+
+
 def affirmative_evidence(text):
     for envelope in outcome_envelopes(text):
-        claim_start = (
-            r"(?:(?:(?:the|your)\s+)?(?:admission\s+form|application|form|registration)\b|"
-            r"(?:submitted\s+successfully|successfully\s+submitted|registered\s+successfully|"
-            r"successfully\s+registered|saved\s+successfully|successfully\s+saved)\b)"
-        )
-        boundary = (
-            r"(?:[.!?;]+|\balthough\b[^,;.!?]*,\s*|"
-            r",\s*(?=(?:(?:the|your)\s+)?(?:admission\s+form|application|form|registration)\b)|"
-            rf"\b(?:but|yet|however)\b(?=\s*,?\s*{claim_start})|"
-            rf"\band\b(?=\s*{claim_start}))"
-        )
+        if negative_only_outcome(envelope):
+            continue
         for pattern in AFFIRMATIVE_OUTCOME_PATTERNS:
             for match in re.finditer(rf"(?<!\w)(?:{pattern})(?!\w)", envelope):
-                prefix = re.split(boundary, envelope[:match.start()])[-1]
+                prefix = envelope[:match.start()]
+                local_prefix = re.split(r"[.!?;|]+", prefix)[-1]
                 suffix = envelope[match.end():]
-                if (outcome_negative(prefix)
-                        or re.search(r"\b(?:no|not|never|nothing|none|neither|cannot)\b", prefix)
-                        or re.search(r"\b(?:if|unless|when|whenever|once|after|before|until|will|shall|"
-                                     r"would|should|could|may|might|can|verify|check)\b", prefix)):
+                if match.group(0).endswith("submitted") and re.match(r"\s+successfully\b", suffix):
+                    continue
+                if prefix.count('"') % 2:
+                    continue
+                if re.search(r"\b(?:if|unless|when|whenever|once|after|before|until|will|shall|"
+                             r"would|should|could|may|might|can|verify|check)\b", local_prefix):
                     continue
                 if re.match(r"\s*\?", suffix):
                     continue

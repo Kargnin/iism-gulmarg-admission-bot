@@ -1188,6 +1188,8 @@ class Resilience(unittest.TestCase):
         messages = (
             "Application wasn't submitted successfully",
             "Application wasn’t submitted successfully",
+            "It wasn't submitted successfully",
+            "Was not submitted successfully",
             "Application hasn't under any circumstances been submitted successfully",
             "Nothing has been submitted",
             "No application has been submitted",
@@ -1209,6 +1211,7 @@ class Resilience(unittest.TestCase):
         )
         for message in messages:
             with self.subTest(message=message):
+                self.assertFalse(bot.affirmative_evidence(message))
                 session.static = {}
                 page = bot.Page(
                     "http://127.0.0.1:9/admission_form.aspx", 200,
@@ -1225,17 +1228,27 @@ class Resilience(unittest.TestCase):
             (500, "Application contains invalid data. Application submitted successfully."),
             (429, "An error occurred. Application submitted successfully."),
             (429, "Application was rejected, but application submitted successfully."),
+            (429, "Application was rejected, but it was submitted successfully."),
+            (429, "Application was rejected, but was submitted successfully."),
+            (429, "Application was rejected, it was submitted successfully."),
+            (429, "Application was rejected whereas it was submitted successfully."),
             (429, "Application was rejected and application submitted successfully."),
             (500, "Application contains invalid data; however, application submitted successfully."),
+            (500, "Application contains invalid data; however, it was submitted successfully."),
             (429, "An error occurred, yet application submitted successfully."),
+            (429, "An error occurred, yet was submitted successfully."),
             (200, "Although application was rejected, application submitted successfully."),
+            (200, "Although application was rejected, it was submitted successfully."),
             (200, "Application was rejected, application submitted successfully."),
             (200, "This Mobile No. is already registered. Application submitted successfully."),
             (200, "This Mobile No. is already registered, but application submitted successfully."),
+            (200, "This Mobile No. is already registered, but it was submitted successfully."),
             (200, "Seat not available. Application submitted successfully."),
             (200, "Seat not available; yet application submitted successfully."),
+            (200, "Seat not available; yet was submitted successfully."),
             (200, "Registration is closed. Application submitted successfully."),
             (200, "Registration is closed, however application submitted successfully."),
+            (200, "Registration is closed, however it was submitted successfully."),
         )
         for status, message in cases:
             with self.subTest(status=status, message=message):
@@ -1247,12 +1260,21 @@ class Resilience(unittest.TestCase):
                 with self.assertRaises(bot.Uncertain):
                     session.judge_submit(page, instance.targets[0], None, None, set())
 
+        page = bot.Page(
+            "http://127.0.0.1:9/admission_form.aspx", 429,
+            '<form action="admission_form.aspx"><input name="__VIEWSTATE" value="a">'
+            '<span id="lblMsg">Validation failed, but it was submitted successfully.</span>'
+            '<script>rfvtxtName.errormessage = "Please Enter Name.";'
+            'rfvtxtName.isvalid = "False";</script></form>')
+        with self.assertRaises(bot.Uncertain):
+            session.judge_submit(page, instance.targets[0], None, None, set())
+
     def test_negative_before_success_after_commit_requires_feedback_without_reserve(self):
         site, url = self.local_site()
         site.success_receipt = (
             429,
             '<form action="AdmissionFormSuccess.aspx"><input name="__VIEWSTATE" value="a">'
-            '<span id="lblMsg">Application was rejected, but application submitted successfully.</span></form>',
+            '<span id="lblMsg">Application was rejected, but it was submitted successfully.</span></form>',
             {},
         )
         answers = []
