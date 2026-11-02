@@ -14,7 +14,7 @@ cp config.example.jsonc config.jsonc
 python3 iism-bot.py --check
 ```
 
-`--check` reports configuration/field errors, accepted state/education/diet choices, document problems, and one read-only site check. Site downtime is reported separately from invalid local details. Normal booking performs the same local preparation before starting workers.
+`--check` reports configuration/field errors, accepted state/education/diet choices, document problems, and one read-only site check. It validates saved progress against the same applicant/season/origin identity as booking without modifying the progress file; a local blocker skips the site probe and cannot print full readiness. Site downtime is reported separately from invalid local details.
 
 The current schema uses `applicant.diet`, top-level `phoneNumbers`, and `coursePriorities`. Unknown/obsolete keys are reported; private configs are never silently migrated. Course kinds and skiing levels use whole-word semantics, and incompatible combinations such as Snow Boarding + Basic are rejected at startup. `maxBookings` is removed: every configured preference is attempted.
 
@@ -44,7 +44,7 @@ Basic skiing is supported. Intermediate/Advance entries generate an unsupported-
 | K1 | Kargil | 8–21 Feb 2027 |
 | K2 | Kargil | 22 Feb–7 Mar 2027 |
 
-Dates come from `schedule.json`. Matching accommodates different wording and date formats, explores actual dropdowns, and enforces every explicitly written start/end pair from one parsed date representation. Live IDs are not hardcoded. Preference objects may provide `courseText`, `levelText`, and `batchText` hints; hints rank compatible choices but stale wording never blocks semantic kind, level, location and date matching.
+Dates come from `schedule.json`. Matching accommodates different wording and date formats, explores actual dropdowns, enforces every explicitly written start/end pair, and rejects configured or persisted ranges whose end precedes their start. Live IDs are not hardcoded. Preference objects may provide `courseText`, `levelText`, and `batchText` hints; hints rank compatible choices but stale wording never blocks semantic kind, level, location and date matching. If a generic course/level has no contradictory evidence and only the configured dates align, the approved permissive attempt continues with a prominent runtime warning.
 
 The repository `schedule.json` is the default. An explicit `scheduleFile` selects another complete schedule and must exist. Top-level `batches` override matching batch codes from that schedule, while top-level `bookingOpensAt` overrides its opening time. These are explicit current-schema inputs; no alias or implicit migration is applied.
 
@@ -74,7 +74,7 @@ An explicit 429 response to the original final POST retries the same phone from 
 
 If the original final POST has no definite rejection or confirmation, **only that preference is held**. This includes failures or 429 responses while loading a redirected receipt, blocked foreign receipt redirects, and any unverified error-labelled final form. Only an actual failed-validator state or a known used/full/closed/direct-429 response proves direct rejection. Check the actual application/email and answer `booked` to finish that preference or `not booked` to resume from a fresh mobile visit. Other workers continue. A used-number message or a URL containing payment/success is not automatic confirmation. Without interactive stdin, pending progress is retained; restart interactively to answer.
 
-Progress lives in `runs/<config-name>-<identity>/`, separated by full config path/site/season. A process lock prevents concurrent booking against the same progress. Writes are atomic and flushed before final submissions. The current durable schema records an explicit target-key version plus canonical location/date/kind/level identity for accepted applications. Older, unversioned, corrupt or incompatible progress is preserved and rejected for explicit reconciliation; it is never migrated or guessed from display dates. Matching hints are not part of identity. Trusted accepted history remains visible and its numbers stay protected when a target is removed or its dates, kind or level change.
+Progress lives in `runs/<config-name>-<identity>/`, separated by full config path/site/season. A process lock prevents concurrent booking against the same progress. Writes are atomic and flushed before final submissions. The current durable schema records an explicit target-key version plus canonical location/date/kind/level identity, canonical phone strings, typed summary fields and typed receipt metadata. Older, unversioned, malformed or identity-incompatible progress is preserved and rejected before requests; it is never normalized, migrated or guessed from display dates. Matching hints are not part of identity. Trusted accepted history remains visible and its numbers stay protected when a target is removed or its dates, kind or level change.
 
 Restarting preserves accepted applications and pending questions. Adding preferences/reserves does not count an old date as a new booking. `--reset-state` refuses to discard existing or unresolved applications.
 

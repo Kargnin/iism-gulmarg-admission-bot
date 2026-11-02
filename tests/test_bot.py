@@ -6,7 +6,10 @@ a copy of the real site's pages and flow.
   VERBOSE=1 python3 -m unittest tests.test_bot.EndToEnd.test_survives_a_crashing_site   # show the bot's log
 """
 
+import contextlib
+import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -335,6 +338,22 @@ class ConfigurationAndDocuments(unittest.TestCase):
             cfg = make_config(tmp, PHONES[:1], ["G2 Basic"],
                               batches={"G2": {"from": "2027-01-03", "to": "not-a-date"}})
             with self.assertRaisesRegex(bot.ConfigError, "batches.G2.to"):
+                bot.parse_settings(cfg, None)
+
+            cfg = make_config(tmp, PHONES[:1],
+                              [{"batch": "G2", "from": "2027-01-16", "to": "2027-01-03"}])
+            self.assertTrue(any("ends before it starts" in error for error in bot.parse_settings(cfg, None)[1]))
+
+            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"],
+                              batches={"G2": {"from": "2027-01-16", "to": "2027-01-03"}})
+            with self.assertRaisesRegex(bot.ConfigError, "ends before it starts"):
+                bot.parse_settings(cfg, None)
+
+            schedule = tmp / "reversed-schedule.json"
+            schedule.write_text(json.dumps({"batches": {
+                "G2": {"from": "2027-01-16", "to": "2027-01-03", "location": "Gulmarg"}}}))
+            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(schedule))
+            with self.assertRaisesRegex(bot.ConfigError, "ends before it starts"):
                 bot.parse_settings(cfg, None)
 
             cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(tmp / "missing.json"))
@@ -958,6 +977,19 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual((self.site.applications[0]["course"], self.site.applications[0]["level"],
                           self.site.applications[0]["schedule"]), (course_id, level_id, batch_id))
 
+    def test_date_only_generic_match_warns_but_still_attempts(self):
+        course_id, _, batch_id = self.key("G2")
+        course = dict(self.site.courses[course_id])
+        course["name"] = "Generic Adventure Courses"
+        course["levels"] = [("16", "None")]
+        self.site.courses[course_id] = course
+        self.site.seats[(course_id, "16", batch_id)] = 3
+        instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertTrue(instance.finished())
+        self.assertEqual(self.site.applications[0]["schedule"], batch_id)
+        self.assertIn("only the configured dates support this generic course/level match",
+                      (self.out / "bot.log").read_text())
+
     def test_resume_preserves_bookings_when_another_preference_is_added(self):
         self.run_with(PHONES[:2], ["G2 Basic"])
         resumed = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"])
@@ -975,6 +1007,71 @@ class EndToEnd(unittest.TestCase):
         resumed = self.run_with(PHONES[:1], [hinted])
         self.assertTrue(resumed.finished())
         self.assertEqual(len(self.site.applications), 1)
+
+    def test_current_state_rejects_malformed_fields_and_noncanonical_phones(self):
+        self.run_with(PHONES[:2], ["G2 Basic"])
+        state_path = self.out / "state.json"
+        baseline = json.loads(state_path.read_text())
+        settings = bot.parse_settings(make_config(self.tmp, PHONES[:2], ["G2 Basic"]), None)[0]
+        formatted = "+91 " + PHONES[0]
+        cases = ("missing-target", "batch-type", "status", "timestamp", "message-type",
+                 "application-id-type", "url-type", "response-type", "booking-phone",
+                 "phone-map-key", "assignment-phone", "phone-record-target")
+        for case in cases:
+            with self.subTest(case=case):
+                state = json.loads(json.dumps(baseline))
+                booking = state["bookings"][0]
+                if case == "missing-target":
+                    del booking["target"]
+                elif case == "batch-type":
+                    booking["batch"] = []
+                elif case == "status":
+                    booking["status"] = "maybe"
+                elif case == "timestamp":
+                    booking["at"] = "yesterday"
+                elif case == "message-type":
+                    booking["message"] = []
+                elif case == "application-id-type":
+                    booking["applicationId"] = 1
+                elif case == "url-type":
+                    booking["url"] = []
+                elif case == "response-type":
+                    booking["response"] = {}
+                elif case == "booking-phone":
+                    booking["phone"] = formatted
+                elif case == "phone-map-key":
+                    state["bookings"] = []
+                    state["phones"] = {formatted: {"status": "used", "note": "used"}}
+                elif case == "assignment-phone":
+                    state["assignments"]["f" * 64] = formatted
+                elif case == "phone-record-target":
+                    del state["phones"][PHONES[0]]["target"]
+                state_path.write_text(json.dumps(state))
+                preserved = state_path.read_bytes()
+                requests = self.site.requests
+                with self.assertRaises(bot.ConfigError):
+                    bot.Bot(settings, self.out, base_url=self.url, log=bot.Log(echo=False))
+                self.assertEqual(state_path.read_bytes(), preserved)
+                self.assertEqual(self.site.requests, requests)
+        state_path.write_text(json.dumps(baseline))
+
+    def test_reversed_persisted_identity_is_preserved_and_rejected(self):
+        self.run_with(PHONES[:1], ["G2 Basic"])
+        state_path = self.out / "state.json"
+        state = json.loads(state_path.read_text())
+        identity = state["bookings"][0]["targetIdentity"]
+        identity["from"], identity["to"] = identity["to"], identity["from"]
+        changed_key = bot.target_key_from_identity(identity)
+        state["bookings"][0]["targetKey"] = changed_key
+        state["phones"][PHONES[0]]["targetKey"] = changed_key
+        state_path.write_text(json.dumps(state))
+        preserved = state_path.read_bytes()
+        requests = self.site.requests
+        settings = bot.parse_settings(make_config(self.tmp, PHONES[:1], ["G2 Basic"]), None)[0]
+        with self.assertRaises(bot.ConfigError):
+            bot.Bot(settings, self.out, base_url=self.url, log=bot.Log(echo=False))
+        self.assertEqual(state_path.read_bytes(), preserved)
+        self.assertEqual(self.site.requests, requests)
 
     def test_removed_accepted_history_stays_visible_and_protects_its_phone(self):
         self.run_with(PHONES[:2], ["G2 Basic"])
@@ -1013,6 +1110,38 @@ class EndToEnd(unittest.TestCase):
             bot.Bot(settings, self.out, base_url=self.url, log=bot.Log(echo=False))
         self.assertEqual(state_path.read_bytes(), preserved)
         self.assertEqual(self.site.requests, requests)
+
+    def test_check_uses_booking_identity_without_writing_or_contacting_site(self):
+        config_path = self.tmp / "identity-check.json"
+        cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"])
+        config_path.write_text(json.dumps(cfg))
+        settings = bot.parse_settings(cfg, config_path)[0]
+        run_identity = json.dumps([str(config_path.resolve()), bot.origin(self.url), settings.season])
+        digest = hashlib.sha256(run_identity.encode()).hexdigest()[:16]
+        out_dir = bot.SCRIPT_DIR / "runs" / f"{config_path.stem}-{digest}"
+        shutil.rmtree(out_dir, ignore_errors=True)
+        try:
+            progress = bot.State(out_dir / "state.json", True)
+            progress.bind(bot.expected_state_identity(settings, self.url))
+            progress.acquire()
+            try:
+                progress.save()
+            finally:
+                progress.release()
+            preserved = progress.path.read_bytes()
+            cfg["applicant"]["name"] = "Changed Applicant"
+            config_path.write_text(json.dumps(cfg))
+            requests = self.site.requests
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = bot.main(["--check", "--config", str(config_path), "--base-url", self.url])
+            self.assertEqual(result, 1)
+            self.assertIn("different applicant, season or site", output.getvalue())
+            self.assertNotIn("All good", output.getvalue())
+            self.assertEqual(self.site.requests, requests)
+            self.assertEqual(progress.path.read_bytes(), preserved)
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
 
     def test_old_booking_does_not_complete_a_changed_date(self):
         self.run_with(PHONES[:1], ["G2 Basic"])

@@ -562,6 +562,11 @@ def configured_day(value, where, required=False):
     return parsed
 
 
+def require_date_range(start, end, where):
+    if end is not None and end < start:
+        raise ConfigError(f"{where} ends before it starts")
+
+
 def location_score(text, location):
     if not location:
         return 0
@@ -661,6 +666,15 @@ def match_batch(options, target):
         if score > best_score:
             best, best_score = (value, text), score
     return best
+
+
+def has_semantic_evidence(course, level, batch, target):
+    texts = [course[1], batch[1]] + ([level[1]] if level else [])
+    if any(location_score(text, target.location) > 0 for text in texts):
+        return True
+    if any(kind_score(text, target.kind) > 0 for text in texts):
+        return True
+    return target.kind == "Snow Skiing" and any(level_score(text, target) > 0 for text in texts)
 
 
 def is_season_batch(text, batches):
@@ -850,6 +864,7 @@ def parse_priority(item, index, batches):
     name = bid or start.strftime("%d%b")
     label = spec.get("label") or f"{name} {level if kind == 'Snow Skiing' else kind}"
     end = configured_day(spec.get("to"), f"coursePriorities[{index}].to") or batch.get("to")
+    require_date_range(start, end, f"coursePriorities[{index}]")
     return Target(index, label, bid, spec.get("location") or batch.get("location", ""), start,
                   end, kind, level,
                   spec.get("courseText", ""), spec.get("levelText", ""), spec.get("batchText", ""))
@@ -954,6 +969,7 @@ def load_season(cfg, config_dir):
         source = "batches" if bid in configured else f"{path}: batches"
         start = configured_day(b.get("from"), f"{source}.{bid}.from", required=True)
         end = configured_day(b.get("to"), f"{source}.{bid}.to")
+        require_date_range(start, end, f"{source}.{bid}")
         batches[bid.upper()] = {"location": b.get("location", ""), "from": start,
                                 "to": end, "offers": b.get("offers") or [],
                                 "seats": b.get("seats", "")}
@@ -1796,6 +1812,9 @@ class Session:
                 raise NotOpen("the snow courses are not listed yet" + listing(page, "ddlCourse"))
             raise TargetFull(f"{target.when()} is not listed" + listing(page, "ddlScheduleCourse"))
         course, level, batch = found
+        if not has_semantic_evidence(course, level, batch, target):
+            bot.note(self.who, f"{target.label}: only the configured dates support this generic course/level match; "
+                     "proceeding with the approved permissive attempt", warning=True)
         bot.course_hint[target.index] = course[0]
         values = {"ddlScheduleCourse": batch[0]}
         if level:
@@ -1975,12 +1994,20 @@ STATE_VERSION = 2
 TARGET_KEY_VERSION = 1
 TARGET_IDENTITY_FIELDS = {"location", "from", "to", "kind", "level"}
 STATE_FIELDS = {"version", "targetKeyVersion", "identity", "bookings", "phones", "assignments"}
+BOOKING_REQUIRED_FIELDS = {"target", "targetKey", "targetIdentity", "batch", "phone", "status", "at"}
+BOOKING_OPTIONAL_FIELDS = {"message", "applicationId", "url", "response"}
 
 
 def target_identity(target):
     return {"location": norm(target.location), "from": target.start.isoformat(),
             "to": target.end.isoformat() if target.end else "", "kind": target.kind,
             "level": target.level or ""}
+
+
+def expected_state_identity(settings, base_url):
+    values = [settings.applicant.get(key, "") for key in ("name", "fatherName", "dateOfBirth")]
+    values += [settings.season, origin(base_url)]
+    return hashlib.sha256(json.dumps(values).encode()).hexdigest()
 
 
 def target_key_from_identity(identity):
@@ -1996,6 +2023,20 @@ def valid_target_key(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
+def canonical_phone(value):
+    return isinstance(value, str) and parse_phone(value) == value
+
+
+def valid_timestamp(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
 def valid_target_identity(identity):
     if not isinstance(identity, dict) or set(identity) != TARGET_IDENTITY_FIELDS:
         return False
@@ -2004,14 +2045,47 @@ def valid_target_identity(identity):
     if identity["location"] != norm(identity["location"]):
         return False
     try:
-        date.fromisoformat(identity["from"])
-        if identity["to"]:
-            date.fromisoformat(identity["to"])
+        start = date.fromisoformat(identity["from"])
+        end = date.fromisoformat(identity["to"]) if identity["to"] else None
     except ValueError:
+        return False
+    if end is not None and end < start:
         return False
     if identity["kind"] == "Snow Skiing":
         return identity["level"] in ("Basic", "Intermediate", "Advance")
     return identity["kind"] in ("Snow Boarding", "MOI") and identity["level"] == ""
+
+
+def valid_booking_record(item):
+    if not isinstance(item, dict):
+        return False
+    fields = set(item)
+    if not BOOKING_REQUIRED_FIELDS <= fields or not fields <= BOOKING_REQUIRED_FIELDS | BOOKING_OPTIONAL_FIELDS:
+        return False
+    if (not isinstance(item["target"], str) or not item["target"]
+            or not isinstance(item["batch"], str) or not item["batch"]
+            or item["status"] not in ("confirmed", "user-confirmed")
+            or not valid_timestamp(item["at"])
+            or not canonical_phone(item["phone"])
+            or not valid_target_key(item["targetKey"])
+            or not valid_target_identity(item["targetIdentity"])
+            or target_key_from_identity(item["targetIdentity"]) != item["targetKey"]):
+        return False
+    return all(isinstance(item[key], str) for key in BOOKING_OPTIONAL_FIELDS if key in item)
+
+
+def valid_phone_record(item):
+    if not isinstance(item, dict) or item.get("status") not in ("used", "submitting", "booked"):
+        return False
+    if item["status"] == "used":
+        return set(item) == {"status", "note"} and isinstance(item["note"], str)
+    expected = {"status", "targetKey", "target"}
+    if item["status"] == "submitting":
+        expected.add("at")
+    if (set(item) != expected or not valid_target_key(item["targetKey"])
+            or not isinstance(item["target"], str) or not item["target"]):
+        return False
+    return item["status"] != "submitting" or valid_timestamp(item["at"])
 
 
 class State:
@@ -2045,35 +2119,30 @@ class State:
                 raise ValueError("invalid or outdated progress schema")
             booked_phones, booked_targets = set(), set()
             for item in value["bookings"]:
-                if (not isinstance(item, dict) or item.get("status") not in ("confirmed", "user-confirmed")
-                        or not valid_target_key(item.get("targetKey")) or not parse_phone(item.get("phone"))
-                        or not valid_target_identity(item.get("targetIdentity"))
-                        or target_key_from_identity(item["targetIdentity"]) != item["targetKey"]):
+                if not valid_booking_record(item):
                     raise ValueError("invalid booking record")
                 if item["phone"] in booked_phones or item["targetKey"] in booked_targets:
                     raise ValueError("duplicate booking records")
                 booked_phones.add(item["phone"])
                 booked_targets.add(item["targetKey"])
                 phone_record = value["phones"].get(item["phone"], {})
-                if phone_record.get("status") != "booked" or phone_record.get("targetKey") != item["targetKey"]:
+                if (phone_record.get("status") != "booked" or phone_record.get("targetKey") != item["targetKey"]
+                        or phone_record.get("target") != item["target"]):
                     raise ValueError("inconsistent booked phone")
             for phone, item in value["phones"].items():
-                if (not parse_phone(phone) or not isinstance(item, dict)
-                        or item.get("status") not in ("used", "submitting", "booked")):
+                if not canonical_phone(phone) or not valid_phone_record(item):
                     raise ValueError("invalid phone record")
-                if item["status"] == "submitting" and not valid_target_key(item.get("targetKey")):
-                    raise ValueError("invalid pending submission")
                 if item["status"] == "booked" and phone not in booked_phones:
                     raise ValueError("booked phone has no booking record")
-            if any(not valid_target_key(k) or not parse_phone(v) for k, v in value["assignments"].items()):
+            if any(not valid_target_key(k) or not canonical_phone(v) for k, v in value["assignments"].items()):
                 raise ValueError("invalid phone assignments")
             assigned_phones = list(value["assignments"].values())
             if len(assigned_phones) != len(set(assigned_phones)):
                 raise ValueError("one phone is assigned to multiple preferences")
             for target_key_value, phone in value["assignments"].items():
                 record = value["phones"].get(phone)
-                if record and record["status"] == "used":
-                    raise ValueError("used phone still has a preference assignment")
+                if record and record["status"] in ("used", "booked"):
+                    raise ValueError("unavailable phone still has a preference assignment")
                 if (record and record["status"] in ("submitting", "booked")
                         and record.get("targetKey") != target_key_value):
                     raise ValueError("phone assignment conflicts with its application record")
@@ -2088,9 +2157,12 @@ class State:
                               "Keep this file and reconcile existing applications before resetting it.") from exc
 
     def bind(self, identity):
+        self.validate_identity(identity)
+        self.identity = self.data["identity"] = identity
+
+    def validate_identity(self, identity):
         if self.data["identity"] not in (None, identity):
             raise ConfigError("Saved progress belongs to a different applicant, season or site; use a separate config.")
-        self.identity = self.data["identity"] = identity
 
     def acquire(self):
         if not self.enabled or self.lease is not None:
@@ -2165,9 +2237,7 @@ class Bot:
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.state = State(self.out_dir / "state.json", enabled=not dry_run)
-        identity = [settings.applicant.get(k, "") for k in ("name", "fatherName", "dateOfBirth")]
-        identity += [settings.season, origin(base_url)]
-        self.state.bind(hashlib.sha256(json.dumps(identity).encode()).hexdigest())
+        self.state.bind(expected_state_identity(settings, base_url))
         self.confirmation_handler = confirmation_handler or self.prompt_confirmation
         self.questions = queue.Queue()
         self.pending_questions = {}
@@ -2256,13 +2326,13 @@ class Bot:
     def poll_delay(self):
         return min(10.0, self.opt["pollSec"])
 
-    def note(self, who, message, every=60):
+    def note(self, who, message, every=60, warning=False):
         with self.lock:
             key, now = (who, message), time.monotonic()
             if now - self.notes.get(key, -1e9) < every:
                 return
             self.notes[key] = now
-        self.log.info(f"{who}{message}")
+        (self.log.warn if warning else self.log.info)(f"{who}{message}")
 
     def save_page(self, who, tag, page):
         with self.lock:
@@ -2657,16 +2727,17 @@ def run_check(settings, errors, warnings, doc_problems, doc_notes, base_url, log
     log.info("Documents:")
     for note in doc_notes:
         log.info(f"  {note}")
-    started = time.monotonic()
-    try:
-        page = Http(base_url, 30, log).get("Admission_instructions.aspx")
-        took = time.monotonic() - started
-        if page.status == 200 and page.name == INSTRUCTIONS_PAGE and page.value("txtMobileNo") is not None:
-            log.info(f"Site: OK - mobile verification page answered in {took:.1f}s")
-        else:
-            warnings.append(f"site answered HTTP {page.status} with page '{page.name}' - it may be down right now")
-    except Transient as e:
-        warnings.append(f"could not reach the site right now: {e}")
+    if not errors and not doc_problems:
+        started = time.monotonic()
+        try:
+            page = Http(base_url, 30, log).get("Admission_instructions.aspx")
+            took = time.monotonic() - started
+            if page.status == 200 and page.name == INSTRUCTIONS_PAGE and page.value("txtMobileNo") is not None:
+                log.info(f"Site: OK - mobile verification page answered in {took:.1f}s")
+            else:
+                warnings.append(f"site answered HTTP {page.status} with page '{page.name}' - it may be down right now")
+        except Transient as e:
+            warnings.append(f"could not reach the site right now: {e}")
     for w in warnings:
         log.warn(w)
     for p in errors + doc_problems:
@@ -2767,7 +2838,8 @@ def main(argv=None):
         problems, notes = prepare_documents(settings, out_dir)
         if args.check:
             try:
-                State(out_dir / "state.json", True)
+                progress = State(out_dir / "state.json", True)
+                progress.validate_identity(expected_state_identity(settings, args.base_url))
             except ConfigError as exc:
                 problems.append(str(exc))
             return run_check(settings, errors, warnings, problems, notes, args.base_url, log)
