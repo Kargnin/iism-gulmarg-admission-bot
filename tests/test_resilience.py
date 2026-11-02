@@ -657,6 +657,29 @@ class Resilience(unittest.TestCase):
             client.get("/")
         self.assertLess(time.monotonic() - started, 0.8)
 
+    def test_trickled_response_headers_obey_total_request_deadline(self):
+        class TrickleHeaders(BaseHTTPRequestHandler):
+            def do_GET(self):
+                response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Slow: header\r\n\r\nOK"
+                try:
+                    for value in response:
+                        self.connection.sendall(bytes([value]))
+                        time.sleep(0.03)
+                except OSError:
+                    pass
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TrickleHeaders)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = bot.Http(f"http://127.0.0.1:{server.server_port}", 0.2, bot.Log(echo=False))
+        started = time.monotonic()
+        with self.assertRaises(bot.Transient):
+            client.get("/")
+        self.assertLess(time.monotonic() - started, 0.8)
+
     def test_stdlib_empty_and_http_error_bodies_use_one_response_contract(self):
         class EmptyBodies(BaseHTTPRequestHandler):
             def do_GET(self):
@@ -701,7 +724,9 @@ class Resilience(unittest.TestCase):
         for path, status, body in (
                 ("payment-error.aspx", 503, "payment failed"),
                 ("Unsuccessful.aspx", 200, "application failed"),
-                ("AdmissionFormSuccess.aspx", 200, "Application not successfully submitted")):
+                ("AdmissionFormSuccess.aspx", 200, "Application not successfully submitted"),
+                ("AdmissionFormSuccess.aspx", 200, "Application not submitted successfully"),
+                ("AdmissionFormSuccess.aspx", 200, "Application unsuccessfully submitted")):
             with self.subTest(path=path):
                 page = bot.Page(f"http://127.0.0.1:9/{path}", status, body)
                 with self.assertRaises(bot.Transient):
@@ -712,20 +737,29 @@ class Resilience(unittest.TestCase):
         session = bot.Session(instance, PHONES[0], "")
         success = "Admission Form submitted successfully. Payment link has been sent."
         cases = {
-            "used": '<span id="lblerrorMsg">This Mobile No. is already registered.</span>',
-            "full": '<span id="lblerrorMsg">Seat not available.</span>',
-            "closed": '<span id="lblerrorMsg">Registration is closed.</span>',
-            "validator": ('<script>rfvtxtName.errormessage = "Please Enter Name.";'
-                          'rfvtxtName.isvalid = "False";</script>'),
+            "used": (200, '<span id="lblerrorMsg">This Mobile No. is already registered.</span>'),
+            "full": (200, '<span id="lblerrorMsg">Seat not available.</span>'),
+            "closed": (200, '<span id="lblerrorMsg">Registration is closed.</span>'),
+            "validator": (200, '<script>rfvtxtName.errormessage = "Please Enter Name.";'
+                               'rfvtxtName.isvalid = "False";</script>'),
+            "http-500-full": (500, '<span id="lblerrorMsg">Seat not available.</span>'),
+            "http-429-validator": (429, '<script>rfvtxtName.errormessage = "Please Enter Name.";'
+                                         'rfvtxtName.isvalid = "False";</script>'),
+            "http-429": (429, ""),
         }
-        for name, evidence in cases.items():
+        for name, (status, evidence) in cases.items():
             with self.subTest(name=name):
                 session.static = {}
                 body = ('<form action="admission_form.aspx"><input name="__VIEWSTATE" value="a">'
                         f'<span id="lblMsg">{success}</span>{evidence}</form>')
-                page = bot.Page("http://127.0.0.1:9/admission_form.aspx", 200, body)
+                page = bot.Page("http://127.0.0.1:9/admission_form.aspx", status, body)
                 with self.assertRaises(bot.Uncertain):
                     session.judge_submit(page, instance.targets[0], None, None, set())
+
+        page = bot.Page("http://127.0.0.1:9/admission_form.aspx", 429,
+                        '<form action="admission_form.aspx"><input name="__VIEWSTATE" value="a"></form>')
+        with self.assertRaises(bot.RateLimited):
+            session.judge_submit(page, instance.targets[0], None, None, set())
 
         pure = {
             "used": ("This Mobile No. is already registered.", bot.PhoneUsed),

@@ -7,6 +7,7 @@ a copy of the real site's pages and flow.
 """
 
 import contextlib
+import copy
 import hashlib
 import importlib.util
 import io
@@ -730,6 +731,79 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(instance.finished())
         self.assertEqual(self.site.applications[0]["level"], "19")
 
+    def _book_after_full_message(self, stage):
+        original_id, original_level, original_batch = self.key("G2")
+        expected_course = original_id
+        expected_level = original_level
+        expected_batch = original_batch
+        if stage == "level":
+            if self.layout != "levels":
+                self.skipTest("multi-level layout only")
+            course = self.site.courses[original_id]
+            course["levels"].append(("19", "Basic alternate"))
+            for batch, *_ in course["batches"]:
+                self.site.seats[(original_id, "19", batch)] = 3
+            full_course, full_level = original_id, original_level
+            full_batch = None
+            expected_level = "19"
+            priority = "G2 Basic"
+        elif stage == "course":
+            full_course = "98"
+            course = copy.deepcopy(self.site.courses[original_id])
+            course["name"] += " Preferred"
+            self.site.courses[full_course] = course
+            for level, _ in course["levels"]:
+                for batch, *_ in course["batches"]:
+                    self.site.seats[(full_course, level, batch)] = 3
+            full_level = course["levels"][0][0]
+            full_batch = None
+            priority = {"batch": "G2", "course": "Snow Skiing", "level": "Basic",
+                        "courseText": "Preferred"}
+        else:
+            full_course, full_level, full_batch = original_id, original_level, "99"
+            course = self.site.courses[original_id]
+            batch = next(item for item in course["batches"] if item[0] == original_batch)
+            course["batches"].append((full_batch, batch[1] + " Preferred", *batch[2:]))
+            self.site.seats[(full_course, full_level, full_batch)] = 3
+            priority = {"batch": "G2", "course": "Snow Skiing", "level": "Basic",
+                        "batchText": "Preferred"}
+
+        original_form = mock_site.Handler.form
+        original_post = mock_site.Handler.post_form
+        event = {"course": "ddlCourse", "level": "ddlCourseLevel", "schedule": "ddlScheduleCourse"}[stage]
+
+        def inject_full(handler, mobile, values, listed, invalid=(), alert=None):
+            body = original_form(handler, mobile, values, listed, invalid=invalid, alert=alert)
+            matches = (values.get("__EVENTTARGET") == event and values.get("ddlCourse") == full_course
+                       and (stage == "course" or values.get("ddlCourseLevel") == full_level)
+                       and (stage != "schedule" or values.get("ddlScheduleCourse") == full_batch))
+            if matches:
+                handler.site.sessions[handler.sid]["poisoned-full"] = True
+                body = body.replace("</form>", '<span id="lblCheckError">Seat not available.</span></form>')
+            return body
+
+        def reject_poisoned(handler, session, query, values, files):
+            if session.get("poisoned-full"):
+                return handler.send(500, mock_site.YSOD)
+            return original_post(handler, session, query, values, files)
+
+        with mock.patch.object(mock_site.Handler, "form", inject_full), \
+                mock.patch.object(mock_site.Handler, "post_form", reject_poisoned):
+            instance = self.run_with(PHONES[:1], [priority], timeout=4)
+        self.assertTrue(instance.finished())
+        self.assertEqual(self.site.applications[0]["course"], expected_course)
+        self.assertEqual(self.site.applications[0]["level"], expected_level)
+        self.assertEqual(self.site.applications[0]["schedule"], expected_batch)
+
+    def test_full_course_message_restarts_before_later_candidate(self):
+        self._book_after_full_message("course")
+
+    def test_full_level_message_restarts_before_later_candidate(self):
+        self._book_after_full_message("level")
+
+    def test_full_schedule_message_restarts_before_later_candidate(self):
+        self._book_after_full_message("schedule")
+
     def test_batch_appears_later_inside_an_already_visible_course(self):
         self.site.batch_opens[self.key("G2")[2]] = time.time() + 0.8
         instance = self.run_with(PHONES, ["G2 Basic", "G3 Basic"])
@@ -1073,12 +1147,14 @@ class EndToEnd(unittest.TestCase):
 
     def test_mixed_success_and_rejection_evidence_requires_feedback(self):
         cases = {
-            "used": "This Mobile No. is already registered.",
-            "full": "Seat not available.",
-            "closed": "Registration is closed.",
-            "validator": None,
+            "used": (200, "This Mobile No. is already registered."),
+            "full": (200, "Seat not available."),
+            "closed": (200, "Registration is closed."),
+            "validator": (200, None),
+            "http-500-full": (500, "Seat not available."),
+            "http-429-validator": (429, None),
         }
-        for name, negative in cases.items():
+        for name, (status, negative) in cases.items():
             with self.subTest(name=name):
                 feedback = []
                 self.site.used.clear()
@@ -1089,8 +1165,8 @@ class EndToEnd(unittest.TestCase):
                 def mixed(handler, mobile, values, files, listed, course, level, batch):
                     success = "Admission Form submitted successfully. Payment link has been sent."
                     values["lblMsg"] = (success + ((" " + negative) if negative else ""), "Green")
-                    invalid = ["rfvtxtName"] if name == "validator" else []
-                    return handler.send(200, handler.form(mobile, values, listed, invalid=invalid))
+                    invalid = ["rfvtxtName"] if "validator" in name else []
+                    return handler.send(status, handler.form(mobile, values, listed, invalid=invalid))
 
                 def confirm(phone, target, reason):
                     feedback.append((phone, target.label, reason))

@@ -30,6 +30,7 @@ looks like, and how a used number or a full batch is reported.
 """
 
 import argparse
+import copy
 import hashlib
 import html
 import json
@@ -272,7 +273,7 @@ class Site:
                  success_style="redirect", seed=None):
         self.lock = threading.Lock()
         self.rng = random.Random(seed)
-        self.courses = dict(LAYOUTS[layout])
+        self.courses = copy.deepcopy(dict(LAYOUTS[layout]))
         self.seats = {}
         for cv, course in self.courses.items():
             for lv, _ in course["levels"]:

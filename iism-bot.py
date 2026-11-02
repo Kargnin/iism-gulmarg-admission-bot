@@ -675,9 +675,9 @@ def state_aliases(name):
     return next(([a for a in group if a != n] for group in STATE_ALIASES if n in group), [])
 
 
-def match_batch(options, target):
-    best, best_score = None, 0
-    for value, text in real_options(options):
+def batch_candidates(options, target):
+    ranked = []
+    for index, (value, text) in enumerate(real_options(options)):
         found = dates_in(text)
         start = date_match(found, target.start)
         if not start:
@@ -690,9 +690,14 @@ def match_batch(options, target):
             continue
         score = (10 * start + 5 * date_match(found, target.end) + location + level
                  + (100 if target.batch_text and norm(target.batch_text) in norm(text) else 0))
-        if score > best_score:
-            best, best_score = (value, text), score
-    return best
+        if score > 0:
+            ranked.append((-score, index, (value, text)))
+    return [option for _, _, option in sorted(ranked)]
+
+
+def match_batch(options, target):
+    choices = batch_candidates(options, target)
+    return choices[0] if choices else None
 
 
 def has_semantic_evidence(course, level, batch, target):
@@ -1624,8 +1629,9 @@ class OriginRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 class TransportStartMixin:
-    def __init__(self, *args, on_write, **kwargs):
+    def __init__(self, *args, on_write, deadline, **kwargs):
         self._on_write = on_write
+        self._deadline = deadline
         self._write_started = False
         self._in_tunnel = False
         super().__init__(*args, **kwargs)
@@ -1645,6 +1651,36 @@ class TransportStartMixin:
             self._write_started = True
         return super().send(data)
 
+    def getresponse(self):
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("response header deadline exceeded")
+        expired = threading.Event()
+        response_socket = self.sock
+
+        def expire():
+            expired.set()
+            try:
+                response_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        timer = threading.Timer(remaining, expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            response = super().getresponse()
+        except BaseException as exc:
+            timer.cancel()
+            if expired.is_set() and isinstance(exc, Exception):
+                raise TimeoutError("response header deadline exceeded") from exc
+            raise
+        timer.cancel()
+        if expired.is_set() or time.monotonic() >= self._deadline:
+            response.close()
+            raise TimeoutError("response header deadline exceeded")
+        return response
+
 
 class TrackedHTTPConnection(TransportStartMixin, http.client.HTTPConnection):
     pass
@@ -1655,24 +1691,26 @@ class TrackedHTTPSConnection(TransportStartMixin, http.client.HTTPSConnection):
 
 
 class TrackedHTTPHandler(urllib.request.HTTPHandler):
-    def __init__(self, on_write):
+    def __init__(self, on_write, deadline):
         super().__init__()
         self.on_write = on_write
+        self.deadline = deadline
 
     def http_open(self, request):
         def factory(host, **kwargs):
-            return TrackedHTTPConnection(host, on_write=self.on_write, **kwargs)
+            return TrackedHTTPConnection(host, on_write=self.on_write, deadline=self.deadline(), **kwargs)
         return self.do_open(factory, request)
 
 
 class TrackedHTTPSHandler(urllib.request.HTTPSHandler):
-    def __init__(self, on_write, context):
+    def __init__(self, on_write, deadline, context):
         super().__init__(context=context)
         self.on_write = on_write
+        self.deadline = deadline
 
     def https_open(self, request):
         def factory(host, **kwargs):
-            return TrackedHTTPSConnection(host, on_write=self.on_write, **kwargs)
+            return TrackedHTTPSConnection(host, on_write=self.on_write, deadline=self.deadline(), **kwargs)
         return self.do_open(factory, request, context=self._context)
 
 
@@ -1689,6 +1727,18 @@ def response_retry_after(page):
     return max(0.0, seconds) if math.isfinite(seconds) else None
 
 
+def affirmative_success(text):
+    for phrase in SUCCESS_PHRASES:
+        for match in re.finditer(re.escape(phrase), text):
+            if match.start() and text[match.start() - 1].isalnum():
+                continue
+            prefix = text[max(0, match.start() - 48):match.start()]
+            if re.search(r"\b(?:not|never|unsuccessful|unsuccessfully)\b(?:\W+\w+){0,3}\W*$", prefix):
+                continue
+            return phrase
+    return None
+
+
 class Http:
     """Cookie-keeping HTTP client; every network-level failure becomes Transient."""
 
@@ -1700,6 +1750,7 @@ class Http:
         self.log = log
         self.jar = http.cookiejar.CookieJar()
         self._on_write = None
+        self._deadline = None
         self._build(verify)
 
     def _build(self, verify):
@@ -1709,14 +1760,19 @@ class Http:
             ctx.verify_mode = ssl.CERT_NONE
         self.verified = verify
         self.redirect_handler = OriginRedirectHandler(self.origin, self.stop)
-        self.opener = urllib.request.build_opener(TrackedHTTPHandler(self._before_write),
-                                                  TrackedHTTPSHandler(self._before_write, ctx),
+        self.opener = urllib.request.build_opener(TrackedHTTPHandler(self._before_write, self._request_deadline),
+                                                  TrackedHTTPSHandler(self._before_write, self._request_deadline, ctx),
                                                   urllib.request.HTTPCookieProcessor(self.jar),
                                                   self.redirect_handler)
 
     def _before_write(self):
         if self._on_write is not None:
             self._on_write()
+
+    def _request_deadline(self):
+        if self._deadline is None:
+            raise RuntimeError("HTTP request has no active deadline")
+        return self._deadline
 
     def check_destination(self, url):
         if self.stop is not None and self.stop.is_set():
@@ -1774,6 +1830,7 @@ class Http:
             headers["Referer"] = referer
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         previous_on_write, self._on_write = self._on_write, on_start
+        previous_deadline, self._deadline = self._deadline, deadline
         try:
             with self.opener.open(request, timeout=timeout) as resp:
                 raw, status, final = self._read_response(resp, deadline), resp.status, resp.geturl()
@@ -1802,6 +1859,7 @@ class Http:
             raise self._network_error(f"connection problem: {type(e).__name__} {e}".strip())
         finally:
             self._on_write = previous_on_write
+            self._deadline = previous_deadline
         redirects = tuple(self.redirect_handler.history)
         fresh = method == "GET" or bool(redirects)
         self.check_destination(final)
@@ -1935,7 +1993,7 @@ class Session:
                 raise Transient(f"unexpected page '{page.name}'")
         raise Transient("could not get through to the admission form")
 
-    def select(self, page, event, values):
+    def select(self, page, event, values, classify_full=False):
         """Postback after changing a dropdown/date; returns the refreshed form page."""
         values = dict(values)
         values.setdefault("txtMobileNo", self.phone)
@@ -1944,8 +2002,13 @@ class Session:
             if nxt.name in (INSTRUCTIONS_PAGE, CRITERIA_PAGE):
                 raise SessionLost(f"the site sent us back to {nxt.name}")
             raise Transient(f"unexpected page '{nxt.name}' after choosing {event}")
-        self.verdict(nxt)
-        return nxt
+        try:
+            self.verdict(nxt)
+        except TargetFull:
+            if classify_full:
+                return nxt, True
+            raise
+        return (nxt, False) if classify_full else nxt
 
     def cascade(self, target):
         """Choose course, level, batch, state and date of birth for this target.
@@ -1953,42 +2016,69 @@ class Session:
         Each attempt starts from scratch because the site only recovers reliably after a new
         cookie session repeats mobile verification and every dependent postback."""
         bot = self.bot
-        self.restart()
-        page = self.open_form()
-        course_options = page.options("ddlCourse")
+        excluded_courses = set()
+        excluded_levels = set()
+        excluded_batches = set()
         found = None
-        for value, text in course_candidates(course_options, target, bot.course_hint.get(target.index)):
-            page = self.select(page, "ddlCourse",
-                               dict(first_values(page, "ddlCourseLevel", "ddlScheduleCourse"), ddlCourse=value))
-            level_options = page.options("ddlCourseLevel")
-            levels = level_candidates(level_options, target, loose=kind_score(text, target.kind) > 0)
-            if real_options(level_options) and not levels:
+        while found is None:
+            self.restart()
+            page = self.open_form()
+            course_options = page.options("ddlCourse")
+            restart = False
+            for value, text in course_candidates(course_options, target, bot.course_hint.get(target.index)):
+                if value in excluded_courses:
+                    continue
+                page, full = self.select(
+                    page, "ddlCourse",
+                    dict(first_values(page, "ddlCourseLevel", "ddlScheduleCourse"), ddlCourse=value),
+                    classify_full=True)
+                if full:
+                    excluded_courses.add(value)
+                    restart = True
+                    break
+                level_options = page.options("ddlCourseLevel")
+                levels = level_candidates(level_options, target, loose=kind_score(text, target.kind) > 0)
+                if real_options(level_options) and not levels:
+                    continue
+                for level in levels or [None]:
+                    level_key = (value, level[0] if level else "")
+                    if level_key in excluded_levels:
+                        continue
+                    if level:
+                        page, full = self.select(
+                            page, "ddlCourseLevel",
+                            dict(first_values(page, "ddlScheduleCourse"), ddlCourseLevel=level[0]),
+                            classify_full=True)
+                        if full:
+                            excluded_levels.add(level_key)
+                            restart = True
+                            break
+                    batches = page.options("ddlScheduleCourse")
+                    if any(is_season_batch(t, bot.s.batches) for _, t in real_options(batches)):
+                        bot.saw_season()
+                    for batch in batch_candidates(batches, target):
+                        batch_key = level_key + (batch[0],)
+                        if batch_key in excluded_batches or selection_conflicts(
+                                (value, text), level, batch, target):
+                            continue
+                        values = {"ddlScheduleCourse": batch[0]}
+                        if level:
+                            values["ddlCourseLevel"] = level[0]
+                        candidate_page, full = self.select(page, "ddlScheduleCourse", values, classify_full=True)
+                        seats = to_int(candidate_page.value("txtAvailableSeat"))
+                        if full or seats == 0:
+                            excluded_batches.add(batch_key)
+                            restart = True
+                            break
+                        found = ((value, text), level, batch, candidate_page, seats)
+                        break
+                    if found or restart:
+                        break
+                if found or restart:
+                    break
+            if restart:
                 continue
-            for level in levels or [None]:
-                if level:
-                    page = self.select(page, "ddlCourseLevel",
-                                       dict(first_values(page, "ddlScheduleCourse"), ddlCourseLevel=level[0]))
-                batches = page.options("ddlScheduleCourse")
-                if any(is_season_batch(t, bot.s.batches) for _, t in real_options(batches)):
-                    bot.saw_season()
-                batch = match_batch(batches, target)
-                if not batch or selection_conflicts((value, text), level, batch, target):
-                    continue
-                values = {"ddlScheduleCourse": batch[0]}
-                if level:
-                    values["ddlCourseLevel"] = level[0]
-                try:
-                    candidate_page = self.select(page, "ddlScheduleCourse", values)
-                except TargetFull:
-                    continue
-                seats = to_int(candidate_page.value("txtAvailableSeat"))
-                if seats == 0:
-                    page = candidate_page
-                    continue
-                found = ((value, text), level, batch, candidate_page, seats)
-                break
-            if found:
-                break
+            break
         if not found:
             if bot.season_seen is None:
                 raise NotOpen("the snow courses are not listed yet" + listing(page, "ddlCourse"))
@@ -2182,18 +2272,21 @@ class Session:
         payment_receipt = (actual_page == "admission_formpayment.aspx" and query.get("rid")
                            and hidden_id == query["rid"] and hidden_id != "0")
         negative = has_any(said + " | " + text, ("not successfully", "unsuccessful", "not submitted", "failed", "could not", "error"))
-        explicit_success = has_any(said, SUCCESS_PHRASES) or (
-            actual_page == "admissionformsuccess.aspx" and has_any(text, SUCCESS_PHRASES))
+        message_success = next((affirmative_success(message.lower()) for message in msgs
+                                if affirmative_success(message.lower())), None)
+        page_success = affirmative_success(text) if actual_page == "admissionformsuccess.aspx" else None
+        explicit_success = bool(message_success or page_success)
         phone_used = has_any(said, PHONE_USED_PHRASES)
         full = has_any(said, FULL_PHRASES)
         closed = has_any(said, CLOSED_PHRASES)
         failed_validators = failed_validator_messages(resp.body) if resp.name == FORM_PAGE else []
-        if 200 <= resp.status < 300 and (explicit_success or payment_receipt):
-            if negative or phone_used or full or closed or failed_validators:
-                raise Uncertain("the final response contains conflicting success and rejection evidence")
-            message = next((m for m in msgs if has_any(m.lower(), SUCCESS_PHRASES)), "") or query.get("resp", "")
+        success_evidence = explicit_success or payment_receipt
+        if success_evidence and (negative or phone_used or full or closed or failed_validators or resp.status == 429):
+            raise Uncertain("the final response contains conflicting success and rejection evidence")
+        if 200 <= resp.status < 300 and success_evidence:
+            message = next((m for m in msgs if affirmative_success(m.lower())), "") or query.get("resp", "")
             if not message:
-                hit = next((p for p in SUCCESS_PHRASES if p in text), None)
+                hit = page_success
                 if hit:
                     i = text.find(hit)
                     message = resp.text()[max(0, i - 80):i + 120]
