@@ -19,7 +19,7 @@ Usage:
   python3 iism-bot.py --dry-run      full run that stops right before each final submit
   python3 iism-bot.py                book (waits until shortly before the opening time)
   python3 iism-bot.py --now          book, starting immediately
-  python3 iism-bot.py --config friend.jsonc   use someone else's config
+  python3 iism-bot.py --config configs/friend.jsonc   use someone else's config
 """
 
 import argparse
@@ -48,7 +48,6 @@ import urllib.request
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from difflib import get_close_matches
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -683,26 +682,14 @@ def is_season_batch(text, batches):
 
 
 def match_choice(options, wanted, aliases=()):
-    """Pick a dropdown entry by its text or value: exact, then prefix, then contains, then fuzzy."""
+    """Pick the single dropdown entry whose normalized text or value is explicitly requested."""
     real = real_options(options)
     keys = [k for k in [norm(wanted)] + [norm(a) for a in aliases] if k]
     if not real or not keys:
         return None
-    for k in keys:
-        for v, t in real:
-            if k in (norm(t), norm(v)):
-                return v, t
-    for k in keys:
-        for v, t in real:
-            if norm(t).startswith(k) or k.startswith(norm(t)):
-                return v, t
-    for k in keys:
-        for v, t in real:
-            if k in norm(t):
-                return v, t
-    names = [norm(t) for _, t in real]
-    close = get_close_matches(keys[0], names, n=1, cutoff=0.75)
-    return real[names.index(close[0])] if close else None
+    matches = [(value, text) for value, text in real
+               if any(key in (norm(text), norm(value)) for key in keys)]
+    return matches[0] if len(matches) == 1 else None
 
 
 # ---------------------------------------------------------------------------
@@ -1085,7 +1072,9 @@ def parse_settings(cfg, config_path):
         if wanted and "FILL_ME" not in wanted:
             match = match_choice(rules["dropdowns"][field], wanted, aliases)
             if match is None:
-                errors.append(f"{key} is not one of the current form's accepted choices")
+                choices = ", ".join(text for _, text in real_options(rules["dropdowns"][field]))
+                errors.append(f'{key} "{wanted}" does not identify exactly one current form choice; '
+                              f"accepted choices: {choices}")
 
     raw_phones = cfg.get("phoneNumbers") or []
     s.phones = []
@@ -1830,7 +1819,8 @@ class Session:
         if state_options is not None:
             state = match_choice(state_options, bot.s.state, state_aliases(bot.s.state))
             if state is None:
-                raise Rejected(f"address.state \"{bot.s.state}\" is not in the site's list" + listing(page, "ddlState"))
+                raise Rejected(f"address.state \"{bot.s.state}\" does not identify exactly one site option"
+                               + listing(page, "ddlState"))
             page = self.select(page, "ddlState", {"ddlState": state[0]})
         dob = bot.s.applicant.get("dateOfBirth", "")
         page = self.select(page, "txtDateOfBirth", {"txtDateOfBirth": dob})
@@ -1864,7 +1854,8 @@ class Session:
                 continue
             pick = match_choice(options, wanted)
             if pick is None:
-                raise Rejected(f"{key} \"{wanted}\" is not one of the site's options" + listing(page, field))
+                raise Rejected(f"{key} \"{wanted}\" does not identify exactly one site option"
+                               + listing(page, field))
             values[field] = pick[0]
         files = {}
         for key, input_name, flag, _ in DOCUMENTS:

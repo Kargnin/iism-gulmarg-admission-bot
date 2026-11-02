@@ -302,6 +302,9 @@ class Site:
         self.applications = []
         self.requests = 0
         self.request_log = []
+        self.request_condition = threading.Condition(self.lock)
+        self.active_requests = {}
+        self.request_serial = 0
         self.receipt_redirects = {}
         self.success_receipt = None
 
@@ -326,6 +329,28 @@ class Site:
     def snapshot(self):
         with self.lock:
             return {"applications": list(self.applications), "used": sorted(self.used), "requests": self.requests}
+
+    def begin_request(self, phone):
+        with self.request_condition:
+            self.request_serial += 1
+            request_id = self.request_serial
+            self.active_requests[request_id] = phone
+            self.request_condition.notify_all()
+            return request_id
+
+    def finish_request(self, request_id):
+        with self.request_condition:
+            self.active_requests.pop(request_id)
+            self.request_condition.notify_all()
+
+    def active_request_count(self, phone):
+        with self.request_condition:
+            return sum(active_phone == phone for active_phone in self.active_requests.values())
+
+    def wait_for_requests(self, phone, timeout):
+        with self.request_condition:
+            return self.request_condition.wait_for(
+                lambda: all(active_phone != phone for active_phone in self.active_requests.values()), timeout)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -418,6 +443,24 @@ class Handler(BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         page = url.path.rsplit("/", 1)[-1].lower()
         query = dict(urllib.parse.parse_qsl(url.query))
+        values, files = {}, {}
+        if method == "POST":
+            ctype = self.headers.get("Content-Type", "")
+            if ctype.startswith("multipart/form-data"):
+                values, files = parse_multipart(body, ctype)
+            else:
+                values = {k: v[0] for k, v in urllib.parse.parse_qs(
+                    body.decode(), keep_blank_values=True).items()}
+        previous = self.site.sessions.get(self.sid, {})
+        self.request_mobile = values.get("txtMobileNo") or query.get("mobile") or previous.get("mobile")
+        self.request_submit = bool(values.get("btnSubmit"))
+        request_id = self.site.begin_request(self.request_mobile)
+        try:
+            return self._route(method, page, query, values, files, url)
+        finally:
+            self.site.finish_request(request_id)
+
+    def _route(self, method, page, query, values, files, url):
         if page == "__state":
             return self.send(200, json.dumps(self.site.snapshot()), {"Content-Type": "application/json"})
         if page == "webresource.axd":
@@ -435,13 +478,6 @@ class Handler(BaseHTTPRequestHandler):
         if self.misbehave():
             return
         sess = self.site.sessions.setdefault(self.sid, {"mobile": None, "accepted": False})
-        values, files = {}, {}
-        if method == "POST":
-            ctype = self.headers.get("Content-Type", "")
-            if ctype.startswith("multipart/form-data"):
-                values, files = parse_multipart(body, ctype)
-            else:
-                values = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode(), keep_blank_values=True).items()}
         with self.site.lock:
             self.site.request_log.append({"method": method, "page": page, "sid": self.sid,
                                           "event": values.get("__EVENTTARGET", ""),

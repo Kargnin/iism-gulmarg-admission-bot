@@ -1,6 +1,6 @@
 // IISM Gulmarg booking bot - one person's config.
 //
-// Copy this file to config.jsonc (or any name, then run with --config <file>)
+// Copy this file to config.jsonc, or to configs/<name>.jsonc for another person,
 // and replace every FILL_ME - those are the fields the form marks as mandatory (*).
 // Lines starting with // are comments.
 {

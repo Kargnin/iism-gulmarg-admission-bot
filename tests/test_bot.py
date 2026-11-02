@@ -221,8 +221,29 @@ class Matching(unittest.TestCase):
         self.assertEqual(bot.match_choice(states, "Orissa", bot.state_aliases("Orissa"))[0], "21")
         self.assertEqual(bot.match_choice(states, "Ladakh")[0], "39")
         self.assertEqual(bot.match_choice(mock_site.DIET, "Vegetarian")[0], "Vegetarian")
-        self.assertEqual(bot.match_choice(mock_site.DIET, "non veg")[0], "Non-Vegetarian")
-        self.assertEqual(bot.match_choice(mock_site.EDUCATION, "Post Graduate")[0], "Post graduation")
+        self.assertEqual(bot.match_choice(mock_site.DIET, "Non-Vegetarian")[0], "Non-Vegetarian")
+        self.assertEqual(bot.match_choice(mock_site.EDUCATION, "Post graduation")[0], "Post graduation")
+        self.assertIsNone(bot.match_choice(mock_site.DIET, "non veg"))
+        self.assertIsNone(bot.match_choice(mock_site.EDUCATION, "Post Graduate"))
+        self.assertIsNone(bot.match_choice(states, "Andhra Pradesh N"))
+        self.assertIsNone(bot.match_choice([("1", "Same"), ("2", "same")], "same"))
+
+    def test_invalid_applicant_choices_list_current_options(self):
+        cases = [
+            (("address", "state"), "Andhra Pradesh N", "Andhra Pradesh"),
+            (("applicant", "education"), "Post Graduate", "Post graduation"),
+            (("applicant", "diet"), "non veg", "Non-Vegetarian"),
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            for path, value, accepted in cases:
+                with self.subTest(path=".".join(path)):
+                    cfg = make_config(Path(folder), PHONES[:1], ["G2 Basic"])
+                    cfg[path[0]][path[1]] = value
+                    errors = bot.parse_settings(cfg, None)[1]
+                    matching = [error for error in errors if ".".join(path) in error]
+                    self.assertEqual(len(matching), 1)
+                    self.assertIn("accepted choices:", matching[0])
+                    self.assertIn(accepted, matching[0])
 
     def test_server_messages(self):
         # the real page: checkFileSize() alert is code, the startup block mixes functions and a server alert
@@ -938,8 +959,20 @@ class EndToEnd(unittest.TestCase):
         self.site.slow_seconds = 0.3
         original = mock_site.Handler.misbehave
         injected = []
+        delayed_started = threading.Event()
+        feedback_waiting = threading.Event()
+        release_delayed = threading.Event()
+        forced_phone = []
+        forced_feedback = []
+        feedback_answers = []
+        coordination = []
 
         def finite_fault_burst(handler):
+            if handler.request_submit and not forced_phone:
+                forced_phone.append(handler.request_mobile)
+                delayed_started.set()
+                release_delayed.wait(5)
+                raise ConnectionResetError("injected final-request disconnect")
             if handler.site.requests > 40:
                 handler.site.chaos = handler.site.session_loss = handler.site.restarts = 0
             result = original(handler)
@@ -948,18 +981,49 @@ class EndToEnd(unittest.TestCase):
             return result
 
         def settled_feedback(phone, target, reason):
-            # A human must establish the outcome, not infer non-acceptance from an
-            # immediate absence while a timed-out server handler is still running.
-            time.sleep(self.site.slow_seconds + 0.1)
-            return self.feedback_from_receipts(phone, target, reason)
+            is_forced = bool(forced_phone) and phone == forced_phone[0] and not release_delayed.is_set()
+            active_before = self.site.active_request_count(phone)
+            if is_forced:
+                feedback_waiting.set()
+            settled = self.site.wait_for_requests(phone, 5)
+            answer = self.feedback_from_receipts(phone, target, reason)
+            feedback_answers.append((phone, answer))
+            if is_forced:
+                forced_feedback.append((active_before, settled, answer))
+            return answer
 
-        with mock.patch.object(mock_site.Handler, "misbehave", finite_fault_burst):
-            instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], timeout=15,
-                                     bot={"requestTimeoutSec": 0.2, "submitTimeoutSec": 0.2},
-                                     confirmation_handler=settled_feedback)
+        def release_after_feedback_waits():
+            ready = delayed_started.wait(5) and feedback_waiting.wait(5)
+            coordination.append(ready)
+            release_delayed.set()
+
+        coordinator = threading.Thread(target=release_after_feedback_waits, daemon=True)
+        coordinator.start()
+
+        try:
+            with mock.patch.object(mock_site.Handler, "misbehave", finite_fault_burst):
+                instance = self.run_with(PHONES, ["G2 Basic", "G3 Basic"], timeout=15,
+                                         bot={"requestTimeoutSec": 0.2, "submitTimeoutSec": 0.2},
+                                         confirmation_handler=settled_feedback)
+        finally:
+            release_delayed.set()
+            coordinator.join(1)
         self.assertTrue(injected)
+        self.assertEqual(coordination, [True])
+        self.assertEqual(len(forced_feedback), 1)
+        self.assertGreater(forced_feedback[0][0], 0)
+        self.assertEqual(forced_feedback[0][1:], (True, "not-booked"))
+        self.assertIn((forced_phone[0], "not-booked"), feedback_answers)
         self.assertTrue(instance.finished())
-        self.assertEqual(self.applied(), sorted([self.key("G2"), self.key("G3")]))
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed"),
+                                                ("G3 Basic", PHONES[1], "confirmed")])
+        applications = self.site.snapshot()["applications"]
+        self.assertEqual(len(applications), 2)
+        self.assertEqual({(app["course"], app["level"], app["schedule"]): app["mobile"]
+                          for app in applications},
+                         {self.key("G2"): PHONES[0], self.key("G3"): PHONES[1]})
+        self.assertEqual(self.site.used, set(PHONES[:2]))
+        self.assertNotIn(PHONES[2], self.site.used)
 
     def test_persistent_outage_keeps_retrying_until_stopped(self):
         def unavailable(handler):
