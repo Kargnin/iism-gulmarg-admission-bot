@@ -25,7 +25,7 @@ The current schema uses `applicant.diet`, top-level `phoneNumbers`, and `courseP
 "phoneNumbers": ["9000000011", "9000000012", "9000000013"]
 ```
 
-The first preference owns the first number, the second owns the second number, and both run in parallel. The third number is a reserve. Provide one unique primary per preference; extra numbers are reserves.
+The first preference owns the first number, the second owns the second number, and both run in parallel by default. The third number is a reserve. Provide one unique primary per preference; extra numbers are reserves.
 
 A worker takes an exclusively assigned reserve only after its number is explicitly already registered or persistently refused by mobile verification. Network errors, full/missing slots, and uncertain final submissions do not consume reserves. An exhausted worker alerts you and waits while the others continue.
 

@@ -36,7 +36,8 @@
   // One primary per preference in the same order. Extra numbers are reserves.
   "phoneNumbers": ["FILL_ME", "FILL_ME", "FILL_ME"],
 
-  // Your choices, best first. Each one is "<batch> <level or course>".
+  // Your independent choices, in primary-number order. Simple entries use
+  // "<batch> <level or course>"; README.md documents the object form.
   //   Gulmarg: G1 20 Dec-02 Jan, G2 03-16 Jan, G3 17-30 Jan, G4 31 Jan-13 Feb,
   //            G5 14-27 Feb, G6 28 Feb-13 Mar          Kargil: K1 08-21 Feb, K2 22 Feb-07 Mar
   //   Snow Skiing levels: Basic, Intermediate, Advance. Do not add a skiing level to
@@ -59,7 +60,7 @@
     "signature": "signature.jpg",        // mandatory
     "dobProof": "FILL_ME",               // mandatory: Class X marksheet, birth certificate, passport...
     "educationProof": "FILL_ME",         // mandatory: latest marksheet / degree
-    "parentSignature": "",               // only if the participant is under 18
+    "parentSignature": "",               // required under 18; optional for adults
     "domicileProof": "",                 // optional
     "skiingCertificate": "",             // for Intermediate / Advance: your previous course certificate
     "employmentProof": ""                // optional

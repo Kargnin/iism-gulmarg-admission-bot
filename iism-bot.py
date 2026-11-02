@@ -8,14 +8,13 @@ when the site is overloaded and keeps falling over:
 
   * Every configured preference has its own worker and primary phone number.
     Missing and full slots remain pending, and extra numbers are reserves.
-  * Never gives up - timeouts, 5xx errors, ASP.NET error pages and lost
-    sessions are retried with backoff until everything you asked for is
-    booked or you press Ctrl+C.
-  * Resumable - progress is saved under runs/<config name>/, so a restart
-    skips numbers and batches that are already booked.
+  * Recoverable timeouts, 5xx errors, ASP.NET error pages and lost sessions
+    retry with capped backoff; Ctrl+C cancels further requests.
+  * Resumable - confirmed and unresolved outcomes are saved in an
+    identity-isolated run directory.
 
 Usage:
-  python3 iism-bot.py --check        check config + documents and reach the site (sends no form data)
+  python3 iism-bot.py --check        check config + documents, then probe the site if valid (sends no form data)
   python3 iism-bot.py --discover     list the live courses/batches using your first number (never submits)
   python3 iism-bot.py --dry-run      full run that stops right before each final submit
   python3 iism-bot.py                book (waits until shortly before the opening time)
@@ -2820,7 +2819,8 @@ def find_config(arg):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Book every configured IISM course preference.")
     ap.add_argument("--config", help="config file (default: config.jsonc next to this script)")
-    ap.add_argument("--check", action="store_true", help="startup config/document preflight and one read-only site check")
+    ap.add_argument("--check", action="store_true",
+                    help="startup preflight and, if valid, one read-only site check")
     ap.add_argument("--discover", action="store_true", help="inspect course/level/batch postbacks without final submission")
     ap.add_argument("--dry-run", action="store_true", help="run preference workers without final submissions")
     ap.add_argument("--now", action="store_true", help="start immediately")
