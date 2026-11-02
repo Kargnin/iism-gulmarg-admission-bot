@@ -30,6 +30,7 @@ looks like, and how a used number or a full batch is reported.
 """
 
 import argparse
+import hashlib
 import html
 import json
 import random
@@ -189,6 +190,7 @@ FORM_LAYOUT = [
     ("select", "ddlCourse"), ("v", "rfvddlCourse"),
     ("select", "ddlCourseLevel"), ("v", "rfvddlCourseLevel"),
     ("select", "ddlScheduleCourse"), ("v", "rfvddlScheduleCourse"),
+    ("hidden", "hdfTypeOfCapacitySheet"), ("hidden", "hdfCapacitySheetAllocationId"),
     ("select", "ddlState"), ("v", "rfvddlState"),
     ("readonly", "txtAvailableSeat"),
     ("hidden", "hdfMinimumAge"), ("hidden", "hdfMaximumAge"), ("hidden", "hdfAgeCountDate"),
@@ -286,6 +288,8 @@ class Site:
         self.success_style = success_style  # "redirect", "alert" or "payment"
         self.shown_seats = {}             # seat counts the batch page shows instead of the real ones (stale)
         self.course_opens = {}            # course value -> epoch seconds it gets listed (default: opens_at)
+        self.batch_opens = {}             # slots may publish after their course is visible
+        self.level_postbacks = 0
         self.refuse_numbers = {}          # mobile -> message the first page answers it with (e.g. "invalid")
         self.hide_full = False            # take full batches (and fully booked courses) off the list
         self.check_used_at_start = True   # False: a used number gets through verification, refused at submit
@@ -604,9 +608,10 @@ class Handler(BaseHTTPRequestHandler):
     def open_batches(self, cv):
         """Batches of a course on show; with hide_full, a batch with no seats left at any level is gone."""
         course = self.site.courses[cv]
+        published = [b for b in course["batches"] if time.time() >= self.site.batch_opens.get(b[0], 0)]
         if not self.site.hide_full:
-            return course["batches"]
-        return [b for b in course["batches"]
+            return published
+        return [b for b in published
                 if any(self.site.seats.get((cv, lv, b[0]), 0) > 0 for lv, _ in course["levels"])]
 
     def listed_now(self):
@@ -670,12 +675,13 @@ class Handler(BaseHTTPRequestHandler):
             "ddlCourse": [("0", "Select Course")] + [(cv, self.site.courses[cv]["name"]) for cv in listed],
             "ddlCourseLevel": [("0", "Select Course Level")] + (course["levels"] if course else []),
             "ddlScheduleCourse": [("0", "Select Schedule Course")] + (
-                [b[:2] for b in self.open_batches(v["ddlCourse"])] if course else []),
+                [b[:2] for b in self.open_batches(v["ddlCourse"])] if course and level else []),
             "ddlState": STATES, "ddlEduationQualification": EDUCATION, "ddlVegetarianOrNon": DIET,
         }
         token = self.viewstate({name: [o for o, _ in opts] for name, opts in selects.items()}, listed)
         today = date.today()
         defaults = {"hdfAdmissionFormId": "0", "txtAvailableSeat": "0", "hdfMinimumAge": "0", "hdfMaximumAge": "0",
+                    "hdfTypeOfCapacitySheet": "synthetic-shared", "hdfCapacitySheetAllocationId": "0",
                     "hdfAgeCountDate": f"{today:%Y-%m-%d}", "txtCourseFee": "0", "hdfAgeCriteria": "0",
                     "txtMobileNo": mobile}
         check_file_size = (  # sits in the real page's <head>, before the form
@@ -694,7 +700,7 @@ class Handler(BaseHTTPRequestHandler):
                 out.append(f'<input type="hidden" name="{name}" id="{name}" value="{esc(value)}" />\n')
             elif kind == "select":
                 onchange = (f' onchange="javascript:setTimeout(&#39;__doPostBack(\\&#39;{name}\\&#39;,\\&#39;\\&#39;)&#39;, 0)"'
-                            if name in ("ddlCourse", "ddlScheduleCourse", "ddlState") else "")
+                            if name in ("ddlCourse", "ddlCourseLevel", "ddlScheduleCourse", "ddlState") else "")
                 out.append(f'<select name="{name}"{onchange} id="{name}" class="form-control">\n')
                 chosen = value if value in [o for o, _ in selects[name]] else None
                 for option, text in selects[name]:
@@ -765,12 +771,18 @@ class Handler(BaseHTTPRequestHandler):
                      hdfMinimumAge="0", hdfMaximumAge="0",
                      hdfAgeCriteria=str(course["criteria"]) if course else "0")
             return self.send(200, self.form(mobile, v, listed))
+        if event == "ddlCourseLevel":
+            site.level_postbacks += 1
+            v.update(ddlScheduleCourse="0", txtAvailableSeat="0", txtCourseFee="0",
+                     hdfCapacitySheetAllocationId="0")
+            return self.send(200, self.form(mobile, v, listed))
         if event == "ddlScheduleCourse":
             if course and batch:
                 key = (v["ddlCourse"], level and level[0], batch[0])
                 seats = site.shown_seats.get(key, site.seats.get(key, 0)) if level else 0
                 low, high = course["age"]
                 v.update(txtAvailableSeat=str(seats), hdfMinimumAge=str(low), hdfMaximumAge=str(high),
+                         hdfCapacitySheetAllocationId="synthetic-" + "-".join(str(part) for part in key),
                          hdfAgeCountDate="{0.month}/{0.day}/{0.year} 12:00:00 AM".format(course.get("count_date") or batch[2]),
                          txtCourseFee="0")
                 if v.get("txtDateOfBirth"):
@@ -812,6 +824,9 @@ class Handler(BaseHTTPRequestHandler):
             v["lblCheckError"] = ("Please accept the declaration.", "Red")
             return self.send(200, self.form(mobile, v, listed))
         key = (v["ddlCourse"], v["ddlCourseLevel"], v["ddlScheduleCourse"])
+        if (v.get("hdfTypeOfCapacitySheet") != "synthetic-shared" or
+                v.get("hdfCapacitySheetAllocationId") != "synthetic-" + "-".join(key)):
+            return self.ysod("The capacity allocation page state is invalid.")
         problem = None
         with site.lock:
             if mobile in site.used:
@@ -826,7 +841,9 @@ class Handler(BaseHTTPRequestHandler):
                 app_id = 1600 + len(site.applications) + 1
                 site.applications.append({"id": app_id, "mobile": mobile, "course": key[0], "level": key[1],
                                           "schedule": key[2], "name": v.get("txtName"), "fee": v.get("txtCourseFee"),
-                                          "files": sorted(n for n, (f, _) in files.items() if f)})
+                                          "files": sorted(n for n, (f, _) in files.items() if f),
+                                          "fileHashes": {n: hashlib.sha256(content).hexdigest()
+                                                         for n, (filename, content) in files.items() if filename}})
                 crash = site.crash_after_commit > 0
                 if crash:
                     site.crash_after_commit -= 1

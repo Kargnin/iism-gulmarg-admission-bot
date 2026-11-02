@@ -6,11 +6,8 @@ Books seats on https://admission.iismgulmarg.in by driving its ASP.NET
 WebForms pages over plain HTTP - no browser needed. Built for booking day,
 when the site is overloaded and keeps falling over:
 
-  * Course priorities - keeps trying your 1st choice until the site shows it
-    is full, then moves on to the 2nd, and so on.
-  * Several phone numbers - the site allows one booking per number, so once a
-    number has booked, the next number goes after your next choice. You end
-    up with one booking per number, best choices first.
+  * Every configured preference has its own worker and primary phone number.
+    Missing and full slots remain pending, and extra numbers are reserves.
   * Never gives up - timeouts, 5xx errors, ASP.NET error pages and lost
     sessions are retried with backoff until everything you asked for is
     booked or you press Ctrl+C.
@@ -27,12 +24,14 @@ Usage:
 """
 
 import argparse
+import hashlib
 import html
 import http.client
 import http.cookiejar
 import json
 import math
 import os
+import queue
 import random
 import re
 import shutil
@@ -49,6 +48,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from difflib import get_close_matches
 from html.parser import HTMLParser
 from pathlib import Path
@@ -74,16 +74,11 @@ BOT_DEFAULTS = {
     "notify": True,              # Mac notification + terminal bell on a booking
     "preventSleep": True,        # keep the Mac awake while the bot runs (caffeinate)
     "startEarlySec": 600,        # start looking this long before the published opening time
-    "pollSec": 2,                # until the snow courses are listed, look this often (one number at a time)
+    "pollSec": 2,                # each unfinished preference checks for its current date slot
     "requestTimeoutSec": 45,
     "submitTimeoutSec": 120,
     "retryDelaySec": 1.0,        # first retry delay; grows with repeated failures ...
     "maxRetryDelaySec": 10.0,    # ... up to this
-    "fullConfirmations": 2,      # a choice must look full this many times before moving on
-    "unlistedGraceSec": 300,     # once courses are listed, a batch that never showed up gets this long
-    "seatGraceSec": 120,         # "0 seats" while no batch shows seats counts as full only after this long
-    "recheckBlockedSec": 60,     # when every choice is full, look at them again this often
-    "missingAlertSec": 30,       # courses listed but a choice still can't be found after this long: alert
     "maxRejections": 3,          # site rejected the form this often for a choice -> move on
     "rejectedRetrySec": 5,       # pause after the site rejected the form
     # The form's own check asks for a parent/guardian signature even from adults. If the site
@@ -93,7 +88,7 @@ BOT_DEFAULTS = {
 }
 
 BOT_BOOLEAN_OPTIONS = {"parallel", "notify", "preventSleep", "parentSignatureFallback"}
-BOT_INTEGER_MINIMUMS = {"fullConfirmations": 1, "maxRejections": 1}
+BOT_INTEGER_MINIMUMS = {"maxRejections": 1}
 BOT_NUMBER_MINIMUMS = {
     "startEarlySec": (0, True),
     "pollSec": (0, False),
@@ -101,16 +96,12 @@ BOT_NUMBER_MINIMUMS = {
     "submitTimeoutSec": (0, False),
     "retryDelaySec": (0, False),
     "maxRetryDelaySec": (0, False),
-    "unlistedGraceSec": (0, True),
-    "seatGraceSec": (0, True),
-    "recheckBlockedSec": (0, False),
-    "missingAlertSec": (0, True),
     "rejectedRetrySec": (0, True),
     "statusEverySec": (0, False),
 }
 
 CONFIG_ROOT_KEYS = {
-    "applicant", "address", "phoneNumbers", "coursePriorities", "maxBookings",
+    "applicant", "address", "phoneNumbers", "coursePriorities",
     "bookingOpensAt", "scheduleFile", "batches", "documentsDir", "documents", "bot",
 }
 
@@ -249,6 +240,18 @@ class ConfigError(Exception):
 class Transient(Exception):
     """Temporary trouble (network, 5xx, error page): retry the same step."""
 
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class Cancelled(Exception):
+    """Stop requested; do not start another network operation."""
+
+
+class Uncertain(Exception):
+    """A final request may have committed; ask the user before another attempt."""
+
 
 class Refused(Transient):
     """The site answered with a message instead of moving on - not a server error, so something
@@ -331,7 +334,7 @@ def age_on(born, day):
 
 def document_applies(key, target, dob):
     if key == "parentSignature":
-        return bool(dob and age_on(dob, target.start) < 18)
+        return True  # optional for adults when explicitly configured; required only for minors
     if key == "skiingCertificate":
         return target.kind == "Snow Skiing" and target.level in ("Intermediate", "Advance")
     return True
@@ -600,6 +603,9 @@ def match_batch(options, target):
             start = date_match(found, target.start)
             if not start:
                 continue
+            written_dates = re.findall(r"\d{1,4}[/.\-]\d{1,2}[/.\-]\d{2,4}|\b\d{1,2}(?:st|nd|rd|th)?[\s\-/.]*[A-Za-z]{3,9}", text)
+            if target.end and len(written_dates) >= 2 and not date_match(found, target.end):
+                continue
             score = (10 * start + 5 * date_match(found, target.end) + location_score(text, target.location)
                      + level_score(text, target))
         if score > best_score:
@@ -792,6 +798,12 @@ def validate_batch_records(records, where):
             raise ConfigError(f"{where} has an invalid batch code {bid!r}")
         if not isinstance(record, dict):
             raise ConfigError(f"{where}.{bid} must be an object")
+        known = {"from", "to", "location", "offers", "seats"}
+        for key, value in record.items():
+            if key not in known:
+                raise ConfigError(f"{where}.{bid}.{key} is not supported")
+            if key != "offers" and not isinstance(value, str):
+                raise ConfigError(f"{where}.{bid}.{key} must be text")
         offers = record.get("offers", [])
         if not isinstance(offers, list) or any(not isinstance(item, str) for item in offers):
             raise ConfigError(f"{where}.{bid}.offers must be a list of course names")
@@ -801,23 +813,55 @@ def validate_batch_records(records, where):
 def validate_config_structure(cfg):
     if not isinstance(cfg, dict):
         raise ConfigError("config root must be an object")
+    errors = []
     unknown = sorted((key for key in cfg if key not in CONFIG_ROOT_KEYS), key=str)
     if unknown:
-        raise ConfigError("config has unknown option(s): " + ", ".join(map(str, unknown)))
+        errors.append("config has unknown option(s): " + ", ".join(map(str, unknown)))
+        if "maxBookings" in unknown:
+            errors.append("maxBookings was removed: every configured preference is booked; remove that key")
     for key in ("applicant", "address", "documents", "bot", "batches"):
         if key in cfg and not isinstance(cfg[key], dict):
-            raise ConfigError(f"{key} must be an object")
+            errors.append(f"{key} must be an object")
     for key in ("phoneNumbers", "coursePriorities"):
         if key in cfg and not isinstance(cfg[key], list):
-            raise ConfigError(f"{key} must be a list")
+            errors.append(f"{key} must be a list")
     for key in ("bookingOpensAt", "scheduleFile", "documentsDir"):
         if key in cfg and not isinstance(cfg[key], str):
-            raise ConfigError(f"{key} must be text")
-    for key, value in cfg.get("documents", {}).items():
-        if not isinstance(key, str) or not isinstance(value, str):
-            raise ConfigError("documents must map document names to file paths")
-    if "batches" in cfg:
-        validate_batch_records(cfg["batches"], "batches")
+            errors.append(f"{key} must be text")
+    allowed = {
+        "applicant": {key for _, section, key in TEXT_FIELDS if section == "applicant"} | {"education", "diet"},
+        "address": {key for _, section, key in TEXT_FIELDS if section == "address"} | {"state"},
+        "documents": {key for key, _, _, _ in DOCUMENTS},
+    }
+    for section, keys in allowed.items():
+        values = cfg.get(section, {})
+        if not isinstance(values, dict):
+            continue
+        for key, value in values.items():
+            if key not in keys:
+                errors.append(f"{section}.{key} is not a supported config key")
+            if not isinstance(value, str):
+                errors.append(f"{section}.{key} must be text")
+    if isinstance(cfg.get("phoneNumbers"), list):
+        for index, phone in enumerate(cfg["phoneNumbers"]):
+            if type(phone) not in (str, int):
+                errors.append(f"phoneNumbers[{index}] must be a phone number in text or integer form")
+    priority_keys = {"batch", "course", "level", "from", "to", "location", "label", "courseText", "levelText", "batchText"}
+    if isinstance(cfg.get("coursePriorities"), list):
+        for index, item in enumerate(cfg["coursePriorities"]):
+            if isinstance(item, dict):
+                for key, value in item.items():
+                    if key not in priority_keys or not isinstance(value, str):
+                        errors.append(f"coursePriorities[{index}].{key} must be a supported text field")
+            elif not isinstance(item, str):
+                errors.append(f"coursePriorities[{index}] must be text or a preference object")
+    if isinstance(cfg.get("batches"), dict):
+        try:
+            validate_batch_records(cfg["batches"], "batches")
+        except ConfigError as exc:
+            errors.append(str(exc))
+    if errors:
+        raise ConfigError("Startup preflight found:\n  - " + "\n  - ".join(errors))
 
 
 def load_season(cfg, config_dir):
@@ -854,13 +898,6 @@ class Settings:
 
 
 def validate_tuning(cfg, errors):
-    raw_wanted = cfg["maxBookings"] if "maxBookings" in cfg else 0
-    if type(raw_wanted) is not int or raw_wanted < 0:
-        errors.append("maxBookings must be an integer of 0 or greater")
-        wanted = 0
-    else:
-        wanted = raw_wanted
-
     opt = dict(BOT_DEFAULTS)
     raw_opt = cfg.get("bot", {})
     unknown = sorted((key for key in raw_opt if key not in BOT_DEFAULTS), key=str)
@@ -893,7 +930,9 @@ def validate_tuning(cfg, errors):
 
     if opt["maxRetryDelaySec"] < opt["retryDelaySec"]:
         errors.append("bot.maxRetryDelaySec must be at least bot.retryDelaySec")
-    return wanted, opt
+    if opt["maxRetryDelaySec"] > 10 or opt["retryDelaySec"] > 10:
+        errors.append("bot retry delays must be at most 10 seconds")
+    return opt
 
 
 def parse_settings(cfg, config_path):
@@ -904,8 +943,6 @@ def parse_settings(cfg, config_path):
     config_dir = s.config_path.parent if s.config_path else Path.cwd()
     s.batches, s.opens_at, s.season = load_season(cfg, config_dir)
     a = dict(cfg.get("applicant") or {})
-    if "diet" not in a and "vegetarian" in a:  # the old bot's name for it
-        a["diet"] = a["vegetarian"]
     addr = cfg.get("address") or {}
     sections = {"applicant": a, "address": addr}
 
@@ -933,14 +970,33 @@ def parse_settings(cfg, config_path):
             s.dob = None
         if s.dob is None:
             errors.append(f"applicant.dateOfBirth \"{dob_text}\" must be dd/mm/yyyy, e.g. 15/05/1998")
+    rules = load_jsonc(SCRIPT_DIR / "form-rules.json")
     email = s.applicant.get("email", "")
     if email and "FILL_ME" not in email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         errors.append(f"applicant.email \"{email}\" does not look like an email address")
     pin = str(addr.get("pincode") or "")
     if pin and "FILL_ME" not in pin and not re.fullmatch(r"\d{6}", pin.strip()):
-        warnings.append(f"address.pincode \"{pin}\" is not 6 digits")
+        errors.append(f"address.pincode \"{pin}\" must be 6 digits")
+    if email and "FILL_ME" not in email and not re.fullmatch(rules["emailPattern"], email):
+        errors.append("applicant.email does not satisfy the current form's email validator")
+    if s.dob and s.dob > now_ist().date():
+        errors.append("applicant.dateOfBirth is in the future")
+    emergency = a.get("emergencyContactPhone", "")
+    if emergency and "FILL_ME" not in emergency and not re.fullmatch(r"\d{10}", emergency):
+        errors.append("applicant.emergencyContactPhone must be 10 digits")
+    for field, value in s.form_values.items():
+        if len(value) > rules["maxLengths"].get(field, sys.maxsize):
+            errors.append(f"{field} exceeds the live form's {rules['maxLengths'][field]} character limit")
+    for field, key, wanted, aliases in (
+            ("ddlState", "address.state", s.state, state_aliases(s.state)),
+            ("ddlEduationQualification", "applicant.education", s.education, ()),
+            ("ddlVegetarianOrNon", "applicant.diet", s.diet, ())):
+        if wanted and "FILL_ME" not in wanted:
+            match = match_choice(rules["dropdowns"][field], wanted, aliases)
+            if match is None:
+                errors.append(f"{key} is not one of the current form's accepted choices")
 
-    raw_phones = cfg.get("phoneNumbers") or a.get("mobileNumbers") or ([a["mobile"]] if a.get("mobile") else [])
+    raw_phones = cfg.get("phoneNumbers") or []
     s.phones = []
     for raw in raw_phones:
         if "FILL_ME" in str(raw):
@@ -949,7 +1005,7 @@ def parse_settings(cfg, config_path):
         if phone is None:
             errors.append(f"phone number \"{raw}\" is not a 10-digit Indian mobile number")
         elif phone in s.phones:
-            warnings.append(f"phone number {raw} is listed twice")
+            errors.append(f"phone number {raw} is listed twice; primary and reserve numbers must be unique")
         else:
             s.phones.append(phone)
     if not s.phones and not any(p.startswith("phoneNumbers") for p in placeholders):
@@ -964,8 +1020,8 @@ def parse_settings(cfg, config_path):
         except ConfigError as e:
             errors.append(str(e))
             continue
-        if any(o.label == t.label for o in s.targets):
-            warnings.append(f"coursePriorities lists {t.label} twice; keeping the first")
+        if any(o.label == t.label or target_key(o) == target_key(t) for o in s.targets):
+            errors.append(f"coursePriorities duplicates a label or date/course preference: {t.label}")
             continue
         offers = (s.batches.get(t.batch_id) or {}).get("offers") or []
         if offers and t.kind not in offers:
@@ -976,9 +1032,12 @@ def parse_settings(cfg, config_path):
     if (any(document_applies("skiingCertificate", t, s.dob) for t in s.targets)
             and not cfg.get("documents", {}).get("skiingCertificate")):
         warnings.append("Intermediate/Advance choices need your previous course certificate in documents.skiingCertificate")
+    if any(target.level in ("Intermediate", "Advance") for target in s.targets):
+        warnings.append("Intermediate/Advance courses are not supported or validated yet; Basic skiing is the supported path")
 
-    wanted, s.opt = validate_tuning(cfg, errors)
-    s.max_bookings = min(wanted or len(s.phones), len(s.phones) or 1, len(s.targets) or 1)
+    s.opt = validate_tuning(cfg, errors)
+    if len(s.phones) < len(s.targets):
+        errors.append("phoneNumbers needs one primary number per course preference; additional numbers are reserves")
     if s.opens_at is None:
         warnings.append("no booking opening time configured (bookingOpensAt) - the bot starts right away")
 
@@ -1050,7 +1109,8 @@ def prepare_documents(settings, out_dir):
                 continue
             if required is True:
                 problems.append(f"documents.{key} is not set (the form requires it)")
-            elif required == "minor":
+            elif required == "minor" and any(settings.dob and age_on(settings.dob, t.start) < 18
+                                             for t in settings.targets):
                 problems.append(f"documents.{key} is not set (needed because the applicant is under 18)")
             continue
         if not src.is_file():
@@ -1086,6 +1146,21 @@ def prepare_documents(settings, out_dir):
         settings.docs[key] = dst
         page_note = " (first page)" if src.suffix.lower() == ".pdf" else ""
         notes.append(f"{key}: {src.name} {why} -> converted{page_note} to {dst} ({dst.stat().st_size // 1000} KB)")
+    prepared = {}
+    for key, path in settings.docs.items():
+        try:
+            upload = Upload(path)
+            is_png = upload.content.startswith(b"\x89PNG\r\n\x1a\n")
+            is_jpeg = upload.content.startswith(b"\xff\xd8\xff")
+            if not upload.content or len(upload.content) > MAX_UPLOAD_BYTES:
+                problems.append(f"documents.{key}: upload must be nonempty and at most 500 KB")
+            elif (upload.mime == "image/png" and not is_png) or (upload.mime == "image/jpeg" and not is_jpeg):
+                problems.append(f"documents.{key}: file content does not match its JPG/PNG extension")
+            else:
+                prepared[key] = upload
+        except OSError as exc:
+            problems.append(f"documents.{key}: cannot read configured file: {exc}")
+    settings.docs = prepared
     return problems, notes
 
 
@@ -1217,8 +1292,9 @@ class FormParser(HTMLParser):
 class Page:
     """A fetched page plus the controls of its <form>."""
 
-    def __init__(self, url, status, body, fresh=True):
+    def __init__(self, url, status, body, fresh=True, headers=None):
         self.url, self.status, self.body = url, status, body
+        self.headers = {key.lower(): value for key, value in (headers or {}).items()}
         self.fresh = fresh  # loaded by GET or redirect, i.e. not the echo of our own postback
         parser = FormParser()
         try:
@@ -1289,6 +1365,16 @@ class Page:
         return clean_html(m.group(1)) if m else ""
 
 
+class Upload:
+    """A startup snapshot; workers never reopen a user's mutable file."""
+
+    def __init__(self, path):
+        path = Path(path)
+        self.name = path.name
+        self.content = path.read_bytes()
+        self.mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+
+
 class Multipart:
     def __init__(self):
         self.boundary = "----WebKitFormBoundary" + uuid.uuid4().hex[:16]
@@ -1301,11 +1387,9 @@ class Multipart:
     def field(self, name, value):
         self.parts.append(self._head(name) + b"\r\n" + str(value).encode("utf-8") + b"\r\n")
 
-    def file(self, name, path=None):
-        if path:
-            path = Path(path)
-            data, filename = path.read_bytes(), path.name.replace('"', "")
-            ctype = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    def file(self, name, upload=None):
+        if upload is not None:
+            data, filename, ctype = upload.content, upload.name.replace('"', ""), upload.mime
         else:
             data, filename, ctype = b"", "", "application/octet-stream"
         self.parts.append(self._head(name, filename) + f"Content-Type: {ctype}\r\n\r\n".encode() + data + b"\r\n")
@@ -1317,11 +1401,49 @@ class Multipart:
         return "multipart/form-data; boundary=" + self.boundary
 
 
+def origin(url):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise ConfigError("The request URL has an invalid origin.")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ConfigError("The request URL has an invalid port.") from exc
+    return parsed.scheme.lower(), parsed.hostname.lower(), port
+
+
+class OriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, expected, stop):
+        self.expected, self.stop = expected, stop
+
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        if self.stop is not None and self.stop.is_set():
+            raise Cancelled()
+        if origin(new_url) != self.expected:
+            raise ConfigError("Blocked a redirect outside the configured admission site.")
+        return super().redirect_request(request, response, code, message, headers, new_url)
+
+
+def response_retry_after(page):
+    value = page.headers.get("retry-after", "")
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            moment = parsedate_to_datetime(value)
+            seconds = (moment - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, seconds) if math.isfinite(seconds) else None
+
+
 class Http:
     """Cookie-keeping HTTP client; every network-level failure becomes Transient."""
 
-    def __init__(self, base_url, timeout, log):
+    def __init__(self, base_url, timeout, log, stop=None):
         self.base_url = base_url.rstrip("/") + "/"
+        self.origin = origin(base_url)
+        self.stop = stop
         self.timeout = timeout
         self.log = log
         self.jar = http.cookiejar.CookieJar()
@@ -1334,12 +1456,20 @@ class Http:
             ctx.verify_mode = ssl.CERT_NONE
         self.verified = verify
         self.opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx),
-                                                  urllib.request.HTTPCookieProcessor(self.jar))
+                                                  urllib.request.HTTPCookieProcessor(self.jar),
+                                                  OriginRedirectHandler(self.origin, self.stop))
+
+    def check_destination(self, url):
+        if self.stop is not None and self.stop.is_set():
+            raise Cancelled()
+        if origin(url) != self.origin:
+            raise ConfigError("Blocked a form/request outside the configured admission site.")
 
     def get(self, path):
         return self.send("GET", urllib.parse.urljoin(self.base_url, path))
 
     def send(self, method, url, data=None, content_type=None, referer=None, timeout=None):
+        self.check_destination(url)
         timeout = timeout or self.timeout
         headers = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
                    "Accept-Language": "en-IN,en;q=0.9", "Cache-Control": "no-cache"}
@@ -1351,12 +1481,15 @@ class Http:
         try:
             with self.opener.open(request, timeout=timeout) as resp:
                 raw, status, final = resp.read(), resp.status, resp.geturl()
+                response_headers = dict(resp.headers)
         except urllib.error.HTTPError as e:
             try:
                 raw = e.read()
             except Exception:
                 raw = b""
             status, final = e.code, e.geturl() or url
+            response_headers = dict(e.headers)
+            e.close()
         except urllib.error.URLError as e:
             if isinstance(e.reason, ssl.SSLCertVerificationError) and self.verified:
                 self.log.warn("The site's HTTPS certificate did not verify - continuing without verification")
@@ -1368,7 +1501,8 @@ class Http:
         except (http.client.HTTPException, OSError) as e:
             raise Transient(f"connection problem: {type(e).__name__} {e}".strip())
         fresh = method == "GET" or final.split("#")[0] != url
-        return Page(final, status, raw.decode("utf-8", errors="replace"), fresh=fresh)
+        self.check_destination(final)
+        return Page(final, status, raw.decode("utf-8", errors="replace"), fresh=fresh, headers=response_headers)
 
 
 # ---------------------------------------------------------------------------
@@ -1406,7 +1540,7 @@ class Session:
     def restart(self, keep=False):
         """Start over from mobile verification (keep=True: continue from self.entry)."""
         if not keep or self.http is None:
-            self.http = Http(self.bot.base_url, self.bot.opt["requestTimeoutSec"], self.bot.log)
+            self.http = Http(self.bot.base_url, self.bot.opt["requestTimeoutSec"], self.bot.log, self.bot.stop)
             self.entry = None
         self.page = None        # latest admission form page
         self.form_url = None
@@ -1422,7 +1556,7 @@ class Session:
                 raise SessionLost("the site rejected our page state")
             what = f"HTTP {page.status}" if page.status >= 400 else "error page"
             title = page.title()
-            raise Transient(what + (f" ({title[:80]})" if title else ""))
+            raise Transient(what + (f" ({title[:80]})" if title else ""), response_retry_after(page))
         self.progress += 1
         return page
 
@@ -1430,6 +1564,7 @@ class Session:
         return self.checked(self.http.get(path))
 
     def postback(self, page, event, values, files=None, timeout=None):
+        self.http.check_destination(page.post_url)
         data = dict(page.fields())
         data.update({"__EVENTTARGET": event, "__EVENTARGUMENT": ""})
         data.update(values)
@@ -1551,20 +1686,26 @@ class Session:
         page = self.step(("form",), lambda p: self.open_form())
         course_options = page.options("ddlCourse")
         bot.saw_courses(course_options)
-        if bot.season_seen is None and not bot.scan_due(course_options):
-            raise NotOpen("the snow courses are not listed yet" + listing(page, "ddlCourse"))
         found, seen = None, {}  # seen: course -> its batches, to show if the choice can't be found
         for value, text in course_candidates(course_options, target, bot.course_hint.get(target.index)):
             self.cursor = 1
             page = self.step(("course", value), lambda p, v=value: self.select(
                 p, "ddlCourse", dict(first_values(p, "ddlCourseLevel", "ddlScheduleCourse"), ddlCourse=v)))
+            level_options = page.options("ddlCourseLevel")
+            level = match_level(level_options, target, loose=kind_score(text, target.kind) > 0)
+            if real_options(level_options) and level is None:
+                seen[text] = ["levels: " + " | ".join(t for _, t in real_options(level_options))]
+                continue
+            if level:
+                page = self.step(("level", value, level[0]), lambda p, v=level[0]: self.select(
+                    p, "ddlCourseLevel", dict(first_values(p, "ddlScheduleCourse"), ddlCourseLevel=v)))
             batches = page.options("ddlScheduleCourse")
             seen[text] = [t for _, t in real_options(batches)]
             if any(is_season_batch(t, bot.s.batches) for _, t in real_options(batches)):
                 bot.saw_season()
             batch = match_batch(batches, target)
             if batch:
-                found = ((value, text), batch)
+                found = ((value, text), level, batch)
                 break
         if not found:
             if bot.season_seen is None:
@@ -1575,17 +1716,8 @@ class Session:
                 lists.append("not opened (another kind of course): " + " | ".join(others))
             raise TargetFull(f"{target.when()} is not listed" + listing(page, "ddlScheduleCourse"),
                              kind=bot.unlisted_kind(target), site_lists=lists)
-        course, batch = found
+        course, level, batch = found
         bot.course_hint[target.index] = course[0]
-
-        level = None
-        level_options = page.options("ddlCourseLevel")
-        if real_options(level_options):
-            level = match_level(level_options, target, loose=kind_score(course[1], target.kind) > 0)
-            if level is None:
-                levels = " | ".join(t for _, t in real_options(level_options))
-                raise TargetFull(f"level {target.level or target.kind} is not listed" + listing(page, "ddlCourseLevel"),
-                                 kind=bot.unlisted_kind(target), site_lists=[f"{course[1]} / {batch[1]}: levels {levels}"])
         bot.saw_listed(target)
         values = {"ddlScheduleCourse": batch[0]}
         if level:
@@ -1594,8 +1726,6 @@ class Session:
                          lambda p: self.select(p, "ddlScheduleCourse", values))
         seats = to_int(page.value("txtAvailableSeat"))
         if seats == 0:
-            if bot.needs_evidence():
-                self.probe(page, batch[0], values)
             raise TargetFull("0 seats left", kind="shown")
         if seats:
             bot.saw_seats(target)
@@ -1617,19 +1747,10 @@ class Session:
                            final=True)
         return Selection(course, level, batch, state, seats, page.value("txtCourseFee"), page)
 
-    def probe(self, page, skip, values):
-        """0 seats right after the courses appear can just mean seats aren't loaded yet:
-        look at up to two other batches to learn whether anything is bookable."""
-        others = [v for v, _ in real_options(page.options("ddlScheduleCourse")) if v != skip][:2]
-        for value in others:
-            page = self.select(page, "ddlScheduleCourse", dict(values, ddlScheduleCourse=value))
-            if (to_int(page.value("txtAvailableSeat")) or 0) > 0:
-                self.bot.saw_seats(None)
-                return
-
     def submit(self, target, sel):
         bot = self.bot
         page = sel.page
+        self.http.check_destination(page.post_url)
         values = dict(bot.s.form_values)
         values.update({"ddlCourse": sel.course[0], "ddlScheduleCourse": sel.batch[0],
                        "txtMobileNo": self.phone, "chkIAgree": "on"})
@@ -1673,32 +1794,34 @@ class Session:
             resp = self.postback(page, event, values, files=files, timeout=bot.opt["submitTimeoutSec"])
             saved = bot.save_page(self.who, f"submit-{target.label}", resp)
             result = self.judge_submit(resp, target, sel, saved)
-        except Resend:
-            if self.unconfirmed is None:
-                bot.clear_submitting(self.phone)
+        except (Resend, Rejected, TargetFull, NotOpen, PhoneUsed, SessionLost):
+            bot.clear_submitting(self.phone)
             raise
-        except (Transient, SessionLost):
+        except (Cancelled, ConfigError):
+            raise
+        except Exception as exc:
             self.unconfirmed = target  # the site may have taken it; we never saw the answer
-            raise
-        except (Rejected, TargetFull, NotOpen):
-            if self.unconfirmed is None:
-                bot.clear_submitting(self.phone)
-            raise
+            raise Uncertain(str(exc)) from exc
         self.unconfirmed = None
         return result
 
     def judge_submit(self, resp, target, sel, saved):
+        self.http.check_destination(resp.url)
         parsed = urllib.parse.urlparse(resp.url)
         query = {k.lower(): v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
         msgs = self.msgs(resp) if resp.is_aspx else server_messages(resp.body)
-        said = " | ".join(msgs + list(query.values())).lower()
+        said = " | ".join(msgs).lower()
         own_page = resp.name in (INSTRUCTIONS_PAGE, CRITERIA_PAGE, FORM_PAGE)
         text = "" if own_page else resp.text().lower()
         path = parsed.path.lower()
-        # being redirected to a success/payment address proves the site took the form, even when
-        # that page itself then fails to load
-        redirected = "success" in path or "payment" in path or has_any(" ".join(query.values()).lower(), SUCCESS_PHRASES)
-        if redirected or (resp.status < 400 and (has_any(said, SUCCESS_PHRASES) or has_any(text, SUCCESS_PHRASES))):
+        actual_page = path.rsplit("/", 1)[-1]
+        hidden_id = resp.value("hdfAdmissionFormId") or ""
+        payment_receipt = (actual_page == "admission_formpayment.aspx" and query.get("rid")
+                           and hidden_id == query["rid"] and hidden_id != "0")
+        negative = has_any(said + " | " + text, ("not successfully", "unsuccessful", "not submitted", "failed", "could not", "error"))
+        explicit_success = has_any(said, SUCCESS_PHRASES) or (
+            actual_page == "admissionformsuccess.aspx" and has_any(text, SUCCESS_PHRASES))
+        if 200 <= resp.status < 300 and not negative and (explicit_success or payment_receipt):
             self.blank_returns = 0
             message = next((m for m in msgs if has_any(m.lower(), SUCCESS_PHRASES)), "") or query.get("resp", "")
             if not message:
@@ -1725,16 +1848,17 @@ class Session:
             title = resp.title()
             raise Transient(f"submit failed: HTTP {resp.status}" + (f" ({title[:80]})" if title else ""))
         if resp.name in (INSTRUCTIONS_PAGE, CRITERIA_PAGE):
-            self.entry, self.page = resp, None
-            raise SessionLost("the site sent us back to the start after submitting", resume=True)
+            raise Transient("the site sent us back to the start after submitting; outcome unknown")
         if resp.name == FORM_PAGE:
             bot = self.bot
             if (has_any(" ".join(msgs).lower(), ("parent", "guardian")) and not bot.parent_fallback
                     and not bot.s.docs.get("parentSignature") and bot.s.docs.get("signature")
+                    and bot.s.dob and age_on(bot.s.dob, target.start) >= 18
                     and bot.opt.get("parentSignatureFallback")):
                 bot.use_parent_fallback(reason)
                 raise Resend("the site wants a parent/guardian signature - resending with the applicant's signature")
-            if msgs:
+            meaningful = [m for m in msgs if not re.fullmatch(r"Your Age \d+ Years\.?", m, re.I)]
+            if meaningful:
                 raise Rejected(f"{reason} (page saved: {saved})")
             self.blank_returns += 1
             if self.blank_returns >= 4:
@@ -1745,6 +1869,8 @@ class Session:
 
     def book(self, target):
         sel = self.cascade(target)
+        if self.bot.stop.is_set():
+            raise Cancelled()
         if self.bot.dry_run:
             self.bot.log.info(f"{self.who}DRY RUN - would submit {target.label} now: {sel}")
             return {"message": f"dry run: {sel}", "applicationId": "", "dryRun": True}
@@ -1756,129 +1882,240 @@ class Session:
 # ---------------------------------------------------------------------------
 
 class State:
-    """Progress that survives restarts (bookings, used numbers)."""
+    """Versioned progress, locked for a run and atomically made durable before submit."""
 
     def __init__(self, path, enabled):
-        self.path, self.enabled = path, enabled
-        self.data = {"bookings": [], "phones": {}}
-        if enabled and path.exists():
-            try:
-                loaded = json.loads(path.read_text(encoding="utf-8"))
-                self.data["bookings"] = loaded.get("bookings") or []
-                self.data["phones"] = loaded.get("phones") or {}
-            except (OSError, ValueError):
-                path.rename(path.with_name(path.name + f".broken-{int(time.time())}"))
+        self.path, self.enabled = Path(path), enabled
+        self.lease = None
+        self.identity = None
+        self.data = {"version": 1, "identity": None, "bookings": [], "phones": {}, "assignments": {}}
+        self.reload()
+
+    def reload(self):
+        if not self.enabled or not self.path.exists():
+            return
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            if (not isinstance(value, dict) or value.get("version") != 1
+                    or not isinstance(value.get("identity"), str)
+                    or not isinstance(value.get("bookings"), list)
+                    or not isinstance(value.get("phones"), dict)
+                    or not isinstance(value.get("assignments"), dict)):
+                raise ValueError("invalid or outdated progress schema")
+            booked_phones, booked_targets = set(), set()
+            for item in value["bookings"]:
+                if (not isinstance(item, dict) or item.get("status") not in ("confirmed", "user-confirmed")
+                        or not isinstance(item.get("targetKey"), str) or not parse_phone(item.get("phone"))):
+                    raise ValueError("invalid booking record")
+                if item["phone"] in booked_phones or item["targetKey"] in booked_targets:
+                    raise ValueError("duplicate booking records")
+                booked_phones.add(item["phone"])
+                booked_targets.add(item["targetKey"])
+                phone_record = value["phones"].get(item["phone"], {})
+                if phone_record.get("status") != "booked" or phone_record.get("targetKey") != item["targetKey"]:
+                    raise ValueError("inconsistent booked phone")
+            for phone, item in value["phones"].items():
+                if (not parse_phone(phone) or not isinstance(item, dict)
+                        or item.get("status") not in ("used", "submitting", "booked")):
+                    raise ValueError("invalid phone record")
+                if item["status"] == "submitting" and not isinstance(item.get("targetKey"), str):
+                    raise ValueError("invalid pending submission")
+                if item["status"] == "booked" and phone not in booked_phones:
+                    raise ValueError("booked phone has no booking record")
+            if any(not isinstance(k, str) or not parse_phone(v) for k, v in value["assignments"].items()):
+                raise ValueError("invalid phone assignments")
+            if self.identity is not None and value.get("identity") != self.identity:
+                raise ValueError("progress belongs to a different applicant, season or site")
+            self.data = value
+        except (OSError, ValueError, TypeError) as exc:
+            raise ConfigError(f"Cannot safely read progress {self.path}: {exc}. "
+                              "Keep this file and reconcile existing applications before resetting it.") from exc
+
+    def bind(self, identity):
+        if self.data["identity"] not in (None, identity):
+            raise ConfigError("Saved progress belongs to a different applicant, season or site; use a separate config.")
+        self.identity = self.data["identity"] = identity
+
+    def acquire(self):
+        if not self.enabled or self.lease is not None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(self.path.with_suffix(".lock"), "a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                if handle.seek(0, os.SEEK_END) == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise ConfigError("Another booking process holds this config's progress lock, or the lock is not writable.") from exc
+        self.lease = handle
+        try:
+            self.reload()
+            if self.identity is not None:
+                self.bind(self.identity)
+        except Exception:
+            self.release()
+            raise
+
+    def release(self):
+        if self.lease is not None:
+            self.lease.close()
+            self.lease = None
 
     def save(self):
         if not self.enabled:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
-        os.replace(tmp, self.path)
+        if self.lease is None:
+            raise ConfigError("Progress must be locked before it can be changed.")
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
+                                             prefix=".state-", delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(self.data, stream, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+            if os.name != "nt":
+                fd = os.open(str(self.path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        except OSError as exc:
+            raise ConfigError(f"Cannot durably save progress: {exc}. No further submissions will be sent.") from exc
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+
+def target_key(target):
+    value = [target.location, target.start.isoformat(), target.end.isoformat() if target.end else "",
+             target.kind, target.level or target.level_text]
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).hexdigest()
 
 
 class Bot:
-    def __init__(self, settings, out_dir, base_url=DEFAULT_BASE_URL, dry_run=False, log=None):
+    """One persistent worker per preference; primary numbers and a shared reserve pool."""
+
+    def __init__(self, settings, out_dir, base_url=DEFAULT_BASE_URL, dry_run=False, log=None,
+                 confirmation_handler=None):
         self.s, self.opt = settings, settings.opt
         self.out_dir, self.base_url, self.dry_run = Path(out_dir), base_url, dry_run
         self.log = log or Log()
         self.targets, self.phones = settings.targets, settings.phones
-        self.wanted = settings.max_bookings
         self.opens_at = settings.opens_at or now_ist()
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.state = State(self.out_dir / "state.json", enabled=not dry_run)
-        self.bookings = []
-        self.booked = {}       # target index -> booking
-        self.blocked = {}      # target index -> {"why", "kind", "last"}: full or rejected, re-checked slowly
-        self.full_seen = {}
-        self.rejections = {}
-        self.claims = {}       # target index -> worker name
-        self.phone_state = {p: "free" for p in self.phones}
-        self.pending = {}      # phone -> label of a submit whose answer we never saw
-        self.season_seen = None   # when the snow courses first showed up on the form (monotonic)
+        identity = [settings.applicant.get(k, "") for k in ("name", "fatherName", "dateOfBirth")]
+        identity += [settings.season, origin(base_url)]
+        self.state.bind(hashlib.sha256(json.dumps(identity).encode()).hexdigest())
+        self.confirmation_handler = confirmation_handler or self.prompt_confirmation
+        self.questions = queue.Queue()
+        self.pending_questions = {}
+        self.failures = []
+        self.season_seen = None
         self.known_courses = set()
-        self.listed_once = set()  # targets whose batch has been on the list at some point
-        self.open_evidence = False  # some batch has shown seats
-        self.next_poll = 0.0      # see claim_poll
-        self.last_scan = None     # see scan_due
-        self.alerted = set()      # choices we raised the "can't find it" alert for
-        self.attention_seen = {}  # issue -> when it was last announced (see attention)
-        self.refusals = {}        # (phone, what) -> refusals in a row (see Refused)
-        self.parent_fallback = False  # send the applicant's signature as the parent/guardian one
+        self.listed_once = set()
+        self.alerted = set()
+        self.attention_seen = {}
+        self.refusals = {}
+        self.parent_fallback = False
         self.course_hint = {}
         self.status = {}
         self.notes = {}
         self.saved_pages = 0
+        self.blocked = {}
         self._restore()
 
     def _restore(self):
-        by_label = {t.label: t for t in self.targets}
+        self.bookings, self.booked, self.pending, self.assignments = [], {}, {}, {}
+        self.phone_state = {phone: "free" for phone in self.phones}
+        self.owners = {}
+        lookup = {target_key(t): t for t in self.targets}
         for booking in self.state.data["bookings"]:
-            self.bookings.append(booking)
-            t = by_label.get(booking.get("target"))
-            if t is not None:
-                self.booked.setdefault(t.index, booking)
-        for phone, info in self.state.data["phones"].items():
-            if phone not in self.phone_state:
-                continue
-            status = info.get("status")
-            if status in ("booked", "likely"):
-                self.phone_state[phone] = "booked"
-            elif status == "used":
-                self.phone_state[phone] = "used"
-            elif status == "submitting":
-                self.pending[phone] = info.get("target")
-
-    # -- helpers -------------------------------------------------------------
+            target = lookup.get(booking["targetKey"])
+            if target is not None:
+                self.booked[target.index] = booking
+                self.bookings.append(booking)
+        for phone, item in self.state.data["phones"].items():
+            if phone in self.phone_state:
+                self.phone_state[phone] = "free" if item["status"] == "submitting" else item["status"]
+            if item["status"] == "submitting":
+                if item["targetKey"] not in lookup:
+                    raise ConfigError("An unresolved submission belongs to a removed/changed preference. "
+                                      "Restore that preference and reconcile it before booking.")
+                if phone not in self.phone_state:
+                    raise ConfigError("An unresolved submission's phone was removed. Restore it before continuing.")
+                self.pending[phone] = item["targetKey"]
+        for key, phone in self.state.data["assignments"].items():
+            if key in lookup and phone in self.phone_state and self.phone_state[phone] == "free":
+                if phone in self.owners:
+                    raise ConfigError("Saved progress assigns one phone to multiple preferences.")
+                self.assignments[key] = phone
+                self.owners[phone] = key
 
     def sleep(self, seconds):
         self.stop.wait(max(0.0, seconds))
 
     def backoff(self, failures):
-        retry_delay = self.opt["retryDelaySec"]
-        max_delay = self.opt["maxRetryDelaySec"]
+        base = self.opt["retryDelaySec"]
+        cap = min(10.0, self.opt["maxRetryDelaySec"])
         exponent = max(0, failures - 1)
-        log_retry = math.log(retry_delay)
-        log_growth = math.log(1.6)
-        cap_exponent = (math.log(max_delay) - log_retry) / log_growth
-        if exponent == 0:
-            delay = retry_delay
-        elif exponent >= cap_exponent:
-            delay = max_delay
-        else:
-            delay = math.exp(log_retry + exponent * log_growth)
-        return min(max_delay, delay * random.uniform(0.7, 1.3))
+        limit = max(0.0, (math.log(cap) - math.log(base)) / math.log(1.6))
+        delay = cap if exponent >= limit else math.exp(math.log(base) + exponent * math.log(1.6))
+        return min(cap, delay * random.uniform(0.7, 1.3))
+
+    def retry_delay(self, failures, error):
+        delay = self.backoff(failures)
+        if error.retry_after is not None:
+            self.note("", f"Server requested Retry-After {error.retry_after:g}s; retry waits are capped at 10s.")
+            delay = max(delay, min(10.0, error.retry_after))
+        return min(10.0, delay)
 
     def poll_delay(self):
-        """Wait before looking again while nothing is bookable: every pollSec - whatever the clock
-        says, the site may open early or late - or every 30 s when started long before the
-        published opening time (e.g. with --now)."""
-        early = (self.opens_at - now_ist()).total_seconds() - self.opt["startEarlySec"]
-        return 30.0 if early > 60 else self.opt["pollSec"]
+        return min(10.0, self.opt["pollSec"])
 
     def note(self, who, message, every=60):
-        """Log a message, but the same one at most once a minute per worker."""
-        key = (who, message)
-        now = time.monotonic()
-        if now - self.notes.get(key, -1e9) >= every:
+        with self.lock:
+            key, now = (who, message), time.monotonic()
+            if now - self.notes.get(key, -1e9) < every:
+                return
             self.notes[key] = now
-            self.log.info(f"{who}{message}")
+        self.log.info(f"{who}{message}")
 
     def save_page(self, who, tag, page):
-        if self.saved_pages >= 500:
-            return None
-        self.saved_pages += 1
+        with self.lock:
+            if self.saved_pages >= 500:
+                return None
+            self.saved_pages += 1
         folder = self.out_dir / "responses"
-        folder.mkdir(parents=True, exist_ok=True)
-        name = re.sub(r"[^A-Za-z0-9.-]+", "_", f"{datetime.now():%Y%m%d-%H%M%S}-{who.strip('[] ')}-{tag}")
-        path = folder / f"{name}-{uuid.uuid4().hex[:4]}.html"
+        name = re.sub(r"[^A-Za-z0-9.-]+", "_", f"{datetime.now():%Y%m%d-%H%M%S}-{who}-{tag}")
+        path = folder / f"{name}-{uuid.uuid4().hex}.html"
         try:
+            folder.mkdir(parents=True, exist_ok=True)
             path.write_text(f"<!-- {page.status} {page.url} -->\n{page.body}", encoding="utf-8")
         except OSError:
             return None
         return path
+
+    def attention(self, key, title, lines, fix):
+        with self.lock:
+            now = time.monotonic()
+            if now - self.attention_seen.get(key, -1e9) < 600:
+                return
+            self.attention_seen[key] = now
+        self.log.banner([f"NEEDS YOUR ATTENTION: {title}"] + list(lines) + [f"To fix: {fix}"], "ERROR")
+        if self.opt["notify"]:
+            threading.Thread(target=notify, args=("IISM needs your attention", title, "Basso"), daemon=True).start()
 
     def set_status(self, worker, text):
         with self.lock:
@@ -1889,224 +2126,84 @@ class Bot:
 
     def status_line(self):
         with self.lock:
-            parts = [f"booked {len(self.bookings)}/{self.wanted}"]
-            if self.season_seen is None:
-                parts.append(f"snow courses not listed yet (checking every {self.opt['pollSec']}s)")
-            parts += [f"{w}: {text}" for w, text in sorted(self.status.items())]
-            full = [self.targets[i].label for i in sorted(self.blocked)]
-            if full:
-                parts.append("full/blocked: " + ", ".join(full))
-        return " | ".join(parts)
-
-    # -- phones --------------------------------------------------------------
+            return " | ".join([f"booked {len(self.booked)}/{len(self.targets)}"] +
+                              [f"{key}: {value}" for key, value in sorted(self.status.items())])
 
     def finished(self):
         with self.lock:
-            return (len(self.bookings) >= self.wanted or len(self.booked) >= len(self.targets)
-                    or not any(st in ("free", "busy") for st in self.phone_state.values()))
+            return all(target.index in self.booked for target in self.targets)
 
-    def take_phone(self):
+    def assign_phone(self, target):
         with self.lock:
-            if self.finished():
-                return None
-            for phone in self.phones:
-                if self.phone_state[phone] == "free":
-                    self.phone_state[phone] = "busy"
+            key = target_key(target)
+            assigned = self.assignments.get(key)
+            if assigned is not None:
+                return assigned
+            candidates = self.phones[target.index:target.index + 1] + self.phones[len(self.targets):]
+            for phone in candidates:
+                if self.phone_state[phone] == "free" and phone not in self.owners:
+                    self.assignments[key] = phone
+                    self.owners[phone] = key
+                    self.state.data["assignments"][key] = phone
+                    self.state.save()
                     return phone
-            return None
-
-    def release_phone(self, phone):
-        with self.lock:
-            if self.phone_state.get(phone) == "busy":
-                self.phone_state[phone] = "free"
-
-    def pending_target(self, phone):
-        label = self.pending.get(phone)
-        return next((t for t in self.targets if t.label == label), None)
+        return None
 
     def mark_submitting(self, phone, target):
         with self.lock:
-            self.pending[phone] = target.label
-            if not self.dry_run:
-                self.state.data["phones"][phone] = {"status": "submitting", "target": target.label,
-                                                    "at": now_ist().isoformat(timespec="seconds")}
-                self.state.save()
-
-    def use_parent_fallback(self, why):
-        with self.lock:
-            if self.parent_fallback:
-                return
-            self.parent_fallback = True
-        self.log.warn(f"The site refused the form without a parent/guardian signature ({why}). From now on the "
-                      "applicant's own signature goes in that slot (set bot.parentSignatureFallback to false to stop this).")
+            if self.stop.is_set():
+                raise Cancelled()
+            key = target_key(target)
+            self.pending[phone] = key
+            self.state.data["phones"][phone] = {"status": "submitting", "targetKey": key,
+                                                 "target": target.label, "at": now_ist().isoformat()}
+            self.state.save()
 
     def clear_submitting(self, phone):
-        """The site answered that submit (with a refusal), so nothing is pending for this number."""
         with self.lock:
             self.pending.pop(phone, None)
-            if not self.dry_run and self.state.data["phones"].get(phone, {}).get("status") == "submitting":
+            if self.state.data["phones"].get(phone, {}).get("status") == "submitting":
                 del self.state.data["phones"][phone]
                 self.state.save()
 
-    def phone_used(self, phone, unconfirmed, why):
-        """The site says the number is used. Right after a submit whose answer we never saw,
-        that means our submit went through; otherwise the number was used before."""
+    def phone_used(self, phone, target, why):
         with self.lock:
-            target = unconfirmed
-            if target is not None:
-                self._record(phone, target, "likely", {
-                    "message": f"site now says this number is used ({why}) - our submit for {target.label} "
-                               "most likely went through"})
-                return
+            if phone in self.pending:
+                raise Uncertain(why)
+            key = target_key(target)
             self.phone_state[phone] = "used"
-            if not self.dry_run:
-                self.state.data["phones"][phone] = {"status": "used", "note": why,
-                                                    "at": now_ist().isoformat(timespec="seconds")}
-                self.state.save()
-        self.log.warn(f"Number {mask(phone)} is already used on the site ({why}) - switching to the next number")
-        self.attention(("used", phone), f"number {mask(phone)} is already registered on the site",
-                       [f"Site says: {why}", "It is skipped; your other numbers carry on."],
-                       f"if that's unexpected, check phoneNumbers (or add another number), {RESTART_HINT}")
-
-    def number_refused(self, phone, what, why):
-        """The site keeps answering our mobile number (or the terms page) with a message.
-        Announce it after 2 in a row; give up on the number after maxRejections."""
-        with self.lock:
-            count = self.refusals[(phone, what)] = self.refusals.get((phone, what), 0) + 1
-            give_up = what == "number" and count >= self.opt["maxRejections"]
-            if give_up:
-                self.phone_state[phone] = "used"  # this run only - not saved, the next run tries it again
-        if count >= 2:
-            subject = f"the site refuses number {mask(phone)}" if what == "number" else "the terms page won't move on"
-            lines = [f"Site says: {why.split(': ', 1)[-1]}", f"That's {count} times in a row."]
-            if give_up:
-                lines.append(f"Number {mask(phone)} is skipped for the rest of this run; your other numbers carry on.")
-            self.attention(("refused", phone, what, give_up), subject, lines, fix_hint(why))
-        return give_up
+            self.assignments.pop(key, None)
+            self.owners.pop(phone, None)
+            self.state.data["assignments"].pop(key, None)
+            self.state.data["phones"][phone] = {"status": "used", "note": why}
+            self.state.save()
+        self.attention(("used", phone), f"number {mask(phone)} is already used/refused",
+                       [why, "This preference will use an available reserve number."],
+                       "check the configured number or add reserve numbers, then restart if needed")
 
     def number_accepted(self, phone):
         with self.lock:
-            for key in [k for k in self.refusals if k[0] == phone]:
-                del self.refusals[key]
+            self.refusals.pop(phone, None)
 
-    # -- choices -------------------------------------------------------------
-
-    def _claim(self, index, worker):
-        for i, w in list(self.claims.items()):
-            if w == worker:
-                del self.claims[i]
-        self.claims[index] = worker
-        return self.targets[index]
-
-    def pick_target(self, worker):
-        """Best choice that is not booked, not full and not being worked on by another number."""
+    def number_refused(self, phone, what, why):
         with self.lock:
-            free = [t for t in self.targets
-                    if t.index not in self.booked and self.claims.get(t.index) in (None, worker)]
-            for t in free:
-                if t.index not in self.blocked:
-                    return self._claim(t.index, worker)
-            # everything left is full, not listed or keeps being rejected: look again now and
-            # then - seats come back when bookings lapse, and a choice not listed may still be
-            # published (those are looked at every pollSec, so a newly listed course is noticed)
-            now = time.monotonic()
-            for t in free:
-                b = self.blocked[t.index]
-                every = self.opt["pollSec"] if b.get("kind") == "unlisted" else self.opt["recheckBlockedSec"]
-                if now - b["last"] >= every:
-                    b["last"] = now
-                    return self._claim(t.index, worker)
-            self.release_claims(worker)
-            return None
+            self.refusals[phone] = self.refusals.get(phone, 0) + 1
+            return what == "number" and self.refusals[phone] >= self.opt["maxRejections"]
 
-    def release_claims(self, worker):
+    def use_parent_fallback(self, why):
         with self.lock:
-            for i, w in list(self.claims.items()):
-                if w == worker:
-                    del self.claims[i]
-
-    # -- when is the site open, and when is a choice full -------------------
-    # Decided by what the site shows, not by the clock: the courses may be published early or
-    # late, one after another, and a course or batch disappears from the list once it is full.
-
-    def claim_poll(self):
-        """Until the snow courses show up, only one number at a time does the full
-        verify-and-look cycle (every pollSec); the rest wait for its news."""
-        with self.lock:
-            now = time.monotonic()
-            if now < self.next_poll:
-                return False
-            self.next_poll = now + self.poll_delay()
-            return True
-
-    def scan_due(self, course_options):
-        """Before the snow courses show up, look inside the listed courses only when the list
-        changes (or every 30 s); otherwise the verify-and-look cycle alone is enough."""
-        key = tuple(real_options(course_options))
-        with self.lock:
-            now = time.monotonic()
-            if self.last_scan and self.last_scan[0] == key and now - self.last_scan[1] < 30:
-                return False
-            self.last_scan = (key, now)
-            return True
+            self.parent_fallback = True
+        self.log.warn("The site insists on an adult's guardian-signature upload; using the applicant's "
+                      f"configured signature as authorized. Site says: {why}")
 
     def saw_courses(self, options):
-        """Note the course list of a freshly verified form. A snow course on it means the season is
-        published. A course that wasn't there before may hold a batch we stopped looking for."""
-        names = {t for _, t in real_options(options)}
         with self.lock:
-            new = sorted(names - self.known_courses) if self.known_courses else []
-            self.known_courses |= names
-            reopened = [i for i, b in self.blocked.items() if b["kind"] == "unlisted"] if new else []
-            for i in reopened:
-                del self.blocked[i]
-                self.full_seen.pop((i, "unlisted"), None)
-        if new:
-            self.log.info("New on the course list: " + ", ".join(new)
-                          + (f" - looking again for {', '.join(self.targets[i].label for i in reopened)}" if reopened else ""))
-        if any(kind_score(t, kind) > 0 for t in names for kind in KIND_PATTERNS):
-            self.saw_season()
-
-    def attention(self, key, title, lines, fix):
-        """Something only a person can fix - config, documents, a refused number: banner, beep and
-        Mac notification. Server trouble never comes here, that is simply retried. The same issue
-        is announced again at most every 10 minutes while it keeps happening."""
-        now = time.monotonic()
-        with self.lock:
-            if now - self.attention_seen.get(key, -1e9) < 600:
-                return
-            self.attention_seen[key] = now
-        body = [f"NEEDS YOUR ATTENTION: {title}"] + list(lines) + [f"To fix: {fix}", "The bot keeps going meanwhile."]
-        self.log.banner(body, "ERROR")
-        if self.opt.get("notify"):
-            threading.Thread(target=notify, args=(f"IISM bot: {title}"[:120], "Needs your attention - see the terminal",
-                                                  "Basso"), daemon=True).start()
-
-    def check_missing(self, target, kind, site_lists):
-        """Courses are listed but this choice still can't be matched: most likely its dates or
-        names differ from what we expect. Alert with what the site lists while the bot keeps trying."""
-        with self.lock:
-            if (kind != "unlisted" or self.season_seen is None or target.index in self.alerted
-                    or time.monotonic() - self.season_seen < self.opt["missingAlertSec"]):
-                return
-            self.alerted.add(target.index)
-        waited = int(time.monotonic() - self.season_seen)
-        wanted = f"a {target.kind} batch starting {target.start:%d %b %Y}" + (f", level {target.level}" if target.level else "")
-        lines = [f"The snow courses have been listed for {waited}s, but nothing matches this choice ({wanted}).",
-                 "The site lists:"]
-        lines += [f"  {line}" for line in site_lists] or ["  (nothing)"]
-        example = (f'{{"batch": "{target.batch_id or "G2"}", "level": "{target.level or "Basic"}", '
-                   '"courseText": "...", "batchText": "..."}')
-        self.attention(("missing", target.index), f"can't find {target.label} ({target.when()}) on the site", lines,
-                       f"correct the dates in schedule.json, or give this choice the site's own words in your config, "
-                       f"e.g. {example}, {RESTART_HINT}")
+            self.known_courses.update(text for _, text in real_options(options))
 
     def saw_season(self):
         with self.lock:
-            if self.season_seen is not None:
-                return
-            self.season_seen = time.monotonic()
-        self.log.banner(["The snow courses are on the list now - booking."])
+            if self.season_seen is None:
+                self.season_seen = time.monotonic()
 
     def saw_listed(self, target):
         with self.lock:
@@ -2115,223 +2212,211 @@ class Bot:
     def unlisted_kind(self, target):
         return "gone" if target.index in self.listed_once else "unlisted"
 
-    def full_allowed(self, kind):
-        """Whether a "no seats" sighting of this kind counts yet."""
-        if kind == "submit":
-            return True  # the site refused the submit itself
-        if self.season_seen is None:
-            return False  # nothing is published yet - the site may just be late
-        if kind == "gone":
-            return True  # it was on the list and has been taken off: full
-        listed_for = time.monotonic() - self.season_seen
-        if kind == "shown":  # 0 seats: right away if other batches show seats, else after a grace
-            return self.open_evidence or listed_for >= self.opt["seatGraceSec"]
-        return listed_for >= self.opt["unlistedGraceSec"]  # never listed: courses come one by one
-
-    def needs_evidence(self):
-        return not self.open_evidence and self.season_seen is not None
-
     def saw_seats(self, target):
         with self.lock:
-            self.open_evidence = True
-            if target is not None:
-                # seats on show cancel earlier "0 seats" / "not listed" sightings, but not the site
-                # refusing a submit for lack of seats (the count shown can be stale)
-                for kind in ("shown", "gone", "unlisted"):
-                    self.full_seen.pop((target.index, kind), None)
-                if self.blocked.get(target.index, {}).get("kind") in ("shown", "gone", "unlisted"):
-                    del self.blocked[target.index]
-                    self.log.info(f"{target.label} shows seats again")
+            self.blocked.pop(target.index, None)
 
-    def report_full(self, target, why, kind="shown"):
-        """Returns 'full' (move on), 'counted' (look again) or 'early' (doesn't count yet)."""
-        with self.lock:
-            if not self.full_allowed(kind):
-                return "early"
-            seen = self.full_seen[(target.index, kind)] = self.full_seen.get((target.index, kind), 0) + 1
-            if seen < self.opt["fullConfirmations"] and target.index not in self.blocked:
-                return "counted"
-            what = "not on the list" if kind == "unlisted" else "FULL"
-            if target.index not in self.blocked:
-                self.log.warn(f"{target.label} ({target.when()}) is {what}: {why} - moving on to the next choice")
-            self.blocked[target.index] = {"why": f"{'not listed' if kind == 'unlisted' else 'full'}: {why}",
-                                          "kind": kind, "last": time.monotonic()}
-            self.claims.pop(target.index, None)
-            return "full"
+    def check_missing(self, target, kind, site_lists):
+        if kind != "unlisted":
+            return
+        self.note("", f"{target.label}: waiting for the date slot; course names alone do not mean it has opened.")
 
-    def report_rejected(self, target, why, final=False):
+    def prompt_confirmation(self, phone, target, reason):
+        while not self.stop.is_set():
+            try:
+                answer = input(f"\n{target.label}, {mask(phone)}: reply was uncertain ({reason}). "
+                               "Check your application/email. Was it booked? [booked/not booked]: ").strip().lower()
+            except EOFError:
+                self.log.warn("No interactive input is available. This batch stays pending; restart interactively "
+                              "to confirm its outcome. Other batches continue.")
+                return None
+            if answer in ("b", "booked", "yes", "y"):
+                return "booked"
+            if answer in ("r", "retry", "not booked", "not-booked", "no", "n"):
+                return "not-booked"
+            self.log.warn("Please answer 'booked' or 'not booked'.")
+        return None
+
+    def confirm_uncertain(self, phone, target, reason):
+        question = {"phone": phone, "target": target, "reason": reason,
+                    "event": threading.Event(), "answer": None}
         with self.lock:
-            count = self.rejections[target.index] = self.rejections.get(target.index, 0) + 1
-            if final or count >= self.opt["maxRejections"]:
-                self.log.error(f"{target.label}: " + ("not possible for this applicant" if final else
-                               f"the site rejected the form {count} times") + " - moving on. "
-                               "Fix the config and restart if this is about your details.")
-                self.blocked[target.index] = {"why": f"rejected: {why}", "kind": "rejected",
-                                              "last": time.monotonic()}
-                self.claims.pop(target.index, None)
-                self.rejections[target.index] = 0
+            self.pending_questions[target.index] = question
+        self.attention(("uncertain", target.index), f"confirm whether {target.label} was booked",
+                       [reason, "This batch is held. Other batches continue; no reserve number is consumed."],
+                       "answer 'booked' or 'not booked' in the terminal after checking the actual outcome")
+        self.questions.put(question)
+        while not self.stop.is_set() and not question["event"].wait(0.1):
+            pass
+        with self.lock:
+            self.pending_questions.pop(target.index, None)
+        if self.stop.is_set():
+            raise Cancelled()
+        return question["answer"]
 
     def record_booking(self, phone, target, info):
         with self.lock:
-            self._record(phone, target, "dry-run" if info.get("dryRun") else "confirmed", info)
-
-    def _record(self, phone, target, status, info):
-        booking = {"target": target.label, "batch": target.when(), "phone": phone, "status": status,
-                   "at": now_ist().isoformat(timespec="seconds")}
-        booking.update({k: v for k, v in info.items() if k != "dryRun"})
-        self.bookings.append(booking)
-        self.booked.setdefault(target.index, booking)
-        self.claims.pop(target.index, None)
-        self.blocked.pop(target.index, None)
-        self.phone_state[phone] = "booked"
-        self.pending.pop(phone, None)
-        if not self.dry_run:
-            self.state.data["bookings"].append(booking)
-            self.state.data["phones"][phone] = {"status": "booked" if status == "confirmed" else "likely",
-                                                "target": target.label, "at": booking["at"]}
-            self.state.save()
-        headline = {"confirmed": "BOOKED", "likely": "PROBABLY BOOKED", "dry-run": "DRY RUN OK"}[status]
-        lines = [f"{headline}: {target.label} ({target.when()}) with number {mask(phone)}"]
-        if booking.get("message"):
-            lines.append(f"Site: {booking['message'][:200]}")
-        if booking.get("applicationId"):
-            lines.append(f"Application id: {booking['applicationId']}")
-        if status != "dry-run":
-            lines.append("Watch the applicant's email for the payment link.")
-        lines.append(f"Bookings so far: {len(self.bookings)} of {self.wanted}")
-        self.log.banner(lines, "WARN" if status == "likely" else "INFO")
-        if status != "dry-run" and self.opt.get("notify"):
-            title = "IISM seat booked" if status == "confirmed" else "IISM seat probably booked"
-            threading.Thread(target=notify, args=(title, f"{target.label} ({target.when()}) with {mask(phone)}"),
-                             daemon=True).start()
-        if self.finished():
-            self.stop.set()
-
-    # -- running -------------------------------------------------------------
+            key = target_key(target)
+            if target.index in self.booked:
+                return
+            status = "dry-run" if info.get("dryRun") else (
+                "user-confirmed" if info.get("userConfirmed") else "confirmed")
+            booking = {"target": target.label, "targetKey": key, "batch": target.when(), "phone": phone,
+                       "status": status, "at": now_ist().isoformat(timespec="seconds")}
+            booking.update({k: v for k, v in info.items() if k not in ("dryRun", "userConfirmed")})
+            if not self.dry_run:
+                self.state.data["bookings"].append(booking)
+                self.state.data["phones"][phone] = {"status": "booked", "targetKey": key, "target": target.label}
+                self.state.save()
+            self.bookings.append(booking)
+            self.booked[target.index] = booking
+            self.phone_state[phone] = "booked"
+            self.pending.pop(phone, None)
+            self.blocked.pop(target.index, None)
+        headline = "DRY RUN OK" if self.dry_run else ("BOOKED (confirmed by user)" if status == "user-confirmed" else "BOOKED")
+        self.log.banner([f"{headline}: {target.label} ({target.when()}) with {mask(phone)}",
+                         f"Completed {len(self.booked)} of {len(self.targets)} configured preferences.",
+                         "Watch the applicant's email for the payment link." if not self.dry_run else "Nothing submitted."])
+        if not self.dry_run and self.opt["notify"]:
+            threading.Thread(target=notify, args=("IISM booking", target.label), daemon=True).start()
 
     def run(self):
-        with self.lock:
-            free_phones = sum(1 for st in self.phone_state.values() if st == "free")
-            count = min(free_phones, self.wanted - len(self.bookings), len(self.targets) - len(self.booked))
-        workers = [Worker(self, n + 1) for n in range(max(1, count if self.opt["parallel"] else 1))]
-        for w in workers:
-            w.start()
-        last_status = time.monotonic()
+        workers = []
         try:
-            while any(w.is_alive() for w in workers):
-                for w in workers:
-                    w.join(0.5)
+            self.state.acquire()
+            self._restore()
+            todo = [t for t in self.targets if t.index not in self.booked]
+            waiting = list(todo)
+            if self.opt["parallel"]:
+                workers = [Worker(self, target) for target in waiting]
+                waiting = []
+            elif waiting:
+                workers = [Worker(self, waiting.pop(0))]
+            for worker in workers:
+                worker.start()
+            last_status = time.monotonic()
+            while workers or waiting:
+                if not self.opt["parallel"] and not any(w.is_alive() for w in workers) and waiting and not self.stop.is_set():
+                    worker = Worker(self, waiting.pop(0))
+                    workers.append(worker)
+                    worker.start()
+                try:
+                    question = self.questions.get_nowait()
+                except queue.Empty:
+                    question = None
+                if question is not None and not self.stop.is_set():
+                    answer = self.confirmation_handler(question["phone"], question["target"], question["reason"])
+                    if answer in ("booked", "not-booked"):
+                        question["answer"] = answer
+                        question["event"].set()
+                for worker in workers:
+                    worker.join(0.1)
+                workers = [w for w in workers if w.is_alive()]
+                if self.stop.is_set():
+                    waiting.clear()
                 if time.monotonic() - last_status >= self.opt["statusEverySec"]:
                     last_status = time.monotonic()
                     self.log.info("status: " + self.status_line())
         except KeyboardInterrupt:
-            self.log.warn("Stopping (Ctrl+C) - progress is saved, run again to continue")
+            self.log.warn("Stopping; pending submissions remain saved for confirmation on restart.")
             self.stop.set()
-            for w in workers:
-                w.join(3)
+        except ConfigError as exc:
+            self.failures.append(str(exc))
+            self.log.error(str(exc))
+            self.stop.set()
+        finally:
+            self.stop.set()
+            for worker in workers:
+                worker.join()
+            self.state.release()
         return self.bookings
 
 
 class Worker(threading.Thread):
-    def __init__(self, bot, number):
-        super().__init__(name=f"W{number}", daemon=True)
-        self.bot = bot
+    def __init__(self, bot, target):
+        super().__init__(name=f"W{target.index + 1}", daemon=True)
+        self.bot, self.target = bot, target
 
     def run(self):
-        bot = self.bot
+        bot, target = self.bot, self.target
+        phone = None
+        session = None
+        failures = 0
         try:
-            while not bot.stop.is_set():
-                phone = bot.take_phone()
+            while not bot.stop.is_set() and target.index not in bot.booked:
                 if phone is None:
-                    break
+                    phone = bot.assign_phone(target)
+                    if phone is None:
+                        bot.set_status(self.name, f"{target.label}: waiting for a usable reserve number")
+                        bot.attention(("exhausted", target.index), f"no usable number for {target.label}", [],
+                                      "add a reserve phone number to the config and restart")
+                        bot.sleep(10)
+                        continue
+                    session = Session(bot, phone, f"[{self.name} {mask(phone)}] ")
+                if phone in bot.pending:
+                    answer = bot.confirm_uncertain(phone, target, "a previous final submit has no confirmed reply")
+                    if answer == "booked":
+                        bot.record_booking(phone, target, {"userConfirmed": True, "message": "User verified the booking."})
+                        return
+                    bot.clear_submitting(phone)
+                    session.restart()
+                    session.fresh_needed = True
+                    session.unconfirmed = None
+                bot.set_status(self.name, f"{target.label} with {mask(phone)}")
+                progress = session.progress
                 try:
-                    self.use(phone)
-                finally:
-                    bot.release_phone(phone)
-                    bot.release_claims(self.name)
+                    info = session.book(target)
+                except Uncertain as exc:
+                    bot.note(session.who, f"{target.label}: final outcome needs your confirmation: {exc}")
+                    continue
+                except PhoneUsed as exc:
+                    bot.phone_used(phone, target, str(exc))
+                    phone, session = None, None
+                except (TargetFull, NotOpen) as exc:
+                    session.fresh_needed = True
+                    with bot.lock:
+                        bot.blocked[target.index] = {"why": str(exc), "kind": "pending"}
+                    bot.note(session.who, f"{target.label}: {exc}; keeping this preference pending")
+                    bot.sleep(bot.poll_delay())
+                except SessionLost as exc:
+                    session.fresh_needed = True
+                    bot.note(session.who, f"{exc}; refreshing the session")
+                    bot.sleep(bot.backoff(1))
+                except Refused as exc:
+                    session.fresh_needed = True
+                    if bot.number_refused(phone, exc.what, str(exc)):
+                        bot.phone_used(phone, target, str(exc))
+                        phone, session = None, None
+                    else:
+                        bot.sleep(min(10, bot.opt["rejectedRetrySec"]))
+                except Rejected as exc:
+                    session.fresh_needed = True
+                    with bot.lock:
+                        bot.blocked[target.index] = {"why": str(exc), "kind": "rejected"}
+                    bot.attention(("rejected", target.index, str(exc)), f"the site refused {target.label}",
+                                  [str(exc)], fix_hint(str(exc)))
+                    bot.sleep(min(10, bot.opt["rejectedRetrySec"]))
+                except Transient as exc:
+                    failures = 1 if session.progress > progress else failures + 1
+                    session.fresh_needed = session.fresh_needed or failures >= 6
+                    bot.note(session.who, f"{target.label}: {exc}; retrying with capped backoff")
+                    bot.sleep(bot.retry_delay(failures, exc))
+                else:
+                    bot.record_booking(phone, target, info)
+                    return
+        except Cancelled:
+            pass
+        except ConfigError as exc:
+            with bot.lock:
+                bot.failures.append(str(exc))
+            bot.log.error(str(exc))
+            bot.stop.set()
         except Exception:
-            bot.log.error(f"[{self.name}] crashed:\n{traceback.format_exc()}")
+            with bot.lock:
+                bot.failures.append(f"{target.label}: unexpected worker failure")
+            bot.log.error(f"[{self.name}] failed:\n{traceback.format_exc()}")
         finally:
             bot.set_status(self.name, None)
-
-    def use(self, phone):
-        """Book one choice with this number (or find out the number is used)."""
-        bot, log = self.bot, self.bot.log
-        who = f"[{self.name} {mask(phone)}] "
-        session = Session(bot, phone, who)
-        session.unconfirmed = bot.pending_target(phone)  # a submit cut short by the last run
-        fails, attempts, current = 0, 0, None
-        while not bot.stop.is_set() and not bot.finished():
-            target = bot.pick_target(self.name)
-            if target is None:
-                bot.set_status(self.name, f"{mask(phone)} waiting - every open choice is booked, full or taken")
-                bot.sleep(min(5.0, bot.opt["recheckBlockedSec"]))
-                continue
-            if bot.season_seen is None and session.fresh_needed and not bot.claim_poll():  # retries skip the queue
-                bot.set_status(self.name, f"{mask(phone)} -> {target.label}: waiting for the snow courses to be listed")
-                bot.sleep(0.25)
-                continue
-            if target is not current:
-                log.info(f"{who}going for {target.label} ({target.when()})")
-                current, attempts = target, 0
-            attempts += 1
-            bot.set_status(self.name, f"{mask(phone)} -> {target.label} (try {attempts})")
-            progress = session.progress
-            try:
-                info = session.book(target)
-            except PhoneUsed as e:
-                bot.phone_used(phone, session.unconfirmed, str(e))
-                return
-            except TargetFull as e:
-                session.fresh_needed = True
-                bot.check_missing(target, e.kind, e.site_lists)
-                verdict = bot.report_full(target, str(e), e.kind)
-                if verdict == "early":
-                    bot.note(who, f"{target.label}: {e} - not counting it as full yet, checking again")
-                elif verdict == "counted":
-                    log.info(f"{who}{target.label}: {e} - checking again")
-                bot.sleep(0 if verdict == "full" else bot.poll_delay())
-            except NotOpen as e:
-                session.fresh_needed = True
-                bot.note(who, f"not open yet: {e}")
-                if bot.season_seen is not None:  # before that, claim_poll paces the checks
-                    bot.sleep(bot.poll_delay())
-            except SessionLost as e:
-                session.fresh_needed = True
-                log.info(f"{who}{e} - starting over with the number")
-                bot.sleep(bot.backoff(1))
-            except Rejected as e:
-                session.fresh_needed = True
-                log.error(f"{who}{target.label}: site rejected the form: {e}")
-                bot.report_rejected(target, str(e), e.final)
-                why = re.sub(r"\s*\(page saved: [^)]*\)", "", str(e))
-                if e.final:
-                    bot.attention(("rejected", why), f"{target.label} isn't possible for this applicant",
-                                  [f"Site says: {why}", "This choice is skipped; the bot moves on to your next one."],
-                                  "nothing, if the details in your config are right; otherwise " + fix_hint(why))
-                else:
-                    bot.attention(("rejected", why), f"the site refused the form for {target.label}",
-                                  [f"Site says: {why}", "Retrying won't help until this is fixed."], fix_hint(why))
-                bot.sleep(0 if e.final else bot.opt["rejectedRetrySec"])
-            except Refused as e:
-                session.fresh_needed = True
-                log.warn(f"{who}{e}")
-                if bot.number_refused(phone, e.what, str(e)):
-                    return  # skip this number; the worker takes the next one
-                bot.sleep(bot.opt["rejectedRetrySec"])
-            except Transient as e:
-                # retry the step that failed; start over only if the same attempt keeps failing
-                fails = 1 if session.progress > progress else fails + 1
-                session.fresh_needed = session.fresh_needed or fails >= 6
-                log.info(f"{who}{e} - retrying" + (f" ({fails} failures in a row)" if fails > 1 else ""))
-                bot.sleep(bot.backoff(fails))
-            except Exception:
-                session.fresh_needed = True
-                log.error(f"{who}unexpected problem, starting over:\n{traceback.format_exc(limit=6)}")
-                bot.sleep(bot.backoff(5))
-            else:
-                bot.record_booking(phone, target, info)
-                return
 
 
 # ---------------------------------------------------------------------------
@@ -2341,11 +2426,14 @@ class Worker(threading.Thread):
 def describe_plan(settings, log, dry_run=False):
     log.info(f"Applicant: {settings.applicant.get('name', '?')}  (email {settings.applicant.get('email', '?')})")
     log.info(f"Numbers:   {', '.join(mask(p) for p in settings.phones)}")
-    log.info("Choices, best first:")
+    log.info("Preferences and their primary numbers:")
     for t in settings.targets:
-        log.info(f"  {t.index + 1}. {t.label:<20} {t.when()}")
+        number = mask(settings.phones[t.index]) if t.index < len(settings.phones) else "MISSING"
+        log.info(f"  {t.index + 1}. {t.label:<20} {t.when()}  primary {number}")
     mode = "parallel" if settings.opt["parallel"] else "one number at a time"
-    log.info(f"Goal: {settings.max_bookings} booking(s), one per number ({mode})" + (" - DRY RUN" if dry_run else ""))
+    reserves = settings.phones[len(settings.targets):]
+    log.info(f"Reserve numbers: {', '.join(mask(p) for p in reserves) or 'none'}")
+    log.info(f"Goal: every configured preference ({mode})" + (" - DRY RUN" if dry_run else ""))
 
 
 def wait_for_opening(settings, log, stop):
@@ -2373,7 +2461,7 @@ def print_summary(bot):
     log = bot.log
     lines = []
     for b in bot.bookings:
-        status = {"confirmed": "BOOKED", "likely": "PROBABLY BOOKED", "dry-run": "DRY RUN OK"}.get(b["status"], b["status"])
+        status = {"confirmed": "BOOKED", "user-confirmed": "USER CONFIRMED", "dry-run": "DRY RUN OK"}.get(b["status"], b["status"])
         extra = f"  application {b['applicationId']}" if b.get("applicationId") else ""
         lines.append(f"{status:<16} {b['target']:<16} {b.get('batch', ''):<28} number {mask(b['phone'])}{extra}")
     for t in bot.targets:
@@ -2386,9 +2474,9 @@ def print_summary(bot):
         lines.append("Numbers already used on the site: " + ", ".join(used))
     if unused:
         lines.append("Numbers not used: " + ", ".join(unused))
-    if any(b["status"] == "likely" for b in bot.bookings):
-        lines.append("PROBABLY BOOKED = we never saw the reply, but the site then said the number was used.")
-    if any(b["status"] in ("confirmed", "likely") for b in bot.bookings):
+    if bot.pending:
+        lines.append("Unresolved submissions are saved: confirm their outcome before booking those batches again.")
+    if any(b["status"] in ("confirmed", "user-confirmed") for b in bot.bookings):
         lines.append("Pay through the link sent to the applicant's email before it expires.")
     lines.append(f"Log and saved pages: {bot.out_dir}")
     log.banner(["RESULT"] + lines)
@@ -2492,83 +2580,91 @@ def find_config(arg):
         if not path.exists():
             raise ConfigError(f"config file not found: {path}")
         return path.resolve()
-    for name in ("config.jsonc", "config.json"):
-        if (SCRIPT_DIR / name).exists():
-            return SCRIPT_DIR / name
+    if (SCRIPT_DIR / "config.jsonc").exists():
+        return SCRIPT_DIR / "config.jsonc"
     raise ConfigError("no config found - copy config.example.jsonc to config.jsonc and fill it in")
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Book IISM Gulmarg courses.",
-                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("Usage:")[1])
+    ap = argparse.ArgumentParser(description="Book every configured IISM course preference.")
     ap.add_argument("--config", help="config file (default: config.jsonc next to this script)")
-    ap.add_argument("--check", action="store_true", help="check config, documents and the site; send nothing")
-    ap.add_argument("--discover", action="store_true", help="list the live courses/batches; never submits")
-    ap.add_argument("--dry-run", action="store_true", help="do everything except the final submit")
-    ap.add_argument("--now", action="store_true", help="start immediately instead of waiting for the opening time")
-    ap.add_argument("--phone", help="number to use with --discover (default: the first one)")
-    ap.add_argument("--reset-state", action="store_true", help="forget saved bookings/used numbers for this config")
+    ap.add_argument("--check", action="store_true", help="startup config/document preflight and one read-only site check")
+    ap.add_argument("--discover", action="store_true", help="inspect course/level/batch postbacks without final submission")
+    ap.add_argument("--dry-run", action="store_true", help="run preference workers without final submissions")
+    ap.add_argument("--now", action="store_true", help="start immediately")
+    ap.add_argument("--phone", help="configured number to use with --discover")
+    ap.add_argument("--reset-state", action="store_true", help="reset only progress without existing or pending applications")
     ap.add_argument("--base-url", default=DEFAULT_BASE_URL, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
-
-    log = Log()
+    log, bot, awake = Log(), None, None
     try:
         config_path = find_config(args.config)
-        cfg = load_jsonc(config_path)
-        settings, errors, warnings = parse_settings(cfg, config_path)
-    except ConfigError as e:
-        log.error(str(e))
-        return 2
-    out_dir = SCRIPT_DIR / "runs" / config_path.stem
-    if args.base_url != DEFAULT_BASE_URL:  # a rehearsal must not mark real numbers as booked
-        site = urllib.parse.urlparse(args.base_url)
-        out_dir = out_dir.with_name(f"{config_path.stem}@{site.hostname}_{site.port or ''}")
-    doc_problems, doc_notes = prepare_documents(settings, out_dir)
-
-    if args.check:
-        return run_check(settings, errors, warnings, doc_problems, doc_notes, args.base_url, log)
-    if args.discover and settings.phones:
-        errors, doc_problems = [], []  # looking around needs only a number
-    if errors or doc_problems:
-        for p in errors + doc_problems:
-            log.error(p)
-        log.error("Fix the above (python3 iism-bot.py --check shows everything) and run again.")
-        return 2
-    for w in warnings:
-        log.warn(w)
-
-    log.open(out_dir / "bot.log")
-    if args.reset_state and (out_dir / "state.json").exists():
-        backup = out_dir / f"state.json.bak-{datetime.now():%Y%m%d-%H%M%S}"
-        (out_dir / "state.json").rename(backup)
-        log.info(f"Saved progress moved to {backup}")
-    bot = Bot(settings, out_dir, base_url=args.base_url, dry_run=args.dry_run or args.discover, log=log)
-
-    if args.discover:
-        phone = parse_phone(args.phone) if args.phone else settings.phones[0]
-        if not phone:
-            log.error(f"--phone {args.phone} is not a 10-digit number")
+        settings, errors, warnings = parse_settings(load_jsonc(config_path), config_path)
+        identity = json.dumps([str(config_path.resolve()), origin(args.base_url), settings.season])
+        digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+        out_dir = SCRIPT_DIR / "runs" / f"{config_path.stem}-{digest}"
+        problems, notes = prepare_documents(settings, out_dir)
+        if args.check:
+            try:
+                State(out_dir / "state.json", True)
+            except ConfigError as exc:
+                problems.append(str(exc))
+            return run_check(settings, errors, warnings, problems, notes, args.base_url, log)
+        log.open(out_dir / "bot.log")
+        log.info("Startup preflight: configuration, form rules and documents")
+        for note in notes:
+            log.info(note)
+        for warning in warnings:
+            log.warn(warning)
+        if args.discover and settings.phones:
+            errors, problems = [], []
+        if errors or problems:
+            for problem in errors + problems:
+                log.error(problem)
+            log.error("Fix these startup problems before booking; --check lists them without submitting.")
             return 2
-        return run_discover(bot, phone)
-
-    if settings.opt.get("preventSleep"):
-        keep_awake()
-    describe_plan(settings, log, args.dry_run)
-    if bot.bookings:
-        log.info(f"Already booked earlier: {', '.join(b['target'] + ' (' + mask(b['phone']) + ')' for b in bot.bookings)}")
-    if bot.finished():
-        log.info("Nothing left to do for this config (use --reset-state to start over).")
-        print_summary(bot)
-        return 0
-    try:
-        if not args.now:
+        log.info("Startup preflight passed; all workers share the prepared upload snapshots.")
+        if args.reset_state:
+            old = State(out_dir / "state.json", True)
+            try:
+                old.acquire()
+                if old.data["bookings"] or any(i["status"] == "submitting" for i in old.data["phones"].values()):
+                    raise ConfigError("Cannot reset existing or unresolved applications. Reconcile them first; "
+                                      "use a distinct season/config for a new booking plan.")
+                if old.path.exists():
+                    backup = old.path.with_name(f"state.json.bak-{uuid.uuid4().hex}")
+                    old.path.rename(backup)
+                    log.info(f"Progress without applications moved to {backup}")
+            finally:
+                old.release()
+        bot = Bot(settings, out_dir, base_url=args.base_url, dry_run=args.dry_run or args.discover, log=log)
+        if args.discover:
+            phone = parse_phone(args.phone) if args.phone else settings.phones[0]
+            if phone not in settings.phones:
+                raise ConfigError("--phone must be one of this config's phoneNumbers")
+            return run_discover(bot, phone)
+        if settings.opt["preventSleep"]:
+            awake = keep_awake()
+        describe_plan(settings, log, args.dry_run)
+        if not bot.finished() and not args.now:
             wait_for_opening(settings, log, bot.stop)
-        log.info(f"Logging to {out_dir / 'bot.log'}")
-        bot.run()
+        if not bot.finished():
+            bot.run()
+        print_summary(bot)
+        return 0 if bot.finished() and not bot.failures else 1
     except KeyboardInterrupt:
-        log.warn("Stopped.")
-    print_summary(bot)
-    return 0 if bot.bookings else 1
+        if bot is not None:
+            bot.stop.set()
+        log.warn("Stopped. Any unresolved final requests remain saved for confirmation on restart.")
+        return 1
+    except (ConfigError, OSError, ValueError) as exc:
+        log.error(str(exc))
+        return 2
+    finally:
+        if awake is not None:
+            awake.terminate()
+        if log.file is not None:
+            log.file.close()
 
 
 if __name__ == "__main__":

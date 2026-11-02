@@ -1,0 +1,225 @@
+{
+  "source": "https://admission.iismgulmarg.in",
+  "observedAt": "2026-11-02T20:24:09.242458+05:30",
+  "maxLengths": {
+    "txtName": 50,
+    "txtFatherName": 50,
+    "txtNationality": 50,
+    "txtDateOfBirth": 10,
+    "txtDomicile": 50,
+    "txtHouseNoApartment": 50,
+    "txtStreetVillageColony": 250,
+    "txtDistrictCity": 50,
+    "txtPincode": 6,
+    "txtMobileNo": 10,
+    "txtBloodGroup": 50,
+    "txtMedicalCategory": 50,
+    "txtHeight": 50,
+    "txtWeight": 50,
+    "txtWaist": 50,
+    "txtShoeSize": 50,
+    "txtEmergencyContactName": 50,
+    "txtEmergencyContactPhone": 10
+  },
+  "dropdowns": {
+    "ddlState": [
+      [
+        "0",
+        "Select State"
+      ],
+      [
+        "35",
+        "ANDAMAN AND NICOBAR ISLANDS"
+      ],
+      [
+        "2",
+        "Andhra Pradesh"
+      ],
+      [
+        "37",
+        "ANDHRA PRADESH (NEW)"
+      ],
+      [
+        "28",
+        "ANDHRA PRADESH(BEFORE DIVISION)"
+      ],
+      [
+        "12",
+        "ARUNACHAL PRADESH"
+      ],
+      [
+        "18",
+        "ASSAM"
+      ],
+      [
+        "10",
+        "BIHAR"
+      ],
+      [
+        "4",
+        "CHANDIGARH"
+      ],
+      [
+        "22",
+        "CHATTISGARH"
+      ],
+      [
+        "26",
+        "DADRA AND NAGAR HAVELI"
+      ],
+      [
+        "25",
+        "DAMAN AND DIU"
+      ],
+      [
+        "7",
+        "DELHI"
+      ],
+      [
+        "30",
+        "GOA"
+      ],
+      [
+        "24",
+        "GUJARAT"
+      ],
+      [
+        "6",
+        "HARYANA"
+      ],
+      [
+        "38",
+        "HIMACHAL PRADESH"
+      ],
+      [
+        "1",
+        "JAMMU AND KASHMIR"
+      ],
+      [
+        "20",
+        "JHARKHAND"
+      ],
+      [
+        "29",
+        "KARNATAKA"
+      ],
+      [
+        "32",
+        "KERALA"
+      ],
+      [
+        "39",
+        "LADAKH"
+      ],
+      [
+        "31",
+        "LAKSHWADEEP"
+      ],
+      [
+        "23",
+        "MADHYA PRADESH"
+      ],
+      [
+        "27",
+        "MAHARASHTRA"
+      ],
+      [
+        "14",
+        "MANIPUR"
+      ],
+      [
+        "17",
+        "MEGHLAYA"
+      ],
+      [
+        "15",
+        "MIZORAM"
+      ],
+      [
+        "13",
+        "NAGALAND"
+      ],
+      [
+        "21",
+        "ODISHA"
+      ],
+      [
+        "34",
+        "PUDUCHERRY"
+      ],
+      [
+        "3",
+        "PUNJAB"
+      ],
+      [
+        "8",
+        "RAJASTHAN"
+      ],
+      [
+        "11",
+        "SIKKIM"
+      ],
+      [
+        "33",
+        "TAMIL NADU"
+      ],
+      [
+        "36",
+        "TELANGANA"
+      ],
+      [
+        "16",
+        "TRIPURA"
+      ],
+      [
+        "9",
+        "UTTAR PRADESH"
+      ],
+      [
+        "5",
+        "UTTARAKHAND"
+      ],
+      [
+        "19",
+        "WEST BENGAL"
+      ]
+    ],
+    "ddlEduationQualification": [
+      [
+        "0",
+        "Select"
+      ],
+      [
+        "High School",
+        "High School"
+      ],
+      [
+        "Intermediate",
+        "Intermediate"
+      ],
+      [
+        "Graduation",
+        "Graduation"
+      ],
+      [
+        "Post graduation",
+        "Post graduation"
+      ]
+    ],
+    "ddlVegetarianOrNon": [
+      [
+        "0",
+        "Select"
+      ],
+      [
+        "Vegetarian",
+        "Vegetarian"
+      ],
+      [
+        "Non-Vegetarian",
+        "Non-Vegetarian"
+      ]
+    ]
+  },
+  "emailPattern": "\\w+([-+.']\\w+)*@\\w+([-.]\\w+)*\\.\\w+([-.]\\w+)*"
+}

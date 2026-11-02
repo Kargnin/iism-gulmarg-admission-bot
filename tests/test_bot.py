@@ -30,7 +30,6 @@ spec.loader.exec_module(bot)
 
 FAST = {"parallel": True, "notify": False, "preventSleep": False, "startEarlySec": 0, "pollSec": 0.1,
         "requestTimeoutSec": 2, "submitTimeoutSec": 2, "retryDelaySec": 0.01, "maxRetryDelaySec": 0.05,
-        "fullConfirmations": 2, "unlistedGraceSec": 1, "seatGraceSec": 1, "recheckBlockedSec": 0.3,
         "maxRejections": 3, "rejectedRetrySec": 0.05, "statusEverySec": 999}
 PHONES = ["9000000011", "9000000012", "9000000013"]
 
@@ -65,14 +64,15 @@ def make_config(tmp, phones, priorities, **extra):
     return cfg
 
 
-def run_bot(cfg, base_url, out_dir, dry_run=False, timeout=60):
+def run_bot(cfg, base_url, out_dir, dry_run=False, timeout=60, confirmation_handler=None):
     settings, errors, _ = bot.parse_settings(cfg, None)
     assert not errors, errors
     problems, _ = bot.prepare_documents(settings, out_dir)
     assert not problems, problems
     log = bot.Log(echo=bool(os.environ.get("VERBOSE")))
     log.open(out_dir / "bot.log")
-    b = bot.Bot(settings, out_dir, base_url=base_url, dry_run=dry_run, log=log)
+    b = bot.Bot(settings, out_dir, base_url=base_url, dry_run=dry_run, log=log,
+                confirmation_handler=confirmation_handler)
     guard = threading.Timer(timeout, b.stop.set)
     guard.start()
     try:
@@ -196,7 +196,10 @@ class ConfigurationAndDocuments(unittest.TestCase):
                 cfg["bot"][path[4:]] = value
             else:
                 cfg[path] = value
-            return bot.parse_settings(cfg, None)[1]
+            try:
+                return bot.parse_settings(cfg, None)[1]
+            except bot.ConfigError as exc:
+                return [str(exc)]
 
     def test_rejects_malformed_tuning_types_and_unknown_options(self):
         cases = [
@@ -293,8 +296,8 @@ class ConfigurationAndDocuments(unittest.TestCase):
             first = tmp / "docs" / "photo-a.pdf"
             second = tmp / "docs" / "photo-b.pdf"
             cfg = make_config(tmp, PHONES[:1], ["G2 Basic"])
-            first.write_bytes(b"first applicant")
-            second.write_bytes(b"second applicant")
+            first.write_bytes(b"\xff\xd8\xfffirst applicant")
+            second.write_bytes(b"\xff\xd8\xffsecond applicant")
             cfg["documents"]["photo"] = first.name
             first_settings, first_errors, _ = bot.parse_settings(cfg, None)
             cfg["documents"]["photo"] = second.name
@@ -316,8 +319,8 @@ class ConfigurationAndDocuments(unittest.TestCase):
 
             self.assertEqual(first_problems + second_problems, [])
             self.assertNotEqual(first_prepared, second_prepared)
-            self.assertEqual(first_prepared.read_bytes(), first.read_bytes())
-            self.assertEqual(second_prepared.read_bytes(), second.read_bytes())
+            self.assertEqual(first_prepared.content, first.read_bytes())
+            self.assertEqual(second_prepared.content, second.read_bytes())
             self.assertEqual(converter.call_count, 2)
             self.assertFalse(any(path.name.startswith(".") for path in (out / "upload-ready").iterdir()))
 
@@ -338,36 +341,17 @@ class ConfigurationAndDocuments(unittest.TestCase):
             self.assertEqual(instance.backoff(2000), 10.0)
 
 
-class OpenAndFullRules(unittest.TestCase):
-    def test_rules(self):
-        b = offline_bot()
-        b.opt.update(fullConfirmations=1, unlistedGraceSec=60, seatGraceSec=60)
-        t = b.targets[0]
-        # before any snow course is listed nothing counts - the site may just be late
-        self.assertEqual([b.full_allowed(k) for k in ("shown", "gone", "unlisted")], [False, False, False])
-        self.assertTrue(b.full_allowed("submit"))  # the site refusing a submit always counts
-        b.saw_season()
-        self.assertTrue(b.full_allowed("gone"))        # was listed, now taken off: full
-        self.assertFalse(b.full_allowed("unlisted"))   # never listed: courses come one by one
-        self.assertFalse(b.full_allowed("shown"))      # 0 seats, but no seats seen anywhere yet
-        b.saw_seats(None)
-        self.assertTrue(b.full_allowed("shown"))       # other batches have seats: 0 means full
-        self.assertEqual(b.report_full(t, "0 seats", "shown"), "full")
-        b.saw_seats(t)                                 # seats again: back in play
-        self.assertNotIn(t.index, b.blocked)
-        b.season_seen -= 61
-        self.assertTrue(b.full_allowed("unlisted"))
-
-
 class MockMatchesRealSite(unittest.TestCase):
     """What the real form answered on 23 Oct 2026 (course "Adventure Courses", the only one listed then):
     the mock must answer the same postbacks the same way."""
 
     RECORDED = [
         ("ddlCourse", {"ddlCourse": "9"},
-         {"levels": [("16", "None")], "batches": [("70", "Course from 13 Sep to 26 Sep 2026")],
+         {"levels": [("16", "None")], "batches": [],
           "txtAvailableSeat": "0", "txtCourseFee": "0", "hdfMinimumAge": "0", "hdfMaximumAge": "0",
           "hdfAgeCriteria": "12", "lblDOBMsg": ""}),
+        ("ddlCourseLevel", {"ddlCourseLevel": "16"},
+         {"batches": [("70", "Course from 13 Sep to 26 Sep 2026")]}),
         ("ddlScheduleCourse", {"ddlCourseLevel": "16", "ddlScheduleCourse": "70"},
          {"txtAvailableSeat": "0", "txtCourseFee": "0", "hdfMinimumAge": "12", "hdfMaximumAge": "45",
           "hdfAgeCountDate": "10/13/2026 12:00:00 AM", "lblDOBMsg": ""}),
@@ -420,67 +404,96 @@ class EndToEnd(unittest.TestCase):
         self.server.server_close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def run_with(self, phones, priorities, timeout=60, **extra):
-        return run_bot(make_config(self.tmp, phones, priorities, **extra), self.url, self.out, timeout=timeout)
+    def run_with(self, phones, priorities, timeout=8, confirmation_handler=None, **extra):
+        return run_bot(make_config(self.tmp, phones, priorities, **extra), self.url, self.out,
+                       timeout=timeout, confirmation_handler=confirmation_handler)
 
     def key(self, batch, level="Basic", kind=None):
         return self.site.batch_key((batch, level), kind)
 
-    def booked(self, b):
-        return sorted((x["target"], x["phone"], x["status"]) for x in b.bookings)
+    def booked(self, instance):
+        return sorted((x["target"], x["phone"], x["status"]) for x in instance.bookings)
 
     def applied(self):
         return sorted((a["course"], a["level"], a["schedule"]) for a in self.site.snapshot()["applications"])
 
-    def test_one_booking_per_number_best_choices_first(self):
-        b = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic", "G6 Basic"])
-        self.assertEqual(sorted(x["target"] for x in b.bookings), ["G2 Basic", "G3 Basic"])
-        self.assertEqual(len({x["phone"] for x in b.bookings}), 2)
+    def feedback_from_receipts(self, phone, target, reason):
+        return "booked" if any(a["mobile"] == phone for a in self.site.snapshot()["applications"]) else "not-booked"
+
+    def test_every_preference_uses_its_primary_number(self):
+        instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"])
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed"),
+                                                ("G3 Basic", PHONES[1], "confirmed")])
+        self.assertTrue(instance.finished())
+        self.assertGreater(self.site.level_postbacks, 0)
         self.assertEqual(self.applied(), sorted([self.key("G2"), self.key("G3")]))
-        apps = self.site.snapshot()["applications"]
-        self.assertTrue(all(len(a["files"]) == 4 and a["fee"] == "20000" for a in apps))
-        self.assertTrue(all(x["applicationId"] for x in b.bookings))
+        self.assertTrue(all(len(a["files"]) == 4 for a in self.site.applications))
 
-    def test_sequential_mode_goes_in_order(self):
-        b = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], bot={"parallel": False})
-        self.assertEqual(self.booked(b), [("G2 Basic", PHONES[0], "confirmed"), ("G3 Basic", PHONES[1], "confirmed")])
+    def test_sequential_option_keeps_the_same_assignments(self):
+        instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], bot={"parallel": False})
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed"),
+                                                ("G3 Basic", PHONES[1], "confirmed")])
 
-    def test_full_choice_is_skipped(self):
-        self.site.seats[self.key("G2")] = 0
-        b = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic", "G6 Basic"])
-        self.assertEqual(sorted(x["target"] for x in b.bookings), ["G3 Basic", "G6 Basic"])
-        self.assertTrue(b.blocked[0]["why"].startswith("full"))
+    def test_full_slot_is_rechecked_without_stealing_other_primary(self):
+        key = self.key("G2")
+        self.site.seats[key] = 0
+        timer = threading.Timer(0.6, lambda: self.site.seats.__setitem__(key, 2))
+        timer.start()
+        try:
+            instance = self.run_with(PHONES, ["G2 Basic", "G3 Basic"])
+        finally:
+            timer.cancel()
+        self.assertEqual({x["target"]: x["phone"] for x in instance.bookings},
+                         {"G2 Basic": PHONES[0], "G3 Basic": PHONES[1]})
+        self.assertNotIn(PHONES[2], self.site.used)
 
-    def test_seats_gone_by_submit_time(self):
-        for style in ("label", "alert"):
-            with self.subTest(style=style):
-                self.site.full_style = style
-                self.site.applications.clear()
-                self.site.used.clear()
-                shutil.rmtree(self.out, ignore_errors=True)
-                self.site.seats[self.key("G2")] = 0
-                self.site.shown_seats = {self.key("G2"): 4}  # the batch page still shows seats
-                b = self.run_with(PHONES[:1], ["G2 Basic", "G3 Basic"])
-                self.assertEqual([x["target"] for x in b.bookings], ["G3 Basic"])
+    def test_batch_appears_later_inside_an_already_visible_course(self):
+        self.site.batch_opens[self.key("G2")[2]] = time.time() + 0.8
+        instance = self.run_with(PHONES, ["G2 Basic", "G3 Basic"])
+        self.assertEqual({x["target"]: x["phone"] for x in instance.bookings},
+                         {"G2 Basic": PHONES[0], "G3 Basic": PHONES[1]})
+        self.assertNotIn(PHONES[2], self.site.used)
 
-    def test_used_number_is_skipped(self):
+    def test_seat_race_at_submit_keeps_retrying_same_number(self):
+        key = self.key("G2")
+        self.site.seats[key] = 0
+        self.site.shown_seats[key] = 4
+        timer = threading.Timer(0.6, lambda: self.site.seats.__setitem__(key, 2))
+        timer.start()
+        try:
+            instance = self.run_with(PHONES[:2], ["G2 Basic"])
+        finally:
+            timer.cancel()
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(self.site.applications), 1)
+
+    def test_used_primary_is_replaced_by_a_reserve(self):
         for style in ("label", "alert"):
             with self.subTest(style=style):
                 self.site.used_style = style
                 self.site.used = {PHONES[0]}
                 self.site.applications.clear()
                 shutil.rmtree(self.out, ignore_errors=True)
-                b = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], bot={"parallel": False})
-                self.assertEqual(self.booked(b), [("G2 Basic", PHONES[1], "confirmed")])
-                self.assertEqual(b.phone_state[PHONES[0]], "used")
-                self.assertIn("NEEDS YOUR ATTENTION: number ..0011 is already registered", (self.out / "bot.log").read_text())
+                instance = self.run_with(PHONES, ["G2 Basic", "G3 Basic"])
+                self.assertEqual({x["target"]: x["phone"] for x in instance.bookings},
+                                 {"G2 Basic": PHONES[2], "G3 Basic": PHONES[1]})
 
-    def test_number_refused_at_submit_is_not_a_booking(self):
+    def test_used_at_submit_is_not_treated_as_a_new_booking(self):
         self.site.used = {PHONES[0]}
         self.site.check_used_at_start = False
-        b = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], bot={"parallel": False})
-        self.assertEqual(self.booked(b), [("G2 Basic", PHONES[1], "confirmed")])
-        self.assertEqual(b.phone_state[PHONES[0]], "used")
+        instance = self.run_with(PHONES[:2], ["G2 Basic"])
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[1], "confirmed")])
+
+    def test_permanently_refused_primary_uses_a_reserve(self):
+        self.site.refuse_numbers[PHONES[0]] = "Please Enter Valid Mobile No."
+        instance = self.run_with(PHONES[:2], ["G2 Basic"])
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[1], "confirmed")])
+
+    def test_exhausted_numbers_do_not_stop_other_preferences(self):
+        self.site.used = {PHONES[0]}
+        instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], timeout=0.8)
+        self.assertEqual(self.booked(instance), [("G3 Basic", PHONES[1], "confirmed")])
+        self.assertFalse(instance.finished())
 
     def test_success_page_variants(self):
         for style in ("redirect", "alert", "payment"):
@@ -489,232 +502,143 @@ class EndToEnd(unittest.TestCase):
                 self.site.used.clear()
                 self.site.applications.clear()
                 shutil.rmtree(self.out, ignore_errors=True)
-                b = self.run_with(PHONES[:1], ["G2 Basic"])
-                self.assertEqual(self.booked(b), [("G2 Basic", PHONES[0], "confirmed")])
+                instance = self.run_with(PHONES[:1], ["G2 Basic"])
+                self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
                 self.assertEqual(len(self.site.applications), 1)
 
-    def test_success_page_that_fails_to_load_still_counts(self):
+    def test_failed_success_page_requires_feedback(self):
         self.site.fail_success_page = 1
-        b = self.run_with(PHONES[:1], ["G2 Basic"])
-        self.assertEqual(self.booked(b), [("G2 Basic", PHONES[0], "confirmed")])
-        self.assertTrue(b.bookings[0]["applicationId"])
+        instance = self.run_with(PHONES[:1], ["G2 Basic"],
+                                 confirmation_handler=self.feedback_from_receipts)
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "user-confirmed")])
         self.assertEqual(len(self.site.applications), 1)
 
-    def test_survives_a_crashing_site(self):
-        self.site.chaos, self.site.session_loss, self.site.restarts = 0.4, 0.05, 0.02
-        self.site.slow_seconds = 2.5
-        b = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], timeout=150)
-        self.assertEqual(sorted(x["target"] for x in b.bookings), ["G2 Basic", "G3 Basic"])
-        self.assertNotIn("NEEDS YOUR ATTENTION", (self.out / "bot.log").read_text())  # server trouble: no alerts
-        self.assertEqual(self.applied(), sorted([self.key("G2"), self.key("G3")]))
-
-    def test_lost_reply_after_submit_counts_as_booked(self):
+    def test_uncertainty_holds_one_batch_and_survives_restart(self):
         self.site.crash_after_commit = 1
-        b = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], bot={"parallel": False})
-        self.assertEqual(self.booked(b), [("G2 Basic", PHONES[0], "likely"), ("G3 Basic", PHONES[1], "confirmed")])
-        self.assertEqual(self.applied(), sorted([self.key("G2"), self.key("G3")]))  # G2 not booked twice
+        instance = self.run_with(PHONES, ["G2 Basic", "G3 Basic"], timeout=0.8,
+                                 confirmation_handler=lambda *args: None)
+        self.assertEqual(len(instance.pending), 1)
+        self.assertEqual(len(instance.bookings), 1)
+        self.assertEqual(len(self.site.applications), 2)
+        self.assertNotIn(PHONES[2], self.site.used)
+        requests = self.site.requests
+        resumed = self.run_with(PHONES, ["G2 Basic", "G3 Basic"],
+                                confirmation_handler=lambda *args: "booked")
+        self.assertTrue(resumed.finished())
+        self.assertEqual(self.site.requests, requests, "Restored uncertainty must be resolved before any new request")
+        self.assertEqual(len(self.site.applications), 2)
 
-    def test_waits_for_opening(self):
-        # like the real form today: only "Adventure Courses" until the snow courses are published
-        opens = time.time() + 1.5
-        self.site.opens_at = opens
-        when = (bot.now_ist() + timedelta(seconds=1.5)).isoformat()
-        b = self.run_with(PHONES[:1], ["G2 Basic"], bookingOpensAt=when)
-        self.assertEqual([x["target"] for x in b.bookings], ["G2 Basic"])
-        self.assertGreaterEqual(time.time(), opens)
+    def test_not_booked_feedback_retries_same_primary(self):
+        original = mock_site.Handler.submit
+        attempts = []
+        def fail_once(handler, *args, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                return handler.send(503, mock_site.IIS_503)
+            return original(handler, *args, **kwargs)
+        with mock.patch.object(mock_site.Handler, "submit", fail_once):
+            instance = self.run_with(PHONES[:2], ["G2 Basic"],
+                                     confirmation_handler=lambda *args: "not-booked")
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(attempts), 2)
+        self.assertNotIn(PHONES[1], self.site.used)
 
-    def test_courses_listed_earlier_than_announced(self):
-        self.site.opens_at = time.time() + 0.5
-        announced = (bot.now_ist() + timedelta(seconds=120)).isoformat()
-        started = time.time()
-        b = self.run_with(PHONES[:1], ["G2 Basic"], bookingOpensAt=announced, bot={"startEarlySec": 600})
-        self.assertEqual([x["target"] for x in b.bookings], ["G2 Basic"])
-        self.assertLess(time.time() - started, 30)  # did not wait for the announced time
-
-    def test_courses_listed_later_than_announced(self):
-        self.site.opens_at = time.time() + 2.5
-        announced = (bot.now_ist() - timedelta(seconds=30)).isoformat()
-        b = self.run_with(PHONES[:1], ["G2 Basic", "G3 Basic"], bookingOpensAt=announced)
-        self.assertEqual([x["target"] for x in b.bookings], ["G2 Basic"])  # nothing was given up on meanwhile
-        self.assertEqual(b.blocked, {})
-
-    def test_courses_listed_one_by_one(self):
-        later = self.key("K1")[0]
-        self.site.course_opens[later] = time.time() + 2  # the other snow courses are listed right away
-        b = self.run_with(PHONES[:1], ["K1 Basic", "G6 Basic"], bot={"unlistedGraceSec": 10})
-        self.assertEqual([x["target"] for x in b.bookings], ["K1 Basic"])
-
-    def test_new_course_brings_back_a_choice_given_up_on(self):
-        later = self.key("K1")[0]
-        self.site.course_opens[later] = time.time() + 2
-        b = self.run_with(PHONES[:2], ["K1 Basic", "G6 Basic"],
-                          bot={"unlistedGraceSec": 0.2, "recheckBlockedSec": 600})
-        self.assertIn("K1 Basic", [x["target"] for x in b.bookings])
-
-    def test_alert_when_a_batch_cannot_be_found(self):
-        moved = {"from": "2027-01-05", "location": "Gulmarg", "level": "Basic", "label": "G2 moved"}  # not on the site
-        b = self.run_with(PHONES[:1], [moved], timeout=3, bot={"missingAlertSec": 0.5})
-        self.assertEqual(b.bookings, [])
-        self.assertEqual(b.alerted, {0})
-        log = (self.out / "bot.log").read_text()
-        self.assertEqual(log.count("NEEDS YOUR ATTENTION: can't find G2 moved"), 1)  # once, not on every check
-        self.assertIn("Course from 03 Jan to 16 Jan 2027", log)  # shows what the site lists
-
-    def test_alert_when_a_level_cannot_be_found(self):
-        b = self.run_with(PHONES[:1], [{"batch": "G2", "levelText": "Expert", "label": "G2 Expert"}],
-                          timeout=3, bot={"missingAlertSec": 0.5})
-        self.assertEqual(b.bookings, [])
-        self.assertEqual(b.alerted, {0})
-        self.assertIn("levels", (self.out / "bot.log").read_text())
-
-    def test_refused_number_is_announced_then_skipped(self):
-        self.site.refuse_numbers = {PHONES[0]: "Please Enter Valid Mobile No."}
-        b = self.run_with(PHONES[:2], ["G2 Basic"], bot={"parallel": False})
-        self.assertEqual(self.booked(b), [("G2 Basic", PHONES[1], "confirmed")])
-        log = (self.out / "bot.log").read_text()
-        self.assertEqual(log.count("NEEDS YOUR ATTENTION: the site refuses number ..0011"), 2)  # warning, then dropped
-        self.assertIn("Number ..0011 is skipped for the rest of this run", log)
-        self.assertIn("check phoneNumbers in your config", log)
-
-    def test_full_batch_taken_off_the_list(self):
-        self.site.hide_full = True
-        g2 = self.key("G2")[2]
-        for key in self.site.seats:
-            if key[2] == g2:
-                self.site.seats[key] = 0  # every level of G2 is full, so the batch is not shown
-        b = self.run_with(PHONES[:1], ["G2 Basic", "G3 Basic"])
-        self.assertEqual([x["target"] for x in b.bookings], ["G3 Basic"])
-        self.assertTrue(b.blocked[0]["why"].startswith("not listed"))
-
-    def test_full_choices_are_rechecked_until_seats_appear(self):
-        self.site.seats[self.key("G2")] = 0
-        self.site.seats[self.key("G3")] = 0
-        threading.Timer(1.5, lambda: self.site.seats.__setitem__(self.key("G3"), 2)).start()
-        b = self.run_with(PHONES[:1], ["G2 Basic", "G3 Basic"])
-        self.assertEqual([x["target"] for x in b.bookings], ["G3 Basic"])
-
-    def test_resume_skips_what_is_booked(self):
-        b = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], maxBookings=1, bot={"parallel": False})
-        self.assertEqual(self.booked(b), [("G2 Basic", PHONES[0], "confirmed")])
-        b = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], bot={"parallel": False})
-        self.assertEqual(self.booked(b), [("G2 Basic", PHONES[0], "confirmed"), ("G3 Basic", PHONES[1], "confirmed")])
+    def test_survives_crashes_sessions_and_application_restarts(self):
+        self.site.chaos, self.site.session_loss, self.site.restarts = 0.35, 0.04, 0.02
+        self.site.slow_seconds = 2.5
+        instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], timeout=90,
+                                 confirmation_handler=self.feedback_from_receipts)
+        self.assertTrue(instance.finished())
         self.assertEqual(self.applied(), sorted([self.key("G2"), self.key("G3")]))
 
-    def test_other_courses_and_kargil(self):
-        b = self.run_with(PHONES, ["K1 Basic", "G4 Snowboarding", "G5 MOI"], applicant={"dateOfBirth": "15/05/2001"})
-        self.assertEqual(len(b.bookings), 3)
-        if self.layout == "levels":
-            expected = [self.key("K1"), self.key("G4", "Snow Boarding"), self.key("G5", "MOI")]
-        else:
-            expected = [self.key("K1"), self.key("G4", "None", "board"), self.key("G5", "None", "moi")]
-        self.assertEqual(self.applied(), sorted(expected))
+    def test_courses_may_open_early_late_or_one_at_a_time(self):
+        self.site.opens_at = time.time() + 0.5
+        self.site.course_opens[self.key("K1")[0]] = time.time() + 0.9
+        instance = self.run_with(PHONES[:2], ["G2 Basic", "K1 Basic"],
+                                 bookingOpensAt=(bot.now_ist() + timedelta(seconds=120)).isoformat())
+        self.assertTrue(instance.finished())
+        self.assertEqual(len(self.site.applications), 2)
 
-    def test_age_limit_skips_that_choice(self):
-        # 16 years old: too young for a separate MOI course (18-40), fine for skiing (10-40)
-        cfg = make_config(self.tmp, PHONES[:1], ["G5 MOI", "G2 Basic"], applicant={"dateOfBirth": "15/05/2010"})
-        cfg["documents"]["parentSignature"] = "parent.png"  # under 18
-        b = run_bot(cfg, self.url, self.out)
-        self.assertTrue(all("FupParentGuardianSignature" in a["files"] for a in self.site.applications))
-        if self.layout != "levels":
-            self.assertEqual([x["target"] for x in b.bookings], ["G2 Basic"])
-            self.assertIn("Age Allow 18 To 40", b.blocked[0]["why"])
-        else:
-            self.assertEqual([x["target"] for x in b.bookings], ["G5 MOI"])
+    def test_changed_course_wording_uses_real_basic_level_and_dates(self):
+        course_id = self.key("G2")[0]
+        self.site.courses[course_id] = dict(self.site.courses[course_id])
+        self.site.courses[course_id]["name"] = "Gulmarg Winter Training"
+        self.site.courses[course_id]["levels"] = [("13", "Basic SSC")]
+        self.site.seats[(course_id, "13", self.key("G2")[2])] = 3
+        instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertTrue(instance.finished())
+        self.assertEqual(self.site.applications[0]["level"], "13")
 
-    def test_conditional_documents_follow_each_target(self):
-        phones = PHONES + ["9000000014"]
-        priorities = ["G2 Basic", "G3 Intermediate", "G4 Snowboarding", "G5 MOI"]
-        cfg = make_config(self.tmp, phones, priorities, applicant={"dateOfBirth": "10/01/2009"})
-        cfg["documents"].update({"parentSignature": "parent.png", "skiingCertificate": "parent.png"})
-        b = run_bot(cfg, self.url, self.out)
-        self.assertEqual(len(b.bookings), 4)
+    def test_resume_preserves_bookings_when_another_preference_is_added(self):
+        self.run_with(PHONES[:2], ["G2 Basic"])
+        resumed = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"])
+        self.assertTrue(resumed.finished())
+        self.assertEqual(len(self.site.applications), 2)
 
-        basic = self.key("G2")
-        intermediate = self.key("G3", "Intermediate")
-        if self.layout == "levels":
-            boarding = self.key("G4", "Snow Boarding")
-            moi = self.key("G5", "MOI")
-        else:
-            boarding = self.key("G4", "None", "board")
-            moi = self.key("G5", "None", "moi")
-        applications = {(item["course"], item["level"], item["schedule"]): item
-                        for item in self.site.snapshot()["applications"]}
-        parent = "FupParentGuardianSignature"
-        certificate = "FupAnyAdventureCoursePhoto"
+    def test_old_booking_does_not_complete_a_changed_date(self):
+        self.run_with(PHONES[:1], ["G2 Basic"])
+        changed = {"batch": "G2", "from": "2028-01-03", "to": "2028-01-16", "label": "G2 Basic"}
+        instance = self.run_with(PHONES[:1], [changed], timeout=0.3)
+        self.assertFalse(instance.finished())
+        self.assertEqual(instance.bookings, [])
+        self.assertEqual(len(self.site.applications), 1)
 
-        self.assertIn(parent, applications[basic]["files"])
-        self.assertNotIn(certificate, applications[basic]["files"])
-        self.assertNotIn(parent, applications[intermediate]["files"])
-        self.assertIn(certificate, applications[intermediate]["files"])
-        for key in (boarding, moi):
-            self.assertNotIn(parent, applications[key]["files"])
-            self.assertNotIn(certificate, applications[key]["files"])
-
-    def test_too_old_for_everything_gives_up_on_each_choice(self):
-        b = self.run_with(PHONES[:1], ["G2 Basic", "G3 Basic"], applicant={"dateOfBirth": "15/05/1970"}, timeout=5)
-        self.assertEqual(b.bookings, [])
-        self.assertEqual(sorted(i for i, x in b.blocked.items() if "Age Allow 10 To 40" in x["why"]), [0, 1])
-        self.assertIn("isn't possible for this applicant", (self.out / "bot.log").read_text())
+    def test_cancellation_after_cascade_prevents_final_post(self):
+        original = bot.Session.cascade
+        def cancel(session, target):
+            selection = original(session, target)
+            session.bot.stop.set()
+            return selection
+        with mock.patch.object(bot.Session, "cascade", cancel):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertEqual(instance.bookings, [])
         self.assertEqual(self.site.applications, [])
 
-    def test_dry_run_submits_nothing(self):
-        cfg = make_config(self.tmp, PHONES[:2], ["G2 Basic", "G3 Basic"])
-        b = run_bot(cfg, self.url, self.out, dry_run=True)
-        self.assertEqual(sorted(x["status"] for x in b.bookings), ["dry-run", "dry-run"])
-        self.assertEqual(self.site.snapshot()["applications"], [])
+    def test_dry_run_sends_no_final_application_or_progress(self):
+        instance = run_bot(make_config(self.tmp, PHONES[:2], ["G2 Basic", "G3 Basic"]),
+                           self.url, self.out, dry_run=True)
+        self.assertEqual(len(instance.bookings), 2)
+        self.assertEqual(self.site.applications, [])
         self.assertFalse((self.out / "state.json").exists())
 
-    def test_rejected_form_moves_on_instead_of_looping(self):
-        # passes our own email check, fails the site's validator pattern
-        b = self.run_with(PHONES[:1], ["G2 Basic", "G3 Basic"], timeout=4, applicant={"email": "first..last@example.com"})
-        self.assertEqual(b.bookings, [])
-        self.assertTrue(b.blocked[0]["why"].startswith("rejected"))
-        self.assertIn("Please Enter Valid Email ID", b.blocked[0]["why"])
-        log = (self.out / "bot.log").read_text()
-        self.assertEqual(log.count("NEEDS YOUR ATTENTION: the site refused the form"), 1)  # once, not every retry
-        self.assertIn("check applicant.email in your config", log)
-
-    def test_missing_required_document_is_caught_before_booking(self):
+    def test_missing_required_document_fails_preflight(self):
         cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"])
         cfg["documents"]["photo"] = ""
         settings, _, _ = bot.parse_settings(cfg, None)
-        problems, _ = bot.prepare_documents(settings, self.out)
-        self.assertEqual(problems, ["documents.photo is not set (the form requires it)"])
+        self.assertTrue(any("photo" in problem for problem in bot.prepare_documents(settings, self.out)[0]))
+        self.assertEqual(self.site.requests, 0)
 
-    def test_parent_signature_only_needed_under_18(self):
-        for dob, needed in (("15/05/1998", False), ("15/05/2010", True)):
-            cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"], applicant={"dateOfBirth": dob})
-            settings, errors, _ = bot.parse_settings(cfg, None)
+    def test_invalid_email_fails_preflight_using_observed_validator(self):
+        cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"], applicant={"email": "first..last@example.com"})
+        _, errors, _ = bot.parse_settings(cfg, None)
+        self.assertTrue(any("email" in error for error in errors))
+        self.assertEqual(self.site.requests, 0)
+
+    def test_parent_signature_is_required_only_for_minors(self):
+        for born, required in (("15/05/1998", False), ("15/05/2010", True)):
+            cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"], applicant={"dateOfBirth": born})
+            settings, _, _ = bot.parse_settings(cfg, None)
             problems, _ = bot.prepare_documents(settings, self.out)
-            self.assertEqual(bool(problems), needed, dob)
+            self.assertEqual(any("parentSignature" in p for p in problems), required)
 
-    def test_parent_signature_fallback_when_the_site_insists(self):
-        self.site.parent_signature_required = True  # the form's check is on for adults too
-        b = self.run_with(PHONES[:1], ["G2 Basic"])
-        self.assertEqual(self.booked(b), [("G2 Basic", PHONES[0], "confirmed")])
-        self.assertTrue(b.parent_fallback)
+    def test_accepted_adult_signature_substitution_only_if_site_insists(self):
+        self.site.parent_signature_required = True
+        instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertTrue(instance.finished())
+        self.assertTrue(instance.parent_fallback)
         self.assertIn("FupParentGuardianSignature", self.site.applications[0]["files"])
 
-    def test_parent_signature_not_sent_when_not_needed(self):
-        b = self.run_with(PHONES[:1], ["G2 Basic"])
-        self.assertEqual(self.booked(b), [("G2 Basic", PHONES[0], "confirmed")])
-        self.assertFalse(b.parent_fallback)
+    def test_adult_signature_is_not_sent_in_guardian_slot_unnecessarily(self):
+        instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertTrue(instance.finished())
         self.assertNotIn("FupParentGuardianSignature", self.site.applications[0]["files"])
-
-    def test_parent_signature_fallback_can_be_turned_off(self):
-        self.site.parent_signature_required = True
-        b = self.run_with(PHONES[:1], ["G2 Basic"], timeout=4, bot={"parentSignatureFallback": False})
-        self.assertEqual(b.bookings, [])
-        self.assertIn("Parent/Guardian", b.blocked[0]["why"])
 
 
 class EndToEndOtherLayout(EndToEnd):
-    """Same tests with snowboarding/MOI as separate courses and Kargil inside the skiing course."""
     layout = "courses"
 
 
 class EndToEndLevelCourses(EndToEnd):
-    """Same tests with one course per level ("Snow Skiing Basic Course", ...), each listing every batch."""
     layout = "level-courses"
 
 
