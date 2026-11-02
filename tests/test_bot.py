@@ -231,9 +231,22 @@ class Matching(unittest.TestCase):
         batches = bot.load_season({}, Path("."))[0]
         plain = bot.parse_priority({"batch": "G2", "level": "Basic"}, 0, batches)
         hinted = bot.parse_priority({"batch": "g2", "levelText": "Basic SSC", "label": "hinted"}, 1, batches)
+        stale_hint = bot.parse_priority({"batch": "G2", "course": "Snow Skiing",
+                                         "levelText": "Advance SSC", "label": "stale"}, 2, batches)
+        explicit_basic = bot.parse_priority({"batch": "G2", "course": "Snow Skiing", "level": "Basic",
+                                             "levelText": "Advance SSC"}, 3, batches)
+        explicit_advance = bot.parse_priority({"batch": "G2", "course": "Snow Skiing", "level": "Advance",
+                                               "levelText": "Basic SSC"}, 4, batches)
         self.assertEqual(plain.level, "Basic")
         self.assertEqual(hinted.level, "Basic")
+        self.assertEqual(stale_hint.level, "Basic")
+        self.assertEqual(explicit_basic.level, "Basic")
+        self.assertEqual(explicit_advance.level, "Advance")
         self.assertEqual(bot.target_key(plain), bot.target_key(hinted))
+        self.assertEqual(bot.target_key(plain), bot.target_key(stale_hint))
+        options = [("13", "Basic SSC"), ("15", "Advance SSC")]
+        self.assertEqual(bot.match_level(options, stale_hint, loose=True)[0], "13")
+        self.assertEqual(bot.match_level(options, explicit_advance, loose=True)[0], "15")
         board = bot.parse_priority({"batch": "G4", "course": "Snow Boarding"}, 0, batches)
         board_hint = bot.parse_priority({"batch": "G4", "course": "Snow Boarding",
                                          "levelText": "None", "label": "board hint"}, 1, batches)
@@ -371,9 +384,17 @@ class Matching(unittest.TestCase):
         self.assertEqual(bot.load_jsonc(path), {"url": "https://x//y", "list": [1, 2], "a": "b"})
 
     def test_phones(self):
-        self.assertEqual(bot.parse_phone("+91 98765 43210"), "9876543210")
-        self.assertEqual(bot.parse_phone("098765-43210"), "9876543210")
-        self.assertIsNone(bot.parse_phone("12345"))
+        valid = (
+            "9876543210", 9876543210, "+919876543210", "91 98765 43210", "098765-43210",
+            "+91 (98765) 43210", "(+91) 987-654-3210", "(9876543210)",
+        )
+        for value in valid:
+            with self.subTest(valid=value):
+                self.assertEqual(bot.parse_phone(value), "9876543210")
+        for value in ("12345", "Home: 9876543210", "unavailable", "9876543210 ext 2",
+                      "98765432100", "٩٨٧٦٥٤٣٢١٠"):
+            with self.subTest(invalid=value):
+                self.assertIsNone(bot.parse_phone(value))
 
 
 class ConfigurationAndDocuments(unittest.TestCase):
@@ -503,6 +524,45 @@ class ConfigurationAndDocuments(unittest.TestCase):
             self.assertEqual(settings.phones, [PHONES[0]])
             self.assertEqual(settings.applicant["name"], "नन्दिनी 李")
             self.assertEqual(settings.form_values["txtStreetVillageColony"], "桜通り")
+
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = make_config(Path(folder), ["(+91) 90000-00011"], ["G2 Basic"],
+                              applicant={"emergencyContactPhone": "(900) 000-0001"})
+            settings, errors, _ = bot.parse_settings(cfg, None)
+            self.assertEqual(errors, [])
+            self.assertEqual(settings.phones, [PHONES[0]])
+            self.assertEqual(settings.applicant["emergencyContactPhone"], "9000000001")
+            self.assertEqual(settings.form_values["txtEmergencyContactPhone"], "9000000001")
+
+            cfg = make_config(Path(folder), PHONES[:1], ["G2 Basic"],
+                              applicant={"emergencyContactPhone": "Home: 9000000001"})
+            self.assertTrue(any("emergencyContactPhone" in error for error in bot.parse_settings(cfg, None)[1]))
+
+    def test_discover_phone_uses_the_recognized_format_grammar(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            path = tmp / "config.json"
+            path.write_text(json.dumps(make_config(tmp, PHONES[:1], ["G2 Basic"])))
+            seen = []
+
+            def discover(instance, phone):
+                seen.append(phone)
+                return 0
+
+            patches = (
+                mock.patch.object(bot, "prepare_documents", return_value=([], [])),
+                mock.patch.object(bot, "Bot", return_value=object()),
+                mock.patch.object(bot, "run_discover", side_effect=discover),
+                mock.patch.object(bot.Log, "open"),
+                mock.patch.object(bot.Log, "write"),
+            )
+            with patches[0], patches[1], patches[2] as run_discover, patches[3], patches[4]:
+                self.assertEqual(bot.main(["--discover", "--config", str(path), "--base-url",
+                                           "http://127.0.0.1:9", "--phone", "(+91) 90000-00011"]), 0)
+                self.assertEqual(bot.main(["--discover", "--config", str(path), "--base-url",
+                                           "http://127.0.0.1:9", "--phone", "Home: 9000000011"]), 2)
+            self.assertEqual(seen, [PHONES[0]])
+            self.assertEqual(run_discover.call_count, 1)
 
     def test_booking_open_requires_an_explicit_time_but_keeps_supported_timestamps(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1625,6 +1685,15 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(instance.finished())
         self.assertEqual((self.site.applications[0]["course"], self.site.applications[0]["level"],
                           self.site.applications[0]["schedule"]), (course_id, level_id, batch_id))
+
+    def test_level_text_hint_does_not_change_the_basic_default(self):
+        course_id, basic_id, batch_id = self.key("G2")
+        priority = {"batch": "G2", "course": "Snow Skiing", "levelText": "Advance SSC"}
+        instance = self.run_with(PHONES[:1], [priority])
+        self.assertTrue(instance.finished())
+        self.assertEqual(instance.targets[0].level, "Basic")
+        self.assertEqual((self.site.applications[0]["course"], self.site.applications[0]["level"],
+                          self.site.applications[0]["schedule"]), (course_id, basic_id, batch_id))
 
     def test_date_only_generic_match_warns_but_still_attempts(self):
         course_id, _, batch_id = self.key("G2")

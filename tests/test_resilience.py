@@ -1274,7 +1274,8 @@ class Resilience(unittest.TestCase):
         site.success_receipt = (
             429,
             '<form action="AdmissionFormSuccess.aspx"><input name="__VIEWSTATE" value="a">'
-            '<span id="lblMsg">Application was rejected, but it was submitted successfully.</span></form>',
+            '<span id="lblMsg">Application was submitted, but not successfully because the request was rate '
+            'limited. Application submitted successfully.</span></form>',
             {},
         )
         answers = []
@@ -1299,7 +1300,9 @@ class Resilience(unittest.TestCase):
                 '<html><body><span id="lblMsg">Too many requests</span>'
                 '<p>Application was submitted</p></body></html>',
                 '<html><body><span id="lblMsg">This Mobile No. is already registered.</span>'
-                '<p>It was submitted</p></body></html>'):
+                '<p>It was submitted</p></body></html>',
+                "Application was submitted, but not successfully because the request was rate limited. "
+                "Application submitted successfully."):
             with self.subTest(body=body):
                 page = bot.Page("http://127.0.0.1:9/admission_form.aspx", 429, body)
                 with self.assertRaises(bot.Uncertain):
@@ -1307,7 +1310,11 @@ class Resilience(unittest.TestCase):
 
         for body in (
                 "Application was not submitted successfully because the request was rate limited",
-                "Application was submitted unsuccessfully because the request was rate limited"):
+                "Application was submitted unsuccessfully because the request was rate limited",
+                "Application was submitted, but not successfully because the request was rate limited",
+                "Application was submitted; not successfully because the request was rate limited",
+                "Application was registered; however, unsuccessfully because the request was rate limited",
+                "Application was saved yet not successfully because the request was rate limited"):
             with self.subTest(negative_body=body):
                 negative = bot.Page("http://127.0.0.1:9/admission_form.aspx", 429, body)
                 with self.assertRaises(bot.RateLimited):
@@ -1380,7 +1387,7 @@ class Resilience(unittest.TestCase):
             submitted.append(mobile)
             if len(submitted) == 1:
                 return handler.send(
-                    429, "Application was not submitted successfully because the request was rate limited",
+                    429, "Application was submitted, but not successfully because the request was rate limited",
                     {"Content-Type": "text/plain; charset=utf-8"})
             return original_submit(handler, mobile, values, files, listed, course, level, batch)
 

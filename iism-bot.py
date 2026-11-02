@@ -1037,8 +1037,7 @@ def parse_priority(item, index, batches):
     if kind != "Snow Skiing" and level is not None:
         raise ConfigError(f"coursePriorities[{index}] combines {kind} with skiing level {level}")
     if kind == "Snow Skiing" and level is None:
-        hinted_levels = configured_levels(spec.get("levelText") or "")
-        level = hinted_levels[0] if len(hinted_levels) == 1 else "Basic"
+        level = "Basic"
     name = bid or start.strftime("%d%b")
     label = spec.get("label") or f"{name} {level if kind == 'Snow Skiing' else kind}"
     end = configured_day(spec.get("to"), f"coursePriorities[{index}].to") or batch.get("to")
@@ -1052,7 +1051,20 @@ def parse_phone(raw):
     text = str(raw)
     if any(char.isnumeric() and char not in "0123456789" for char in text):
         return None
-    digits = re.sub(r"[^0-9]", "", text)
+    separator = r"(?:[ \t]*-[ \t]*|[ \t]+)"
+    prefix_separator = r"(?:[ \t]*-[ \t]*|[ \t]*)"
+    prefix = rf"(?:(?:\+91|91|0|\(\+91\)|\(91\)|\(0\)){prefix_separator})?"
+    subscriber = (
+        rf"(?:[0-9]{{10}}|[0-9]{{5}}{separator}[0-9]{{5}}|"
+        rf"\([0-9]{{5}}\)(?:{separator})?[0-9]{{5}}|"
+        rf"[0-9]{{3}}{separator}[0-9]{{3}}{separator}[0-9]{{4}}|"
+        rf"\([0-9]{{3}}\)(?:{separator})?[0-9]{{3}}{separator}[0-9]{{4}}|"
+        r"\([0-9]{10}\))"
+    )
+    normalized = text.strip()
+    if re.fullmatch(prefix + subscriber, normalized) is None:
+        return None
+    digits = re.sub(r"[^0-9]", "", normalized)
     if len(digits) == 12 and digits.startswith("91"):
         digits = digits[2:]
     elif len(digits) == 11 and digits.startswith("0"):
@@ -1267,8 +1279,13 @@ def parse_settings(cfg, config_path):
     if s.dob and s.dob > now_ist().date():
         errors.append("applicant.dateOfBirth is in the future")
     emergency = a.get("emergencyContactPhone", "")
-    if emergency and "FILL_ME" not in emergency and not re.fullmatch(r"[0-9]{10}", emergency):
-        errors.append("applicant.emergencyContactPhone must be 10 ASCII digits")
+    if emergency and "FILL_ME" not in emergency:
+        emergency_phone = parse_phone(emergency)
+        if emergency_phone is None:
+            errors.append("applicant.emergencyContactPhone must be a recognized 10-digit ASCII phone format")
+        else:
+            s.applicant["emergencyContactPhone"] = emergency_phone
+            s.form_values["txtEmergencyContactPhone"] = emergency_phone
     for field, value in s.form_values.items():
         if len(value) > rules["maxLengths"].get(field, sys.maxsize):
             errors.append(f"{field} exceeds the live form's {rules['maxLengths'][field]} character limit")
@@ -1935,7 +1952,8 @@ def affirmative_evidence(text):
                 suffix = envelope[match.end():]
                 if match.group(0).endswith("submitted") and re.match(r"\s+successfully\b", suffix):
                     continue
-                if re.match(r"\s+(?:not\s+successfully|unsuccessfully)\b", suffix):
+                if re.match(r"\s*(?:[,;:]\s*)?(?:(?:but|yet|however|although)(?:\s*[,;:])?\s+)?"
+                            r"(?:not\s+successfully|unsuccessfully)\b", suffix):
                     continue
                 if completion_reference_negated(prefix):
                     continue

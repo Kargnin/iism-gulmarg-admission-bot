@@ -45,6 +45,8 @@ Read the current dates and opening from `schedule.json` and show the available b
 
 Explain the phone mapping before finalizing the config: preference 1 owns number 1, preference 2 owns number 2, and so on; additional numbers are reserves. All preferences run in parallel by default and every configured preference is attempted. These are independent applications, not a ranked list that stops at the first success. A reserve is used only after an explicit already-used number or persistent mobile-verification refusal. Missing/full/unpublished slots and recoverable network failures keep the same phone. Do not add extra preferences merely to use all supplied numbers.
 
+Phone input must be wholly recognizable as a phone number. Keep values as strings in the private config; a leading `+91`, `91`, or `0` and common ASCII spaces, parentheses, or hyphens are accepted for `phoneNumbers` and the emergency phone. The bot normalizes valid input to exactly 10 ASCII digits for posting and saved state. Reject labels such as `Home:`, extensions, prose, non-ASCII digits, and values with extra meaningful digits instead of extracting a convenient-looking substring.
+
 ## Prepare and inspect the documents locally
 
 Required uploads are a photo, applicant signature, DOB proof, and education proof. Applicants under 18 need a real parent/guardian signature. Adults may explicitly provide one. The configured filenames are resolved from `documentsDir`; use an absolute folder path or `~` to avoid confusion about paths relative to `configs/`.

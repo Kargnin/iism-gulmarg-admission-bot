@@ -33,7 +33,8 @@
     "pincode": "FILL_ME"
   },
 
-  // One primary per preference in the same order. Extra numbers are reserves.
+  // One primary per preference in the same order. Extra numbers are reserves. Common
+  // +91/0, space, parenthesis, and hyphen formatting is normalized to 10 ASCII digits.
   "phoneNumbers": ["FILL_ME", "FILL_ME", "FILL_ME"],
 
   // Your independent choices, in primary-number order. Simple entries use

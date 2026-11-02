@@ -25,6 +25,8 @@ Open `configs/me.jsonc`. Replace every `FILL_ME`, confirm the supplied defaults,
 
 Each preference gets the phone number at the same position in `phoneNumbers`. For two preferences, provide at least two different primary numbers. Extra numbers are reserves, used only when a primary is explicitly already used or persistently refused by mobile verification. All preferences run in parallel by default, and **every preference is attempted**. These are independent applications, not a first-choice/backup list.
 
+`phoneNumbers` accepts 10-digit ASCII strings or integers. String phone values, including `applicant.emergencyContactPhone`, may use a leading `+91`, `91`, or `0` plus common spaces, parentheses, and hyphens. The entire value must be a phone number—not a label such as `Home:` or an extension. Valid inputs are normalized to exactly 10 ASCII digits before they are stored or posted; saved progress remains strict canonical text.
+
 Basic skiing is the supported path. Intermediate/Advance choices produce a warning; those paths are not fully supported or validated.
 
 ### Advanced preference objects
