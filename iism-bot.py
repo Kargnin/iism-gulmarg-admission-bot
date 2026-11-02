@@ -192,7 +192,8 @@ FIX_HINTS = [
     (("emergency contact phone",), "applicant.emergencyContactPhone"), (("state",), "address.state"),
     (("vegetarian",), "applicant.diet"),
 ]
-RESTART_HINT = "then restart with:  python3 iism-bot.py --now   (bookings made so far are kept)"
+RESTART_HINT = ("then stop and rerun the same invocation, preserving its --config, --base-url, --dry-run "
+                "and other safety flags (bookings made so far are kept)")
 
 
 def fix_hint(message):
@@ -718,6 +719,29 @@ def choice_similarity(wanted, candidate):
                SequenceMatcher(None, compact_wanted, compact_candidate).ratio())
 
 
+def choice_acronym(value):
+    tokens = [token for token in norm(value).split() if token not in ("and", "of", "the")]
+    return "".join(token[0] for token in tokens)
+
+
+def acronym_choices(options, wanted):
+    key = "".join(norm(wanted).split())
+    if not 2 <= len(key) <= 5 or not key.isalpha():
+        return []
+    return [(value, text) for value, text in real_options(options) if choice_acronym(text) == key]
+
+
+def choice_suggestions(options, wanted):
+    acronym = acronym_choices(options, wanted)
+    if acronym:
+        return [text for _, text in acronym]
+    ranked = sorted(((choice_similarity(wanted, text), text) for _, text in real_options(options)), reverse=True)
+    if not ranked or ranked[0][0] < 0.5:
+        return []
+    threshold = max(0.5, ranked[0][0] - 0.08)
+    return [text for score, text in ranked if score >= threshold][:3]
+
+
 def match_choice(options, wanted, aliases=()):
     """Resolve a configured answer to one plausible dropdown entry."""
     real = real_options(options)
@@ -732,6 +756,9 @@ def match_choice(options, wanted, aliases=()):
                      if alias_keys.intersection((norm(text), norm(value)))]
     if exact_aliases:
         return exact_aliases[0] if len(exact_aliases) == 1 else None
+    acronym = acronym_choices(real, wanted_key)
+    if acronym:
+        return acronym[0] if len(acronym) == 1 else None
     ranked = sorted(((choice_similarity(wanted_key, text), index, (value, text))
                      for index, (value, text) in enumerate(real)), reverse=True)
     if not ranked or ranked[0][0] < 0.78:
@@ -1123,8 +1150,10 @@ def parse_settings(cfg, config_path):
             match = match_choice(rules["dropdowns"][field], wanted, aliases)
             if match is None:
                 choices = ", ".join(text for _, text in real_options(rules["dropdowns"][field]))
+                suggestions = choice_suggestions(rules["dropdowns"][field], wanted)
+                hint = f"; possible matches: {' | '.join(suggestions)}" if suggestions else ""
                 errors.append(f'{key} "{wanted}" cannot be reasonably resolved to one current form choice; '
-                              f"accepted choices: {choices}")
+                              f"accepted choices: {choices}{hint}")
             else:
                 setattr(s, attribute, match[1])
                 if attribute in ("education", "diet"):
@@ -1482,7 +1511,8 @@ class Page:
         return out
 
     def file_inputs(self):
-        return [c["name"] for c in self.controls if c["tag"] == "input" and c["type"] == "file" and c["name"]]
+        return [c["name"] for c in self.controls
+                if c["tag"] == "input" and c["type"] == "file" and c["name"] and not c["disabled"]]
 
     def missing_enabled(self, names):
         return [name for name in names if self._find(name) is None or self._find(name)["disabled"]]
@@ -1894,26 +1924,81 @@ class Session:
     def submit(self, target, sel):
         bot = self.bot
         page = sel.page
-        if sel.server_age is not None and sel.server_age < 18 and not bot.s.docs.get("parentSignature"):
+        minor = sel.server_age is not None and sel.server_age < 18
+        if minor and not bot.s.docs.get("parentSignature"):
             raise Rejected(f"the site classifies the applicant as age {sel.server_age} for {target.label}; "
                            "documents.parentSignature must contain the real guardian signature")
         self.http.check_destination(page.post_url)
-        required_controls = set(bot.s.form_values) | {
+        required_paths = set(REQUIRED_FIELDS)
+        required_text = {field for field, section, key in TEXT_FIELDS if (section, key) in required_paths}
+        required_controls = required_text | {
             "__EVENTTARGET", "__EVENTARGUMENT", "__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION",
             "ddlCourse", "ddlCourseLevel", "ddlScheduleCourse", "ddlState", "txtAvailableSeat", "txtCourseFee",
             "hdfTypeOfCapacitySheet", "hdfCapacitySheetAllocationId", "txtMobileNo",
             "ddlEduationQualification", "ddlVegetarianOrNon", "chkIAgree", "btnSubmit",
         }
-        required_controls.update(name for _, name, _, _ in DOCUMENTS)
-        required_controls.update(flag for _, _, flag, _ in DOCUMENTS)
-        missing = page.missing_enabled(required_controls)
+        files = {}
+        document_flags = {}
+        missing_files = []
+        enabled_files = set(page.file_inputs())
+        for key, input_name, flag, requirement in DOCUMENTS:
+            path = bot.s.docs.get(key)
+            if not document_applies(key, target, bot.s.dob):
+                path = None
+            if (key == "parentSignature" and path is None and bot.parent_fallback
+                    and sel.server_age is not None and sel.server_age >= 18):
+                path = bot.s.docs.get("signature")
+            required_now = requirement is True or (key == "parentSignature" and (minor or bot.parent_fallback))
+            flag_ready = not page.missing_enabled((flag,))
+            input_ready = input_name in enabled_files
+            if required_now and path is None:
+                raise ConfigError(f"prepared required document {key} is unavailable")
+            if required_now:
+                required_controls.add(flag)
+                if not input_ready:
+                    missing_files.append(input_name)
+            if path is not None and input_ready and flag_ready:
+                files[input_name] = path
+                document_flags[flag] = "Yes"
+            elif path is not None and not required_now:
+                bot.note(self.who, f"{target.label}: configured optional documents.{key} control is unavailable; "
+                         "omitting that upload", warning=True)
+        missing = page.missing_enabled(required_controls) + missing_files
         if missing:
             raise Transient("required final form controls are missing or disabled: " + ", ".join(sorted(missing)))
-        values = dict(bot.s.form_values)
+        if sel.level is None:
+            raise Transient("the latest form has no selected course level")
+        expected = {"ddlCourse": sel.course[0], "ddlCourseLevel": sel.level[0],
+                    "ddlScheduleCourse": sel.batch[0], "ddlState": sel.state[0]}
+        stale = [name for name, value in expected.items()
+                 if value not in {option for option, _ in real_options(page.options(name))}
+                 or page.value(name) != value]
+        if stale:
+            raise Transient("the latest form no longer contains and selects: " + ", ".join(stale))
+        echoed_dob = page.value("txtDateOfBirth")
+        if parse_day(echoed_dob) != bot.s.dob:
+            raise Transient("the latest form no longer echoes the configured date of birth")
+        seats = to_int(page.value("txtAvailableSeat"))
+        if seats is None:
+            raise Transient("the latest form does not report available seats")
+        if seats <= 0:
+            raise TargetFull("0 seats left on the latest form")
+        if not to_int(page.value("txtCourseFee")):
+            raise Transient("the latest form does not report a valid course fee")
+        values = {}
+        for field, section, key in TEXT_FIELDS:
+            configured = bot.s.form_values[field]
+            if field in required_text:
+                values[field] = configured
+            elif configured:
+                if not page.missing_enabled((field,)):
+                    values[field] = configured
+                else:
+                    bot.note(self.who, f"{target.label}: configured optional {section}.{key} control is unavailable; "
+                             "omitting that value", warning=True)
         values.update({"ddlCourse": sel.course[0], "ddlScheduleCourse": sel.batch[0],
                        "ddlState": sel.state[0], "txtMobileNo": self.phone, "chkIAgree": "on"})
-        if sel.level:
-            values["ddlCourseLevel"] = sel.level[0]
+        values["ddlCourseLevel"] = sel.level[0]
         for field, key, wanted in (("ddlEduationQualification", "applicant.education", bot.s.education),
                                    ("ddlVegetarianOrNon", "applicant.diet", bot.s.diet)):
             options = page.options(field)
@@ -1924,16 +2009,7 @@ class Session:
                 raise Rejected(f"{key} \"{wanted}\" cannot be reasonably resolved to one site option"
                                + listing(page, field))
             values[field] = pick[0]
-        files = {}
-        for key, input_name, flag, _ in DOCUMENTS:
-            path = bot.s.docs.get(key)
-            if not document_applies(key, target, bot.s.dob):
-                path = None
-            if (key == "parentSignature" and path is None and bot.parent_fallback
-                    and sel.server_age is not None and sel.server_age >= 18):
-                path = bot.s.docs.get("signature")
-            files[input_name] = path
-            values[flag] = "Yes" if path else "No"
+        values.update(document_flags)
         button = page.submit_button()
         if button is None:
             raise Transient("the required final submit control is missing or disabled")
@@ -2572,6 +2648,16 @@ class Bot:
 
     def run(self):
         workers = []
+        confirmation_task = None
+        confirmation_results = queue.Queue()
+
+        def ask_for_confirmation(question):
+            try:
+                answer = self.confirmation_handler(question["phone"], question["target"], question["reason"])
+                confirmation_results.put((question, answer, None, ""))
+            except BaseException as exc:
+                confirmation_results.put((question, None, exc, traceback.format_exc()))
+
         try:
             self.state.acquire()
             self._restore()
@@ -2590,15 +2676,30 @@ class Bot:
                     worker = Worker(self, waiting.pop(0))
                     workers.append(worker)
                     worker.start()
+                if confirmation_task is None and not self.stop.is_set():
+                    try:
+                        question = self.questions.get_nowait()
+                    except queue.Empty:
+                        question = None
+                    if question is not None:
+                        confirmation_task = threading.Thread(target=ask_for_confirmation, args=(question,),
+                                                             name="confirmation-input", daemon=True)
+                        confirmation_task.start()
                 try:
-                    question = self.questions.get_nowait()
+                    question, answer, error, failure_trace = confirmation_results.get_nowait()
                 except queue.Empty:
-                    question = None
-                if question is not None and not self.stop.is_set():
-                    answer = self.confirmation_handler(question["phone"], question["target"], question["reason"])
-                    if answer in ("booked", "not-booked"):
-                        question["answer"] = answer
-                        question["event"].set()
+                    pass
+                else:
+                    confirmation_task = None
+                    if error is not None:
+                        self.failures.append(f"confirmation handler failed: {error}")
+                        self.log.error(f"confirmation handler failed:\n{failure_trace}")
+                        self.stop.set()
+                    elif answer in ("booked", "not-booked") and not self.stop.is_set():
+                        with self.lock:
+                            if self.pending_questions.get(question["target"].index) is question:
+                                question["answer"] = answer
+                                question["event"].set()
                 for worker in workers:
                     worker.join(0.1)
                 workers = [w for w in workers if w.is_alive()]
@@ -2802,8 +2903,8 @@ def run_check(settings, errors, warnings, doc_problems, doc_notes, base_url, log
     if errors or doc_problems:
         log.error(f"{len(errors) + len(doc_problems)} thing(s) to fix before booking day.")
         return 1
-    log.info("All good. On booking day run:  python3 iism-bot.py" +
-             (f" --config {settings.config_path}" if settings.config_path and settings.config_path.name != "config.jsonc" else ""))
+    log.info("All good. When you intend to proceed, rerun the same invocation with the same --config and "
+             "--base-url values; remove only --check and preserve any rehearsal safety flags.")
     return 0
 
 

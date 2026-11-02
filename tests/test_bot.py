@@ -231,6 +231,11 @@ class Matching(unittest.TestCase):
         self.assertEqual(bot.match_choice(mock_site.EDUCATION, "Post Graduate")[0], "Post graduation")
         self.assertEqual(bot.match_choice(mock_site.EDUCATION, "post grad")[0], "Post graduation")
         self.assertEqual(bot.match_choice(mock_site.EDUCATION, "grad")[0], "Graduation")
+        self.assertEqual(bot.match_choice(states, "UP")[0], "9")
+        self.assertEqual(bot.match_choice(mock_site.EDUCATION, "PG")[0], "Post graduation")
+        self.assertEqual(bot.match_choice(mock_site.EDUCATION, "HS")[0], "High School")
+        self.assertIsNone(bot.match_choice(states, "AP"))
+        self.assertEqual(bot.choice_suggestions(states, "AP"), ["Andhra Pradesh", "ARUNACHAL PRADESH"])
         self.assertIsNone(bot.match_choice(states, "totally unknown place"))
         self.assertIsNone(bot.match_choice([("1", "Same"), ("2", "same")], "same"))
 
@@ -255,6 +260,25 @@ class Matching(unittest.TestCase):
             for resolved in (settings.state, settings.education, settings.diet):
                 self.assertIn(resolved, plan)
 
+            abbreviated = make_config(Path(folder), PHONES[:1], ["G2 Basic"])
+            abbreviated["address"]["state"] = "UP"
+            abbreviated["applicant"]["education"] = "PG"
+            resolved, errors, _ = bot.parse_settings(abbreviated, None)
+            self.assertEqual(errors, [])
+            self.assertEqual((resolved.state, resolved.education), ("UTTAR PRADESH", "Post graduation"))
+
+            high_school = make_config(Path(folder), PHONES[:1], ["G2 Basic"])
+            high_school["applicant"]["education"] = "HS"
+            resolved, errors, _ = bot.parse_settings(high_school, None)
+            self.assertEqual(errors, [])
+            self.assertEqual(resolved.education, "High School")
+
+            ambiguous = make_config(Path(folder), PHONES[:1], ["G2 Basic"])
+            ambiguous["address"]["state"] = "AP"
+            error = next(error for error in bot.parse_settings(ambiguous, None)[1]
+                         if "address.state" in error)
+            self.assertIn("possible matches: Andhra Pradesh | ARUNACHAL PRADESH", error)
+
             cases = [
                 (("address", "state"), "totally unknown place", "MAHARASHTRA"),
                 (("applicant", "education"), "unrelated qualification", "Post graduation"),
@@ -269,6 +293,27 @@ class Matching(unittest.TestCase):
                     self.assertEqual(len(matching), 1)
                     self.assertIn("accepted choices:", matching[0])
                     self.assertIn(accepted, matching[0])
+
+    def test_operational_guidance_preserves_active_invocation(self):
+        hint = bot.fix_hint("Please Enter Name")
+        self.assertIn("same invocation", hint)
+        for flag in ("--config", "--base-url", "--dry-run"):
+            self.assertIn(flag, hint)
+        self.assertNotIn("python3 iism-bot.py", hint)
+
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = make_config(Path(folder), PHONES[:1], ["G2 Basic"])
+            settings = bot.parse_settings(cfg, Path(folder) / "person config.jsonc")[0]
+            page = bot.Page("http://127.0.0.1:8765/Admission_instructions.aspx", 200,
+                            '<form action="Admission_instructions.aspx"><input name="__VIEWSTATE" value="x">'
+                            '<input name="txtMobileNo"></form>')
+            output = io.StringIO()
+            with mock.patch.object(bot, "Http") as http, contextlib.redirect_stdout(output):
+                http.return_value.get.return_value = page
+                self.assertEqual(bot.run_check(settings, [], [], [], [], "http://127.0.0.1:8765", bot.Log()), 0)
+            guidance = output.getvalue()
+            self.assertIn("same --config and --base-url values", guidance)
+            self.assertNotIn("On booking day run:  python3 iism-bot.py", guidance)
 
     def test_server_messages(self):
         # the real page: checkFileSize() alert is code, the startup block mixes functions and a server alert
@@ -653,6 +698,134 @@ class EndToEnd(unittest.TestCase):
             timer.cancel()
         self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
         self.assertEqual(len(self.site.applications), 1)
+
+    def test_latest_final_page_revalidates_selections_dob_seats_and_fee(self):
+        original = mock_site.Handler.form
+        batch_key = self.key("G2")
+        cases = {
+            "course": ("ddlCourse", "0"),
+            "level": ("ddlCourseLevel", "0"),
+            "batch": ("ddlScheduleCourse", "0"),
+            "state": ("ddlState", "0"),
+            "dob": ("txtDateOfBirth", "01/01/1990"),
+            "seats": ("txtAvailableSeat", "0"),
+            "fee": ("txtCourseFee", "0"),
+            "dob-format": ("txtDateOfBirth", "15-05-1998"),
+        }
+        for name, (field, replacement) in cases.items():
+            with self.subTest(name=name):
+                changed_sid = []
+
+                def changed_final_page(handler, mobile, values, listed, invalid=(), alert=None):
+                    rendered = dict(values)
+                    if values.get("__EVENTTARGET") == "txtDateOfBirth" and not changed_sid:
+                        changed_sid.append(handler.sid)
+                        rendered[field] = replacement
+                    return original(handler, mobile, rendered, listed, invalid=invalid, alert=alert)
+
+                self.site.used.clear()
+                self.site.applications.clear()
+                self.site.seats[batch_key] = 3
+                self.site.request_log.clear()
+                self.site.sessions.clear()
+                self.site.viewstates.clear()
+                out = self.tmp / f"latest-{name}"
+                with mock.patch.object(mock_site.Handler, "form", changed_final_page):
+                    instance = run_bot(make_config(self.tmp, PHONES[:1], ["G2 Basic"]), self.url, out,
+                                       timeout=3, confirmation_handler=lambda *args: None)
+                self.assertTrue(instance.finished())
+                self.assertEqual(self.site.applications[0]["mobile"], PHONES[0])
+                submit = next(item for item in self.site.request_log if item["submit"])
+                if name == "dob-format":
+                    self.assertEqual(submit["sid"], changed_sid[0])
+                else:
+                    self.assertNotEqual(submit["sid"], changed_sid[0])
+
+    def test_disabled_optional_upload_controls_are_omitted(self):
+        original = mock_site.Handler.form
+        batch_key = self.key("G2")
+        cases = (
+            ("adult-guardian", ("FupParentGuardianSignature",), None, ("FupParentGuardianSignature",)),
+            ("basic-extras", ("FupAnyAdventureCoursePhoto", "FupCurrentEmployment"), None,
+             ("FupAnyAdventureCoursePhoto", "FupCurrentEmployment")),
+            ("configured-employment", ("FupCurrentEmployment",), ("employmentProof", "sign.jpg"),
+             ("FupCurrentEmployment",)),
+        )
+        for name, disabled, configured, omitted in cases:
+            with self.subTest(name=name):
+                def optional_disabled(handler, mobile, values, listed, invalid=(), alert=None):
+                    body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
+                    if values.get("txtDateOfBirth"):
+                        for control in disabled:
+                            body = body.replace(f'type="file" name="{control}"',
+                                                f'type="file" disabled="disabled" name="{control}"')
+                    return body
+
+                self.site.used.clear()
+                self.site.applications.clear()
+                self.site.seats[batch_key] = 3
+                self.site.sessions.clear()
+                self.site.viewstates.clear()
+                cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"])
+                if configured:
+                    cfg["documents"][configured[0]] = configured[1]
+                out = self.tmp / f"optional-{name}"
+                with mock.patch.object(mock_site.Handler, "form", optional_disabled):
+                    instance = run_bot(cfg, self.url, out, timeout=3)
+                self.assertTrue(instance.finished())
+                for control in omitted:
+                    self.assertNotIn(control, self.site.applications[0]["files"])
+                if configured:
+                    self.assertIn("configured optional documents.employmentProof control is unavailable",
+                                  (out / "bot.log").read_text())
+
+    def test_disabled_configured_optional_text_is_omitted(self):
+        original = mock_site.Handler.form
+
+        def domicile_disabled(handler, mobile, values, listed, invalid=(), alert=None):
+            body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
+            if values.get("txtDateOfBirth"):
+                body = body.replace('name="txtDomicile"', 'name="txtDomicile" disabled="disabled"')
+            return body
+
+        cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"], applicant={"domicile": "Maharashtra"})
+        out = self.tmp / "optional-domicile"
+        with mock.patch.object(mock_site.Handler, "form", domicile_disabled):
+            instance = run_bot(cfg, self.url, out, timeout=3)
+        self.assertTrue(instance.finished())
+        self.assertIsNone(self.site.applications[0]["domicile"])
+        self.assertIn("configured optional applicant.domicile control is unavailable", (out / "bot.log").read_text())
+
+    def test_disabled_required_upload_controls_never_submit(self):
+        original = mock_site.Handler.form
+        batch_key = self.key("G2")
+        cases = (("photo", "FupPhototOfApplicant", {}),
+                 ("minor-guardian", "FupParentGuardianSignature", {"dateOfBirth": "15/05/2010"}))
+        for name, disabled, applicant in cases:
+            with self.subTest(name=name):
+                def required_disabled(handler, mobile, values, listed, invalid=(), alert=None):
+                    body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
+                    if values.get("txtDateOfBirth"):
+                        body = body.replace(f'type="file" name="{disabled}"',
+                                            f'type="file" disabled="disabled" name="{disabled}"')
+                    return body
+
+                self.site.used.clear()
+                self.site.applications.clear()
+                self.site.request_log.clear()
+                self.site.seats[batch_key] = 3
+                self.site.sessions.clear()
+                self.site.viewstates.clear()
+                cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"], applicant=applicant)
+                if name == "minor-guardian":
+                    cfg["documents"]["parentSignature"] = "sign.jpg"
+                out = self.tmp / f"required-{name}"
+                with mock.patch.object(mock_site.Handler, "form", required_disabled):
+                    instance = run_bot(cfg, self.url, out, timeout=0.4,
+                                       confirmation_handler=lambda *args: None)
+                self.assertFalse(any(item["submit"] for item in self.site.request_log))
+                self.assertEqual(self.site.applications, [])
+                self.assertEqual(instance.pending, {})
 
     def test_final_submit_429_retries_same_phone_without_confirmation(self):
         original = mock_site.Handler.submit

@@ -888,6 +888,7 @@ class Handler(BaseHTTPRequestHandler):
                 app_id = 1600 + len(site.applications) + 1
                 site.applications.append({"id": app_id, "mobile": mobile, "course": key[0], "level": key[1],
                                           "schedule": key[2], "name": v.get("txtName"), "fee": v.get("txtCourseFee"),
+                                          "domicile": v.get("txtDomicile"),
                                           "state": v.get("ddlState"),
                                           "education": v.get("ddlEduationQualification"),
                                           "diet": v.get("ddlVegetarianOrNon"),

@@ -245,6 +245,51 @@ class Resilience(unittest.TestCase):
         self.assertFalse(instance.finished())
         self.assertTrue(any("unexpected worker failure" in failure for failure in instance.failures))
 
+    def test_blocking_feedback_cannot_hide_fatal_worker_failure(self):
+        settings = bot.parse_settings(
+            make_config(self.root, PHONES[:2], ["G2 Basic", "G3 Basic"]), None)[0]
+        instance = bot.Bot(settings, self.root / "blocking-feedback", base_url="http://127.0.0.1:9",
+                           log=bot.Log(echo=False))
+        handler_started = threading.Event()
+        handler_release = threading.Event()
+        handler_finished = threading.Event()
+        guard_fired = threading.Event()
+
+        def blocking_feedback(phone, target, reason):
+            handler_started.set()
+            handler_release.wait(2)
+            handler_finished.set()
+            return "not-booked"
+
+        instance.confirmation_handler = blocking_feedback
+
+        def uncertain_or_fatal(session, target):
+            if target.index == 0:
+                if session.phone not in instance.pending:
+                    instance.mark_submitting(session.phone, target)
+                raise bot.Uncertain("lost final reply")
+            handler_started.wait(1)
+            raise RuntimeError("unexpected sibling failure")
+
+        guard = threading.Timer(1.5, lambda: (guard_fired.set(), instance.stop.set()))
+        guard.start()
+        try:
+            with mock.patch.object(bot.Session, "book", uncertain_or_fatal):
+                instance.run()
+        finally:
+            guard.cancel()
+        self.assertFalse(guard_fired.is_set())
+        self.assertTrue(handler_started.is_set())
+        self.assertTrue(any("unexpected worker failure" in failure for failure in instance.failures))
+        self.assertEqual(instance.pending, {PHONES[0]: bot.target_key(instance.targets[0])})
+        self.assertEqual(instance.pending_questions, {})
+        preserved = instance.state.path.read_bytes()
+        handler_release.set()
+        self.assertTrue(handler_finished.wait(1))
+        time.sleep(0.05)
+        self.assertEqual(instance.state.path.read_bytes(), preserved)
+        self.assertEqual(instance.bookings, [])
+
     def test_retry_after_delta_and_date_are_capped_and_cancel_aware(self):
         instance = offline_bot()
         for value in ("120", "Wed, 12 Nov 2036 10:00:00 GMT"):
