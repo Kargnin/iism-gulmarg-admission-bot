@@ -162,6 +162,28 @@ class Matching(unittest.TestCase):
         self.assertEqual(bot.course_candidates([("0", "Select Course"), ("9", "Adventure Courses")],
                                                target("K2 Basic")), [("9", "Adventure Courses")])
 
+    def test_non_skiing_targets_reject_known_competitors_but_keep_generic_paths(self):
+        moi, board = target("G5 MOI"), target("G4 Snowboarding")
+        basic = ("21", "Snow Skiing Basic Course")
+        moi_course = ("25", "MOI Course")
+        board_course = ("24", "Snow Boarding Course")
+        self.assertEqual(bot.course_candidates([basic], moi), [])
+        self.assertEqual(bot.course_candidates([basic], board), [])
+        self.assertEqual(bot.course_candidates([board_course], moi), [])
+        self.assertEqual(bot.course_candidates([moi_course], board), [])
+
+        parent = ("10", "Snow Skiing Courses at Gulmarg")
+        board_level = ("17", "Snow Boarding")
+        board_batch = ("74", "Course from 31 Jan 2027 to 13 Feb 2027")
+        self.assertIn(parent, bot.course_candidates([parent], board))
+        self.assertFalse(bot.selection_conflicts(parent, board_level, board_batch, board))
+
+        generic_course = ("9", "Gulmarg Winter Training")
+        generic_level = ("16", "None")
+        moi_batch = ("75", "Course from 14 Feb 2027 to 27 Feb 2027")
+        self.assertFalse(bot.selection_conflicts(generic_course, generic_level, moi_batch, moi))
+        self.assertTrue(bot.selection_conflicts(parent, generic_level, moi_batch, moi))
+
     def test_level_named_courses(self):
         options = [("0", "Select Course"), ("9", "Adventure Courses"), ("21", "Snow Skiing Basic Course"),
                    ("22", "Snow Skiing Intermediate Course"), ("23", "Snow Skiing Advance Course")]
@@ -740,6 +762,43 @@ class EndToEnd(unittest.TestCase):
                     self.assertEqual(submit["sid"], changed_sid[0])
                 else:
                     self.assertNotEqual(submit["sid"], changed_sid[0])
+
+    def test_latest_final_page_revalidates_same_id_meanings(self):
+        original = mock_site.Handler.form
+        batch_key = self.key("G2")
+        cases = {
+            "course-kind": ("ddlCourse", "Snow Boarding Course", False),
+            "level": ("ddlCourseLevel", "Advance SSC", False),
+            "batch-dates": ("ddlScheduleCourse", "Course from 17 Jan 2027 to 30 Jan 2027", False),
+            "state": ("ddlState", "KARNATAKA", False),
+            "benign-course": ("ddlCourse", "Gulmarg Winter Training", True),
+        }
+        for name, (field, text, same_session) in cases.items():
+            with self.subTest(name=name):
+                changed_sid = []
+
+                def rebound_final_page(handler, mobile, values, listed, invalid=(), alert=None):
+                    body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
+                    if values.get("__EVENTTARGET") == "txtDateOfBirth" and not changed_sid:
+                        changed_sid.append(handler.sid)
+                        value = values[field]
+                        pattern = rf'(<option selected="selected" value="{re.escape(value)}">)[^<]*(</option>)'
+                        body = re.sub(pattern, rf'\1{text}\2', body, count=1)
+                    return body
+
+                self.site.used.clear()
+                self.site.applications.clear()
+                self.site.seats[batch_key] = 3
+                self.site.request_log.clear()
+                self.site.sessions.clear()
+                self.site.viewstates.clear()
+                out = self.tmp / f"rebound-{name}"
+                with mock.patch.object(mock_site.Handler, "form", rebound_final_page):
+                    instance = run_bot(make_config(self.tmp, PHONES[:1], ["G2 Basic"]), self.url, out,
+                                       timeout=5, confirmation_handler=lambda *args: None)
+                self.assertTrue(instance.finished())
+                submit = next(item for item in self.site.request_log if item["submit"])
+                self.assertEqual(submit["sid"] == changed_sid[0], same_session)
 
     def test_disabled_optional_upload_controls_are_omitted(self):
         original = mock_site.Handler.form
@@ -1571,6 +1630,35 @@ class EndToEnd(unittest.TestCase):
                          ("GET", "admission_instructions.aspx"))
         self.assertNotEqual(next_request["sid"], first_submit["sid"])
 
+    def test_omitted_configured_guardian_retries_with_real_file_when_control_returns(self):
+        self.site.parent_signature_required = True
+        cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"])
+        guardian = self.tmp / "docs" / "guardian.jpg"
+        content = b"\xff\xd8\xffconfigured adult guardian"
+        guardian.write_bytes(content)
+        cfg["documents"]["parentSignature"] = guardian.name
+        original = mock_site.Handler.form
+        omitted = []
+
+        def first_guardian_control_missing(handler, mobile, values, listed, invalid=(), alert=None):
+            body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
+            if values.get("__EVENTTARGET") == "txtDateOfBirth" and not omitted:
+                omitted.append(handler.sid)
+                body = body.replace('type="file" name="FupParentGuardianSignature"',
+                                    'type="file" disabled="disabled" name="FupParentGuardianSignature"')
+            return body
+
+        with mock.patch.object(mock_site.Handler, "form", first_guardian_control_missing):
+            instance = run_bot(cfg, self.url, self.out, timeout=4)
+        self.assertTrue(instance.finished())
+        self.assertFalse(instance.parent_fallback)
+        self.assertEqual(self.site.applications[0]["fileHashes"]["FupParentGuardianSignature"],
+                         hashlib.sha256(content).hexdigest())
+        submits = [item for item in self.site.request_log if item["submit"]]
+        self.assertEqual(len(submits), 2)
+        self.assertEqual(submits[0]["sid"], omitted[0])
+        self.assertNotEqual(submits[1]["sid"], omitted[0])
+
     def test_adult_signature_is_not_sent_in_guardian_slot_unnecessarily(self):
         instance = self.run_with(PHONES[:1], ["G2 Basic"])
         self.assertTrue(instance.finished())
@@ -1583,6 +1671,24 @@ class EndToEndOtherLayout(EndToEnd):
 
 class EndToEndLevelCourses(EndToEnd):
     layout = "level-courses"
+
+    def test_missing_nonski_course_never_falls_back_to_basic_skiing(self):
+        for label, kind in (("G4 Snowboarding", "board"), ("G5 MOI", "moi")):
+            with self.subTest(label=label):
+                course_id = next(value for value, course in self.site.courses.items() if course["kind"] == kind)
+                course = self.site.courses.pop(course_id)
+                try:
+                    self.site.used.clear()
+                    self.site.applications.clear()
+                    self.site.sessions.clear()
+                    self.site.viewstates.clear()
+                    instance = run_bot(make_config(self.tmp, PHONES[:1], [label]), self.url,
+                                       self.tmp / ("missing-" + kind), timeout=0.4)
+                    self.assertFalse(instance.finished())
+                    self.assertEqual(self.site.applications, [])
+                    self.assertNotIn(PHONES[0], self.site.used)
+                finally:
+                    self.site.courses[course_id] = course
 
 
 if __name__ == "__main__":

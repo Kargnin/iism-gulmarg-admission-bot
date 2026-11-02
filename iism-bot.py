@@ -597,9 +597,26 @@ def level_score(text, target):
     return 6 if target.level in named else -100
 
 
+def selection_conflicts(course, level, batch, target, allow_ski_parent=False):
+    texts = [item[1] for item in (course, level, batch) if item]
+    if any(location_score(text, target.location) < 0 or level_score(text, target) < 0 for text in texts):
+        return True
+    if any(re.search(KIND_PATTERNS[target.kind][1], norm(text)) for text in texts):
+        return True
+    kinds = {kind for kind in KIND_PATTERNS if any(kind_score(text, kind) > 0 for text in texts)}
+    if target.kind == "Snow Skiing":
+        return bool(kinds.intersection(("Snow Boarding", "MOI")))
+    named_ski_levels = {name for name, pattern in LEVEL_PATTERNS.items()
+                        if any(re.search(pattern, norm(text)) for text in texts)}
+    if named_ski_levels or any(kind != target.kind for kind in kinds if kind != "Snow Skiing"):
+        return True
+    if target.kind in kinds or not kinds:
+        return False
+    return "Snow Skiing" in kinds and not allow_ski_parent
+
+
 def course_conflicts(text, target):
-    return (location_score(text, target.location) < 0 or level_score(text, target) < 0
-            or bool(re.search(KIND_PATTERNS[target.kind][1], norm(text))))
+    return selection_conflicts(("", text), None, None, target, allow_ski_parent=True)
 
 
 def course_candidates(options, target, hint=None):
@@ -1675,7 +1692,7 @@ class Http:
         kind = RedirectFailure if self.redirect_handler.history else Transient
         return kind(message, retry_after)
 
-    def send(self, method, url, data=None, content_type=None, referer=None, timeout=None):
+    def send(self, method, url, data=None, content_type=None, referer=None, timeout=None, on_start=None):
         self.check_destination(url)
         timeout = timeout or self.timeout
         deadline = time.monotonic() + timeout
@@ -1688,6 +1705,8 @@ class Http:
             headers["Referer"] = referer
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
+            if on_start is not None:
+                on_start()
             with self.opener.open(request, timeout=timeout) as resp:
                 raw, status, final = self._read_response(resp, deadline), resp.status, resp.geturl()
                 response_headers = dict(resp.headers)
@@ -1768,7 +1787,7 @@ class Session:
     def get(self, path):
         return self.checked(self.http.get(path))
 
-    def postback(self, page, event, values, files=None, timeout=None):
+    def postback(self, page, event, values, files=None, timeout=None, on_start=None):
         self.http.check_destination(page.post_url)
         data = dict(page.fields())
         data.update({"__EVENTTARGET": event, "__EVENTARGUMENT": ""})
@@ -1785,7 +1804,8 @@ class Session:
         else:
             body = urllib.parse.urlencode(list(data.items())).encode()
             ctype = "application/x-www-form-urlencoded"
-        return self.http.send("POST", page.post_url, body, ctype, referer=page.url, timeout=timeout)
+        return self.http.send("POST", page.post_url, body, ctype, referer=page.url, timeout=timeout,
+                              on_start=on_start)
 
     def msgs(self, page):
         """Server messages minus the ones that are part of the page itself."""
@@ -1881,7 +1901,7 @@ class Session:
             if any(is_season_batch(t, bot.s.batches) for _, t in real_options(batches)):
                 bot.saw_season()
             batch = match_batch(batches, target)
-            if batch:
+            if batch and not selection_conflicts((value, text), level, batch, target):
                 found = ((value, text), level, batch)
                 break
         if not found:
@@ -1948,7 +1968,8 @@ class Session:
             if (key == "parentSignature" and path is None and bot.parent_fallback
                     and sel.server_age is not None and sel.server_age >= 18):
                 path = bot.s.docs.get("signature")
-            required_now = requirement is True or (key == "parentSignature" and (minor or bot.parent_fallback))
+            required_now = requirement is True or (key == "parentSignature" and (
+                minor or bot.parent_fallback or target.index in bot.guardian_required))
             flag_ready = not page.missing_enabled((flag,))
             input_ready = input_name in enabled_files
             if required_now and path is None:
@@ -1970,11 +1991,18 @@ class Session:
             raise Transient("the latest form has no selected course level")
         expected = {"ddlCourse": sel.course[0], "ddlCourseLevel": sel.level[0],
                     "ddlScheduleCourse": sel.batch[0], "ddlState": sel.state[0]}
-        stale = [name for name, value in expected.items()
-                 if value not in {option for option, _ in real_options(page.options(name))}
-                 or page.value(name) != value]
+        current = {name: next((item for item in real_options(page.options(name)) if item[0] == value), None)
+                   for name, value in expected.items()}
+        stale = [name for name, value in expected.items() if current[name] is None or page.value(name) != value]
         if stale:
             raise Transient("the latest form no longer contains and selects: " + ", ".join(stale))
+        if (selection_conflicts(current["ddlCourse"], current["ddlCourseLevel"],
+                                current["ddlScheduleCourse"], target)
+                or match_batch([current["ddlScheduleCourse"]], target) is None):
+            raise Transient("the latest course, level or batch meaning no longer matches the configured preference")
+        current_state = match_choice(page.options("ddlState"), bot.s.state, state_aliases(bot.s.state))
+        if current_state is None or current_state[0] != sel.state[0]:
+            raise Transient("the latest state option no longer matches the resolved website choice")
         echoed_dob = page.value("txtDateOfBirth")
         if parse_day(echoed_dob) != bot.s.dob:
             raise Transient("the latest form no longer echoes the configured date of birth")
@@ -1983,8 +2011,11 @@ class Session:
             raise Transient("the latest form does not report available seats")
         if seats <= 0:
             raise TargetFull("0 seats left on the latest form")
-        if not to_int(page.value("txtCourseFee")):
+        current_fee, selected_fee = to_int(page.value("txtCourseFee")), to_int(sel.fee)
+        if not current_fee:
             raise Transient("the latest form does not report a valid course fee")
+        if selected_fee is not None and current_fee != selected_fee:
+            raise Transient("the latest form reports a different course fee")
         values = {}
         for field, section, key in TEXT_FIELDS:
             configured = bot.s.form_values[field]
@@ -2015,26 +2046,44 @@ class Session:
             raise Transient("the required final submit control is missing or disabled")
         values[button[0]] = button[1]
 
+        request_started = False
+
+        def note_request_started():
+            nonlocal request_started
+            request_started = True
+
         bot.mark_submitting(self.phone, target)
         bot.log.info(f"{self.who}SUBMITTING {target.label}: {sel}")
         try:
-            resp = self.postback(page, "", values, files=files, timeout=bot.opt["submitTimeoutSec"])
+            resp = self.postback(page, "", values, files=files, timeout=bot.opt["submitTimeoutSec"],
+                                 on_start=note_request_started)
             saved = bot.save_page(self.who, f"submit-{target.label}", resp)
-            result = self.judge_submit(resp, target, sel, saved)
+            result = self.judge_submit(resp, target, sel, saved, set(files))
         except (RateLimited, Resend, Rejected, TargetFull, NotOpen, PhoneUsed):
             bot.clear_submitting(self.phone)
             raise
         except RedirectBlocked as exc:
+            if not request_started:
+                bot.clear_submitting(self.phone)
+                raise
             raise Uncertain(str(exc)) from exc
-        except Uncertain:
+        except Uncertain as exc:
+            if not request_started:
+                bot.clear_submitting(self.phone)
+                raise Transient(f"final request did not start: {exc}") from exc
             raise
         except (Cancelled, ConfigError):
+            if not request_started:
+                bot.clear_submitting(self.phone)
             raise
         except Exception as exc:
+            if not request_started:
+                bot.clear_submitting(self.phone)
+                raise Transient(f"final request did not start: {exc}") from exc
             raise Uncertain(str(exc)) from exc
         return result
 
-    def judge_submit(self, resp, target, sel, saved):
+    def judge_submit(self, resp, target, sel, saved, sent_files=()):
         self.http.check_destination(resp.url)
         parsed = urllib.parse.urlparse(resp.url)
         query = {k.lower(): v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
@@ -2087,11 +2136,16 @@ class Session:
             meaningful = [m for m in msgs if not re.fullmatch(r"Your Age \d+ Years\.?", m, re.I)]
             failed_validators = failed_validator_messages(resp.body)
             wants_parent = has_any(" ".join(failed_validators).lower(), ("parent", "guardian"))
-            if wants_parent and not bot.s.docs.get("parentSignature"):
+            if wants_parent:
                 if sel.server_age is None:
                     raise Rejected("the site requested a guardian signature, but its age response did not "
                                    "establish that the applicant is an adult")
-                if (not bot.parent_fallback and sel.server_age >= 18 and bot.s.docs.get("signature")
+                guardian_sent = "FupParentGuardianSignature" in sent_files
+                if sel.server_age >= 18 and bot.s.docs.get("parentSignature") and not guardian_sent:
+                    bot.require_guardian(target)
+                    raise Resend("the site requires the configured guardian signature; retrying from a fresh form")
+                if (not guardian_sent and not bot.s.docs.get("parentSignature") and not bot.parent_fallback
+                        and sel.server_age >= 18 and bot.s.docs.get("signature")
                         and bot.opt.get("parentSignatureFallback")):
                     bot.use_parent_fallback(reason)
                     raise Resend("the site wants a parent/guardian signature - resending with the applicant's signature")
@@ -2377,6 +2431,7 @@ class Bot:
         self.attention_seen = {}
         self.refusals = {}
         self.parent_fallback = False
+        self.guardian_required = set()
         self.course_hint = {}
         self.status = {}
         self.notes = {}
@@ -2573,6 +2628,10 @@ class Bot:
             self.parent_fallback = True
         self.log.warn("The site insists on an adult's guardian-signature upload; using the applicant's "
                       f"configured signature as authorized. Site says: {why}")
+
+    def require_guardian(self, target):
+        with self.lock:
+            self.guardian_required.add(target.index)
 
     def saw_season(self):
         with self.lock:

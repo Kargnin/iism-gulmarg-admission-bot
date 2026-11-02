@@ -290,6 +290,76 @@ class Resilience(unittest.TestCase):
         self.assertEqual(instance.state.path.read_bytes(), preserved)
         self.assertEqual(instance.bookings, [])
 
+    def test_fatal_sibling_before_final_send_clears_unused_pending_marker(self):
+        site, url = self.local_site()
+        settings = bot.parse_settings(
+            make_config(self.root, PHONES[:2], ["G2 Basic", "G3 Basic"]), None)[0]
+        out = self.root / "pre-send-cancel"
+        self.assertEqual(bot.prepare_documents(settings, out)[0], [])
+        instance = bot.Bot(settings, out, base_url=url, log=bot.Log(echo=False))
+        marked = threading.Event()
+        guard_fired = threading.Event()
+        original_mark = instance.mark_submitting
+        original_book = bot.Session.book
+
+        def mark_and_wait(phone, target):
+            original_mark(phone, target)
+            if target.index == 0:
+                marked.set()
+                instance.stop.wait(1)
+
+        def book_or_fail(session, target):
+            if target.index == 1:
+                marked.wait(1)
+                raise RuntimeError("fatal sibling after pending save")
+            return original_book(session, target)
+
+        guard = threading.Timer(2, lambda: (guard_fired.set(), instance.stop.set()))
+        guard.start()
+        try:
+            with mock.patch.object(instance, "mark_submitting", mark_and_wait), \
+                    mock.patch.object(bot.Session, "book", book_or_fail):
+                instance.run()
+        finally:
+            guard.cancel()
+        self.assertFalse(guard_fired.is_set())
+        self.assertTrue(any("unexpected worker failure" in failure for failure in instance.failures))
+        self.assertEqual(instance.pending, {})
+        self.assertFalse(any(item.get("status") == "submitting" for item in instance.state.data["phones"].values()))
+        self.assertFalse(any(item["submit"] for item in site.request_log))
+        self.assertEqual(site.applications, [])
+
+    def test_inflight_cancellation_preserves_pending_for_feedback(self):
+        site, url = self.local_site()
+        settings = bot.parse_settings(make_config(self.root, PHONES[:1], ["G2 Basic"]), None)[0]
+        out = self.root / "inflight-cancel"
+        self.assertEqual(bot.prepare_documents(settings, out)[0], [])
+        instance = bot.Bot(settings, out, base_url=url, log=bot.Log(echo=False))
+        entered = threading.Event()
+        release = threading.Event()
+        original_submit = mock_site.Handler.submit
+
+        def slow_submit(handler, *args, **kwargs):
+            entered.set()
+            release.wait(1)
+            return original_submit(handler, *args, **kwargs)
+
+        def cancel_inflight():
+            if entered.wait(1):
+                instance.stop.set()
+                release.set()
+
+        coordinator = threading.Thread(target=cancel_inflight, daemon=True)
+        coordinator.start()
+        with mock.patch.object(mock_site.Handler, "submit", slow_submit):
+            instance.run()
+        coordinator.join(1)
+        self.assertTrue(entered.is_set())
+        self.assertEqual(len(site.applications), 1)
+        self.assertEqual(instance.bookings, [])
+        self.assertEqual(instance.pending, {PHONES[0]: bot.target_key(instance.targets[0])})
+        self.assertEqual(instance.state.data["phones"][PHONES[0]]["status"], "submitting")
+
     def test_retry_after_delta_and_date_are_capped_and_cancel_aware(self):
         instance = offline_bot()
         for value in ("120", "Wed, 12 Nov 2036 10:00:00 GMT"):
