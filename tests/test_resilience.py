@@ -697,6 +697,42 @@ class Resilience(unittest.TestCase):
         finally:
             owner.state.release()
 
+    def assert_early_eof_final_reply_requires_feedback(self, status):
+        class EarlyEOF(mock_site.Handler):
+            def redirect(self, location):
+                if location.lower().startswith("/admissionformsuccess.aspx"):
+                    self.send_response(status)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", "99999")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(
+                            b'<form><input name="__VIEWSTATE" value="test">'
+                            b'<span id="lblMsg">No seats left.</span>')
+                        self.wfile.flush()
+                    except OSError:
+                        pass
+                    self.close_connection = True
+                    return
+                return super().redirect(location)
+
+        site, url = self.local_site(EarlyEOF)
+        answers = []
+        cfg = make_config(self.root, PHONES[:2], ["G2 Basic"], bot={"submitTimeoutSec": 0.2})
+        instance = run_bot(cfg, url, self.root / f"early-eof-{status}", timeout=3,
+                           confirmation_handler=lambda *args: answers.append("booked") or "booked")
+        self.assertTrue(instance.finished())
+        self.assertEqual(answers, ["booked"])
+        self.assertEqual(len(site.applications), 1)
+        self.assertEqual(site.applications[0]["mobile"], PHONES[0])
+        self.assertNotIn(PHONES[1], site.used)
+
+    def test_early_eof_200_after_commit_requires_feedback_without_reserve(self):
+        self.assert_early_eof_final_reply_requires_feedback(200)
+
+    def test_early_eof_429_after_commit_requires_feedback_without_reserve(self):
+        self.assert_early_eof_final_reply_requires_feedback(429)
+
     def test_foreign_form_destination_is_blocked_before_sending(self):
         instance = offline_bot()
         session = bot.Session(instance, PHONES[0], "")
@@ -832,6 +868,48 @@ class Resilience(unittest.TestCase):
         with self.assertRaises(bot.Transient):
             client.get("/")
         self.assertLess(time.monotonic() - started, 0.8)
+
+    def test_complete_zero_length_eof_framed_and_chunked_responses_remain_valid(self):
+        class Framing(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_HEAD(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "99")
+                self.end_headers()
+
+            def do_GET(self):
+                if self.path == "/zero":
+                    self.send_response(204)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif self.path == "/eof":
+                    self.send_response(200)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(b"eof body")
+                    self.close_connection = True
+                else:
+                    self.send_response(200)
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(b"4\r\ntest\r\n0\r\n\r\n")
+                    self.wfile.flush()
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Framing)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}"
+        client = bot.Http(url, 1, bot.Log(echo=False))
+        self.assertEqual(client.send("HEAD", url + "/head").body, "")
+        self.assertEqual(client.get("/zero").body, "")
+        self.assertEqual(client.get("/eof").body, "eof body")
+        self.assertEqual(client.get("/chunked").body, "test")
 
     def test_stdlib_empty_and_http_error_bodies_use_one_response_contract(self):
         class EmptyBodies(BaseHTTPRequestHandler):

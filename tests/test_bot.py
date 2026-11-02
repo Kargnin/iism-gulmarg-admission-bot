@@ -1754,6 +1754,38 @@ class EndToEnd(unittest.TestCase):
                 self.assertEqual(instance.pending, {})
                 self.assertEqual(instance.failures, [])
 
+    def test_empty_or_reset_required_hidden_values_never_start_final_submission(self):
+        original = mock_site.Handler.form
+        cases = (
+            ("viewstate", "__VIEWSTATE", "   "),
+            ("viewstate-generator", "__VIEWSTATEGENERATOR", "   "),
+            ("event-validation", "__EVENTVALIDATION", "   "),
+            ("capacity-type", "hdfTypeOfCapacitySheet", "   "),
+            ("capacity-allocation-empty", "hdfCapacitySheetAllocationId", "   "),
+            ("capacity-allocation-zero", "hdfCapacitySheetAllocationId", "0"),
+        )
+        for dry_run in (False, True):
+            for label, name, replacement in cases:
+                with self.subTest(dry_run=dry_run, field=label):
+                    def stale_hidden(handler, mobile, values, listed, invalid=(), alert=None):
+                        body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
+                        if values.get("__EVENTTARGET") != "txtDateOfBirth":
+                            return body
+                        pattern = rf'(<input\b[^>]*\bname="{re.escape(name)}"[^>]*\bvalue=")[^"]*(")'
+                        return re.sub(pattern, rf'\g<1>{replacement}\2', body, count=1, flags=re.I)
+
+                    start = len(self.site.request_log)
+                    out = self.tmp / f"hidden-{dry_run}-{label}"
+                    with mock.patch.object(mock_site.Handler, "form", stale_hidden):
+                        instance = run_bot(make_config(self.tmp, PHONES[:1], ["G2 Basic"]), self.url, out,
+                                           dry_run=dry_run, timeout=0.3,
+                                           confirmation_handler=lambda *args: None)
+                    requests = self.site.request_log[start:]
+                    self.assertFalse(any(item["submit"] for item in requests))
+                    self.assertEqual(instance.pending, {})
+                    self.assertEqual(instance.bookings, [])
+                    self.assertEqual(instance.failures, [])
+
     def test_cancellation_after_cascade_prevents_final_post(self):
         original = bot.Session.cascade
         def cancel(session, target):

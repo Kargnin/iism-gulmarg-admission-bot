@@ -1846,19 +1846,28 @@ class Http:
     def _read_response(self, response, deadline):
         if not isinstance(response, http.client.HTTPResponse):
             raise Transient(f"unsupported stdlib HTTP response type: {type(response).__name__}")
-        if response.length == 0 or response.isclosed():
+        if response.length == 0:
             return b""
         chunks = []
+
+        def finished():
+            body = b"".join(chunks)
+            if response.length not in (None, 0):
+                raise http.client.IncompleteRead(body, response.length)
+            return body
+
+        if response.isclosed():
+            return finished()
         while True:
             if response.length == 0 or response.isclosed():
-                return b"".join(chunks)
+                return finished()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("response body deadline exceeded")
             self._set_read_timeout(response, remaining)
             chunk = response.read1(64 * 1024)
             if not chunk:
-                return b"".join(chunks)
+                return finished()
             chunks.append(chunk)
 
     def _network_error(self, message, retry_after=None):
@@ -2205,6 +2214,13 @@ class Session:
         missing = page.missing_enabled(required_controls) + missing_files
         if missing:
             raise Transient("required final form controls are missing or disabled: " + ", ".join(sorted(missing)))
+        required_tokens = ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION",
+                           "hdfTypeOfCapacitySheet", "hdfCapacitySheetAllocationId")
+        empty_tokens = [name for name in required_tokens if not str(page.value(name) or "").strip()]
+        if str(page.value("hdfCapacitySheetAllocationId") or "").strip() == "0":
+            empty_tokens.append("hdfCapacitySheetAllocationId")
+        if empty_tokens:
+            raise Transient("required final form values are empty or reset: " + ", ".join(sorted(set(empty_tokens))))
         if sel.level is None:
             raise Transient("the latest form has no selected course level")
         expected = {"ddlCourse": sel.course[0], "ddlCourseLevel": sel.level[0],
