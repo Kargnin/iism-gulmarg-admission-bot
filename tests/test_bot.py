@@ -223,24 +223,49 @@ class Matching(unittest.TestCase):
         self.assertEqual(bot.match_choice(mock_site.DIET, "Vegetarian")[0], "Vegetarian")
         self.assertEqual(bot.match_choice(mock_site.DIET, "Non-Vegetarian")[0], "Non-Vegetarian")
         self.assertEqual(bot.match_choice(mock_site.EDUCATION, "Post graduation")[0], "Post graduation")
-        self.assertIsNone(bot.match_choice(mock_site.DIET, "non veg"))
-        self.assertIsNone(bot.match_choice(mock_site.EDUCATION, "Post Graduate"))
-        self.assertIsNone(bot.match_choice(states, "Andhra Pradesh N"))
+        self.assertEqual(bot.match_choice(states, "Andhra Pradesh N")[0], "37")
+        self.assertEqual(bot.match_choice(states, "Mahar astra")[0], "27")
+        self.assertEqual(bot.match_choice(states, "Maharastra")[0], "27")
+        self.assertEqual(bot.match_choice(mock_site.DIET, "non veg")[0], "Non-Vegetarian")
+        self.assertEqual(bot.match_choice(mock_site.DIET, "nonveg")[0], "Non-Vegetarian")
+        self.assertEqual(bot.match_choice(mock_site.EDUCATION, "Post Graduate")[0], "Post graduation")
+        self.assertEqual(bot.match_choice(mock_site.EDUCATION, "post grad")[0], "Post graduation")
+        self.assertEqual(bot.match_choice(mock_site.EDUCATION, "grad")[0], "Graduation")
+        self.assertIsNone(bot.match_choice(states, "totally unknown place"))
         self.assertIsNone(bot.match_choice([("1", "Same"), ("2", "same")], "same"))
 
-    def test_invalid_applicant_choices_list_current_options(self):
-        cases = [
-            (("address", "state"), "Andhra Pradesh N", "Andhra Pradesh"),
-            (("applicant", "education"), "Post Graduate", "Post graduation"),
-            (("applicant", "diet"), "non veg", "Non-Vegetarian"),
-        ]
+    def test_applicant_choices_are_frozen_and_unresolvable_values_list_options(self):
         with tempfile.TemporaryDirectory() as folder:
+            cfg = make_config(Path(folder), PHONES[:1], ["G2 Basic"])
+            cfg["address"]["state"] = "Andhra Pradesh N"
+            cfg["applicant"]["education"] = "post grad"
+            cfg["applicant"]["diet"] = "nonveg"
+            settings, errors, _ = bot.parse_settings(cfg, None)
+            self.assertEqual(errors, [])
+            self.assertEqual((settings.state, settings.education, settings.diet),
+                             ("ANDHRA PRADESH (NEW)", "Post graduation", "Non-Vegetarian"))
+            log_path = Path(folder) / "plan.log"
+            log = bot.Log(echo=False)
+            log.open(log_path)
+            try:
+                bot.describe_plan(settings, log)
+            finally:
+                log.file.close()
+            plan = log_path.read_text()
+            for resolved in (settings.state, settings.education, settings.diet):
+                self.assertIn(resolved, plan)
+
+            cases = [
+                (("address", "state"), "totally unknown place", "MAHARASHTRA"),
+                (("applicant", "education"), "unrelated qualification", "Post graduation"),
+                (("applicant", "diet"), "anything is fine", "Non-Vegetarian"),
+            ]
             for path, value, accepted in cases:
                 with self.subTest(path=".".join(path)):
-                    cfg = make_config(Path(folder), PHONES[:1], ["G2 Basic"])
-                    cfg[path[0]][path[1]] = value
-                    errors = bot.parse_settings(cfg, None)[1]
-                    matching = [error for error in errors if ".".join(path) in error]
+                    invalid = make_config(Path(folder), PHONES[:1], ["G2 Basic"])
+                    invalid[path[0]][path[1]] = value
+                    matching = [error for error in bot.parse_settings(invalid, None)[1]
+                                if ".".join(path) in error]
                     self.assertEqual(len(matching), 1)
                     self.assertIn("accepted choices:", matching[0])
                     self.assertIn(accepted, matching[0])
@@ -1057,6 +1082,25 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(instance.finished())
         self.assertEqual(self.site.applications[0]["level"], "13")
 
+    def test_resolved_applicant_choices_match_reasonable_live_variations(self):
+        states = [(value, "MAHAR ASTRA" if value == "27" else text)
+                  for value, text in mock_site.STATES]
+        education = [("Graduate", "Graduate") if value == "Graduation" else (value, text)
+                     for value, text in mock_site.EDUCATION]
+        diet = [("Non Veg", "Non Veg") if value == "Non-Vegetarian" else (value, text)
+                for value, text in mock_site.DIET]
+        with mock.patch.object(mock_site, "STATES", states), \
+                mock.patch.object(mock_site, "EDUCATION", education), \
+                mock.patch.object(mock_site, "DIET", diet):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"],
+                                     applicant={"education": "grad", "diet": "nonveg"},
+                                     address={"houseNo": "1", "street": "MG Road", "district": "Pune",
+                                              "state": "Mahar astra", "pincode": "411001"})
+        self.assertTrue(instance.finished())
+        application = self.site.applications[0]
+        self.assertEqual((application["state"], application["education"], application["diet"]),
+                         ("27", "Graduate", "Non Veg"))
+
     def test_stale_text_hints_rank_but_never_block_semantic_match(self):
         course_id, level_id, batch_id = self.key("G2")
         course = dict(self.site.courses[course_id])
@@ -1114,7 +1158,8 @@ class EndToEnd(unittest.TestCase):
         formatted = "+91 " + PHONES[0]
         cases = ("missing-target", "batch-type", "status", "timestamp", "message-type",
                  "application-id-type", "url-type", "response-type", "booking-phone",
-                 "phone-map-key", "assignment-phone", "phone-record-target")
+                 "phone-map-key", "assignment-phone", "phone-record-target",
+                 "identity-from-date", "identity-to-date", "booked-pending-target")
         for case in cases:
             with self.subTest(case=case):
                 state = json.loads(json.dumps(baseline))
@@ -1144,6 +1189,18 @@ class EndToEnd(unittest.TestCase):
                     state["assignments"]["f" * 64] = formatted
                 elif case == "phone-record-target":
                     del state["phones"][PHONES[0]]["target"]
+                elif case in ("identity-from-date", "identity-to-date"):
+                    field = "from" if case == "identity-from-date" else "to"
+                    booking["targetIdentity"][field] = booking["targetIdentity"][field].replace("-", "")
+                    changed_key = bot.target_key_from_identity(booking["targetIdentity"])
+                    booking["targetKey"] = changed_key
+                    state["phones"][PHONES[0]]["targetKey"] = changed_key
+                elif case == "booked-pending-target":
+                    state["phones"][PHONES[1]] = {
+                        "status": "submitting", "targetKey": booking["targetKey"],
+                        "target": booking["target"], "at": booking["at"],
+                    }
+                    state["assignments"][booking["targetKey"]] = PHONES[1]
                 state_path.write_text(json.dumps(state))
                 preserved = state_path.read_bytes()
                 requests = self.site.requests
@@ -1250,6 +1307,35 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(instance.bookings[0]["phone"], PHONES[0])
         self.assertEqual(instance.phone_state[PHONES[0]], "booked")
         self.assertEqual(len(self.site.applications), 1)
+
+    def test_missing_or_empty_required_controls_never_start_final_submission(self):
+        original = mock_site.Handler.form
+        cases = ("ddlState", "ddlState-empty", "ddlEduationQualification",
+                 "ddlVegetarianOrNon", "btnSubmit")
+        for control in cases:
+            with self.subTest(control=control):
+                def incomplete_form(handler, mobile, values, listed, invalid=(), alert=None):
+                    body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
+                    if control == "btnSubmit":
+                        return re.sub(r'<input\b(?=[^>]*\bid="btnSubmit")[^>]*>\s*', "", body,
+                                      count=1, flags=re.I)
+                    name = control[:-6] if control.endswith("-empty") else control
+                    pattern = rf'(<select\b[^>]*\bid="{name}"[^>]*>).*?(</select>\s*)'
+                    if control.endswith("-empty"):
+                        return re.sub(pattern, r'\1<option value="0">Select</option>\2', body,
+                                      count=1, flags=re.I | re.S)
+                    return re.sub(pattern, "", body, count=1, flags=re.I | re.S)
+
+                start = len(self.site.request_log)
+                out = self.tmp / f"missing-{control}"
+                with mock.patch.object(mock_site.Handler, "form", incomplete_form):
+                    instance = run_bot(make_config(self.tmp, PHONES[:1], ["G2 Basic"]), self.url, out,
+                                       timeout=0.4, confirmation_handler=lambda *args: None)
+                requests = self.site.request_log[start:]
+                self.assertFalse(any(item["method"] == "POST" and item["page"] == "admission_form.aspx"
+                                     and not item["event"] for item in requests))
+                self.assertEqual(instance.pending, {})
+                self.assertEqual(instance.failures, [])
 
     def test_cancellation_after_cascade_prevents_final_post(self):
         original = bot.Session.cascade

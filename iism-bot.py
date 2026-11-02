@@ -47,6 +47,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -681,15 +682,63 @@ def is_season_batch(text, batches):
     return any(date_match(found, b["from"]) > 0 for b in batches.values())
 
 
+def choice_similarity(wanted, candidate):
+    wanted, candidate = norm(wanted), norm(candidate)
+    if not wanted or not candidate:
+        return 0.0
+    wanted_tokens, candidate_tokens = wanted.split(), candidate.split()
+    matched = set()
+    token_scores = []
+    for wanted_token in wanted_tokens:
+        choices = []
+        for index, candidate_token in enumerate(candidate_tokens):
+            if wanted_token == candidate_token:
+                score = 1.0
+            elif wanted_token.startswith(candidate_token) or candidate_token.startswith(wanted_token):
+                score = 0.92
+            else:
+                score = SequenceMatcher(None, wanted_token, candidate_token).ratio()
+                if score < 0.75:
+                    score = 0.0
+            choices.append((score, index))
+        score, index = max(choices, default=(0.0, -1))
+        token_scores.append(score)
+        if score and index >= 0:
+            matched.add(index)
+    coverage = sum(token_scores) / len(wanted_tokens)
+    precision = len(matched) / len(candidate_tokens)
+    token_score = 0.6 * coverage + 0.4 * precision
+    compact_wanted, compact_candidate = wanted.replace(" ", ""), candidate.replace(" ", "")
+    prefix_score = 0.0
+    if min(len(compact_wanted), len(compact_candidate)) >= 4 and (
+            compact_wanted.startswith(compact_candidate) or compact_candidate.startswith(compact_wanted)):
+        prefix_score = 0.9 + 0.05 * min(len(compact_wanted), len(compact_candidate)) / max(
+            len(compact_wanted), len(compact_candidate))
+    return max(token_score, prefix_score, SequenceMatcher(None, wanted, candidate).ratio(),
+               SequenceMatcher(None, compact_wanted, compact_candidate).ratio())
+
+
 def match_choice(options, wanted, aliases=()):
-    """Pick the single dropdown entry whose normalized text or value is explicitly requested."""
+    """Resolve a configured answer to one plausible dropdown entry."""
     real = real_options(options)
-    keys = [k for k in [norm(wanted)] + [norm(a) for a in aliases] if k]
-    if not real or not keys:
+    wanted_key = norm(wanted)
+    if not real or not wanted_key:
         return None
-    matches = [(value, text) for value, text in real
-               if any(key in (norm(text), norm(value)) for key in keys)]
-    return matches[0] if len(matches) == 1 else None
+    exact = [(value, text) for value, text in real if wanted_key in (norm(text), norm(value))]
+    if exact:
+        return exact[0] if len(exact) == 1 else None
+    alias_keys = {norm(alias) for alias in aliases if norm(alias)}
+    exact_aliases = [(value, text) for value, text in real
+                     if alias_keys.intersection((norm(text), norm(value)))]
+    if exact_aliases:
+        return exact_aliases[0] if len(exact_aliases) == 1 else None
+    ranked = sorted(((choice_similarity(wanted_key, text), index, (value, text))
+                     for index, (value, text) in enumerate(real)), reverse=True)
+    if not ranked or ranked[0][0] < 0.78:
+        return None
+    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.01:
+        return None
+    return ranked[0][2]
 
 
 # ---------------------------------------------------------------------------
@@ -1065,16 +1114,21 @@ def parse_settings(cfg, config_path):
     for field, value in s.form_values.items():
         if len(value) > rules["maxLengths"].get(field, sys.maxsize):
             errors.append(f"{field} exceeds the live form's {rules['maxLengths'][field]} character limit")
-    for field, key, wanted, aliases in (
-            ("ddlState", "address.state", s.state, state_aliases(s.state)),
-            ("ddlEduationQualification", "applicant.education", s.education, ()),
-            ("ddlVegetarianOrNon", "applicant.diet", s.diet, ())):
+    for field, key, attribute, aliases in (
+            ("ddlState", "address.state", "state", state_aliases(s.state)),
+            ("ddlEduationQualification", "applicant.education", "education", ()),
+            ("ddlVegetarianOrNon", "applicant.diet", "diet", ())):
+        wanted = getattr(s, attribute)
         if wanted and "FILL_ME" not in wanted:
             match = match_choice(rules["dropdowns"][field], wanted, aliases)
             if match is None:
                 choices = ", ".join(text for _, text in real_options(rules["dropdowns"][field]))
-                errors.append(f'{key} "{wanted}" does not identify exactly one current form choice; '
+                errors.append(f'{key} "{wanted}" cannot be reasonably resolved to one current form choice; '
                               f"accepted choices: {choices}")
+            else:
+                setattr(s, attribute, match[1])
+                if attribute in ("education", "diet"):
+                    s.applicant[attribute] = match[1]
 
     raw_phones = cfg.get("phoneNumbers") or []
     s.phones = []
@@ -1430,10 +1484,15 @@ class Page:
     def file_inputs(self):
         return [c["name"] for c in self.controls if c["tag"] == "input" and c["type"] == "file" and c["name"]]
 
+    def missing_enabled(self, names):
+        return [name for name in names if self._find(name) is None or self._find(name)["disabled"]]
+
     def submit_button(self):
-        buttons = [(c["name"], c["value"]) for c in self.controls
-                   if c["tag"] == "input" and c["type"] == "submit" and c["name"]]
-        return next((b for b in buttons if "submit" in b[0].lower()), buttons[0] if buttons else None)
+        control = self._find("btnSubmit")
+        if (control is None or control["disabled"] or control["tag"] != "input"
+                or control["type"] != "submit"):
+            return None
+        return control["name"], control["value"]
 
     def messages(self):
         return server_messages(self.body)
@@ -1814,14 +1873,14 @@ class Session:
         if seats:
             bot.saw_seats(target)
 
-        state = None
         state_options = page.options("ddlState")
-        if state_options is not None:
-            state = match_choice(state_options, bot.s.state, state_aliases(bot.s.state))
-            if state is None:
-                raise Rejected(f"address.state \"{bot.s.state}\" does not identify exactly one site option"
-                               + listing(page, "ddlState"))
-            page = self.select(page, "ddlState", {"ddlState": state[0]})
+        if page.missing_enabled(("ddlState",)) or not real_options(state_options):
+            raise Transient("the required state list is missing or empty")
+        state = match_choice(state_options, bot.s.state, state_aliases(bot.s.state))
+        if state is None:
+            raise Rejected(f"address.state \"{bot.s.state}\" cannot be reasonably resolved to one site option"
+                           + listing(page, "ddlState"))
+        page = self.select(page, "ddlState", {"ddlState": state[0]})
         dob = bot.s.applicant.get("dateOfBirth", "")
         page = self.select(page, "txtDateOfBirth", {"txtDateOfBirth": dob})
         # outside the age limit the site says "Your Age N Years , Age Allow X To Y Years." and clears the date
@@ -1839,22 +1898,30 @@ class Session:
             raise Rejected(f"the site classifies the applicant as age {sel.server_age} for {target.label}; "
                            "documents.parentSignature must contain the real guardian signature")
         self.http.check_destination(page.post_url)
+        required_controls = set(bot.s.form_values) | {
+            "__EVENTTARGET", "__EVENTARGUMENT", "__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION",
+            "ddlCourse", "ddlCourseLevel", "ddlScheduleCourse", "ddlState", "txtAvailableSeat", "txtCourseFee",
+            "hdfTypeOfCapacitySheet", "hdfCapacitySheetAllocationId", "txtMobileNo",
+            "ddlEduationQualification", "ddlVegetarianOrNon", "chkIAgree", "btnSubmit",
+        }
+        required_controls.update(name for _, name, _, _ in DOCUMENTS)
+        required_controls.update(flag for _, _, flag, _ in DOCUMENTS)
+        missing = page.missing_enabled(required_controls)
+        if missing:
+            raise Transient("required final form controls are missing or disabled: " + ", ".join(sorted(missing)))
         values = dict(bot.s.form_values)
         values.update({"ddlCourse": sel.course[0], "ddlScheduleCourse": sel.batch[0],
-                       "txtMobileNo": self.phone, "chkIAgree": "on"})
+                       "ddlState": sel.state[0], "txtMobileNo": self.phone, "chkIAgree": "on"})
         if sel.level:
             values["ddlCourseLevel"] = sel.level[0]
-        if sel.state:
-            values["ddlState"] = sel.state[0]
         for field, key, wanted in (("ddlEduationQualification", "applicant.education", bot.s.education),
                                    ("ddlVegetarianOrNon", "applicant.diet", bot.s.diet)):
             options = page.options(field)
-            if options is None:
-                values[field] = wanted
-                continue
+            if not real_options(options):
+                raise Transient(f"the required {key} list is missing or empty")
             pick = match_choice(options, wanted)
             if pick is None:
-                raise Rejected(f"{key} \"{wanted}\" does not identify exactly one site option"
+                raise Rejected(f"{key} \"{wanted}\" cannot be reasonably resolved to one site option"
                                + listing(page, field))
             values[field] = pick[0]
         files = {}
@@ -1867,21 +1934,15 @@ class Session:
                 path = bot.s.docs.get("signature")
             files[input_name] = path
             values[flag] = "Yes" if path else "No"
-        event = ""
         button = page.submit_button()
-        if button:
-            values[button[0]] = button[1]
-        else:
-            m = re.search(r"""(?:__doPostBack\(|PostBackOptions\()\s*['"](\w*submit\w*)['"]""", page.body, re.I)
-            if m:
-                event = m.group(1)
-            else:
-                values["btnSubmit"] = "Submit"
+        if button is None:
+            raise Transient("the required final submit control is missing or disabled")
+        values[button[0]] = button[1]
 
         bot.mark_submitting(self.phone, target)
         bot.log.info(f"{self.who}SUBMITTING {target.label}: {sel}")
         try:
-            resp = self.postback(page, event, values, files=files, timeout=bot.opt["submitTimeoutSec"])
+            resp = self.postback(page, "", values, files=files, timeout=bot.opt["submitTimeoutSec"])
             saved = bot.save_page(self.who, f"submit-{target.label}", resp)
             result = self.judge_submit(resp, target, sel, saved)
         except (RateLimited, Resend, Rejected, TargetFull, NotOpen, PhoneUsed):
@@ -2039,6 +2100,8 @@ def valid_target_identity(identity):
         end = date.fromisoformat(identity["to"]) if identity["to"] else None
     except ValueError:
         return False
+    if identity["from"] != start.isoformat() or (end is not None and identity["to"] != end.isoformat()):
+        return False
     if end is not None and end < start:
         return False
     if identity["kind"] == "Snow Skiing":
@@ -2130,6 +2193,8 @@ class State:
             if len(assigned_phones) != len(set(assigned_phones)):
                 raise ValueError("one phone is assigned to multiple preferences")
             for target_key_value, phone in value["assignments"].items():
+                if target_key_value in booked_targets:
+                    raise ValueError("booked target still has a pending phone assignment")
                 record = value["phones"].get(phone)
                 if record and record["status"] in ("used", "booked"):
                     raise ValueError("unavailable phone still has a preference assignment")
@@ -2634,6 +2699,7 @@ class Worker(threading.Thread):
             with bot.lock:
                 bot.failures.append(f"{target.label}: unexpected worker failure")
             bot.log.error(f"[{self.name}] failed:\n{traceback.format_exc()}")
+            bot.stop.set()
         finally:
             bot.set_status(self.name, None)
 
@@ -2644,6 +2710,7 @@ class Worker(threading.Thread):
 
 def describe_plan(settings, log, dry_run=False):
     log.info(f"Applicant: {settings.applicant.get('name', '?')}  (email {settings.applicant.get('email', '?')})")
+    log.info(f"Website choices: state '{settings.state}', education '{settings.education}', diet '{settings.diet}'")
     log.info(f"Numbers:   {', '.join(mask(p) for p in settings.phones)}")
     log.info("Preferences and their primary numbers:")
     for t in settings.targets:

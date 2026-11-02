@@ -888,6 +888,9 @@ class Handler(BaseHTTPRequestHandler):
                 app_id = 1600 + len(site.applications) + 1
                 site.applications.append({"id": app_id, "mobile": mobile, "course": key[0], "level": key[1],
                                           "schedule": key[2], "name": v.get("txtName"), "fee": v.get("txtCourseFee"),
+                                          "state": v.get("ddlState"),
+                                          "education": v.get("ddlEduationQualification"),
+                                          "diet": v.get("ddlVegetarianOrNon"),
                                           "files": sorted(n for n, (f, _) in files.items() if f),
                                           "fileHashes": {n: hashlib.sha256(content).hexdigest()
                                                          for n, (filename, content) in files.items() if filename}})

@@ -218,6 +218,33 @@ class Resilience(unittest.TestCase):
         self.assertEqual(site.applications, [])
         self.assertTrue(instance.failures)
 
+    def test_unexpected_worker_failure_stops_polling_siblings(self):
+        settings = bot.parse_settings(
+            make_config(self.root, PHONES[:2], ["G2 Basic", "G3 Basic"]), None)[0]
+        instance = bot.Bot(settings, self.root / "fatal-worker", base_url="http://127.0.0.1:9",
+                           dry_run=True, log=bot.Log(echo=False))
+        sibling_started = threading.Event()
+        guard_fired = threading.Event()
+
+        def fail_or_poll(session, target):
+            if target.index == 1:
+                sibling_started.set()
+                raise bot.TargetFull("still unavailable")
+            sibling_started.wait(1)
+            raise RuntimeError("unexpected worker bug")
+
+        guard = threading.Timer(1, lambda: (guard_fired.set(), instance.stop.set()))
+        guard.start()
+        try:
+            with mock.patch.object(bot.Session, "book", fail_or_poll):
+                instance.run()
+        finally:
+            guard.cancel()
+        self.assertFalse(guard_fired.is_set())
+        self.assertTrue(instance.stop.is_set())
+        self.assertFalse(instance.finished())
+        self.assertTrue(any("unexpected worker failure" in failure for failure in instance.failures))
+
     def test_retry_after_delta_and_date_are_capped_and_cancel_aware(self):
         instance = offline_bot()
         for value in ("120", "Wed, 12 Nov 2036 10:00:00 GMT"):

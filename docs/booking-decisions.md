@@ -8,6 +8,10 @@ Certainty is decided at the original final POST boundary. A direct 429, known us
 
 Inputs and files are prepared once before workers start; uploads are shared immutable snapshots. Progress uses process locking and durable atomic writes, rejects reversed ranges, stores canonical semantic identity and phone strings, and validates every persisted summary/receipt field it consumes. Read-only check and booking validate the same applicant/season/origin identity. Existing and unresolved applications are never silently discarded or normalized.
 
+Applicant state, education and diet values resolve once at startup: exact website text and declared state aliases rank first, followed by a unique plausible spelling, spacing or abbreviation match. The resolved website labels are shown before booking and are matched again against the current live options. Missing or unresolvable essentials remain actionable errors. A final request is not persisted or sent unless the observed form still contains its required enabled controls and exact submit button; an absent or empty control restarts from a fresh mobile session. Unexpected worker programming failures stop sibling polling and produce a failing process result.
+
+Persisted semantic dates use canonical `YYYY-MM-DD` text only. A target cannot simultaneously be recorded as accepted and assigned or pending submission; malformed current-version state is preserved and rejected before requests.
+
 Certificate-verification fallback and optional adult applicant-signature reuse when the site insists on a guardian upload are intentional retained behaviors. Runtime guardian classification uses the server-reported age or age-count date; minors require a real guardian signature and are held before final submission when it is missing. Intermediate/Advance entries receive an unsupported-path warning; no full live support is claimed.
 
 ## Observed on 2 November 2026
