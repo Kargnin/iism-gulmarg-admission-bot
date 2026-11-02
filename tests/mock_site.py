@@ -301,6 +301,9 @@ class Site:
         self.viewstates = {}              # token -> {"allowed": {dropdown: values}, "courses": [listed course values]}
         self.applications = []
         self.requests = 0
+        self.request_log = []
+        self.receipt_redirects = {}
+        self.success_receipt = None
 
     def batch_key(self, label, kind=None):
         """('course', 'level', 'batch') values for e.g. ('G2', 'Basic') - for tests. A level is found
@@ -426,6 +429,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.site.fail_success_page -= 1
         if broken_success:
             return self.send(503, IIS_503)
+        if page == "admissionformsuccess.aspx" and self.site.success_receipt is not None:
+            status, response_body, headers = self.site.success_receipt
+            return self.send(status, response_body, dict(headers))
         if self.misbehave():
             return
         sess = self.site.sessions.setdefault(self.sid, {"mobile": None, "accepted": False})
@@ -436,6 +442,11 @@ class Handler(BaseHTTPRequestHandler):
                 values, files = parse_multipart(body, ctype)
             else:
                 values = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode(), keep_blank_values=True).items()}
+        with self.site.lock:
+            self.site.request_log.append({"method": method, "page": page, "sid": self.sid,
+                                          "event": values.get("__EVENTTARGET", ""),
+                                          "submit": bool(values.get("btnSubmit")),
+                                          "mobile": values.get("txtMobileNo") or query.get("mobile", "")})
         handler = {
             ("GET", ""): lambda: self.send(403, IIS_403),
             ("GET", "admission_instructions.aspx"): lambda: self.send(200, self.instructions()),
@@ -855,7 +866,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, self.form(mobile, v, listed))
         if crash:
             return self.send(503, IIS_503)
+        if mobile in site.receipt_redirects:
+            return self.redirect(site.receipt_redirects[mobile])
         message = "Admission Form submitted successfully. Payment link has been sent to your email id."
+        if site.success_style == "temporary":
+            v2 = {"lblMsg": ("Service temporarily unavailable. Please try again.", "Red")}
+            return self.send(200, self.form(mobile, v2, listed))
         if site.success_style == "alert":
             v2 = {"lblMsg": (message, "Green")}
             return self.send(200, self.form(mobile, v2, listed, alert=message))

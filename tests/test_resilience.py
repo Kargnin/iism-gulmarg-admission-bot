@@ -3,12 +3,14 @@ import json
 import hashlib
 import os
 import signal
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -272,6 +274,84 @@ class Resilience(unittest.TestCase):
         with self.assertRaises(bot.ConfigError):
             http.get("/")
         self.assertEqual(received, [])
+
+    def test_foreign_receipt_redirect_is_uncertain_and_does_not_stop_siblings(self):
+        received = []
+        class Receiver(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        receiver = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
+        threading.Thread(target=receiver.serve_forever, daemon=True).start()
+        self.addCleanup(receiver.server_close)
+        self.addCleanup(receiver.shutdown)
+
+        site, url = self.local_site()
+        site.receipt_redirects[PHONES[0]] = f"http://127.0.0.1:{receiver.server_port}/collect"
+        feedback = lambda phone, target, reason: (
+            "booked" if any(item["mobile"] == phone for item in site.snapshot()["applications"]) else "not-booked")
+        instance = run_bot(make_config(self.root, PHONES[:2], ["G2 Basic", "G3 Basic"]),
+                           url, self.root / "foreign-receipt", timeout=5, confirmation_handler=feedback)
+        self.assertTrue(instance.finished())
+        self.assertEqual(len(site.applications), 2)
+        self.assertEqual(received, [])
+        self.assertEqual(instance.failures, [])
+
+    def test_tls_failure_on_redirected_receipt_never_replays_original_post(self):
+        client = bot.Http("https://example.test", 1, bot.Log(echo=False))
+        calls = []
+
+        class ReceiptTLSFailure:
+            def open(self, request, timeout):
+                calls.append((request.get_method(), request.full_url))
+                client.redirect_handler.history.append(
+                    (302, "POST", request.full_url, "https://example.test/receipt"))
+                raise urllib.error.URLError(ssl.SSLCertVerificationError(1, "certificate verify failed"))
+
+        client.opener = ReceiptTLSFailure()
+        with self.assertRaises(bot.RedirectFailure):
+            client.send("POST", "https://example.test/admission_form.aspx", b"application")
+        self.assertEqual(calls, [("POST", "https://example.test/admission_form.aspx")])
+        self.assertFalse(client.verified)
+
+        instance = offline_bot()
+        instance.base_url = "https://example.test"
+        session = bot.Session(instance, PHONES[0], "")
+        session.http = client
+        old_jar = client.jar
+        session.restart()
+        self.assertFalse(session.http.verified)
+        self.assertIsNot(session.http.jar, old_jar)
+
+    def test_trickled_response_body_obeys_total_request_deadline(self):
+        class Trickle(BaseHTTPRequestHandler):
+            def do_GET(self):
+                data = b"x" * 100
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                try:
+                    for value in data:
+                        self.wfile.write(bytes([value]))
+                        self.wfile.flush()
+                        time.sleep(0.03)
+                except OSError:
+                    pass
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = bot.Http(f"http://127.0.0.1:{server.server_port}", 0.2, bot.Log(echo=False))
+        started = time.monotonic()
+        with self.assertRaises(bot.Transient):
+            client.get("/")
+        self.assertLess(time.monotonic() - started, 0.8)
 
     def test_error_or_negative_success_page_is_not_a_confirmation(self):
         instance = offline_bot()

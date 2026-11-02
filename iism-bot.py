@@ -253,11 +253,7 @@ class Transient(Exception):
         self.retry_after = retry_after
 
 
-class RetryableSubmit(Transient):
-    """The final response explicitly says no application was accepted and can be retried."""
-
-
-class RateLimited(RetryableSubmit):
+class RateLimited(Transient):
     """The final request was explicitly refused with HTTP 429 and is safe to retry."""
 
 
@@ -282,12 +278,16 @@ class Resend(Transient):
     """The site refused the form for something we can fix ourselves: send it again."""
 
 
-class SessionLost(Exception):
+class SessionLost(Transient):
     """The site dropped our session or page state: verify the number again."""
 
-    def __init__(self, message, resume=False):
-        super().__init__(message)
-        self.resume = resume  # True: we already hold the page to continue from
+
+class RedirectFailure(Transient):
+    """A request failed after the server redirected it."""
+
+
+class RedirectBlocked(ConfigError):
+    """A redirect left the configured origin and was blocked before contact."""
 
 
 class PhoneUsed(Exception):
@@ -820,8 +820,8 @@ def parse_priority(item, index, batches):
     if start is None:
         raise ConfigError(f"coursePriorities: {item!r} needs a batch code (G1..G6, K1, K2) or a \"from\" date")
     kind = course_kind(spec.get("course", ""))
-    level = course_level(spec.get("level", ""))
-    if kind == "Snow Skiing" and level is None and not spec.get("levelText"):
+    level = course_level(spec.get("level") or spec.get("levelText") or "")
+    if kind == "Snow Skiing" and level is None:
         level = "Basic"
     name = bid or start.strftime("%d%b")
     label = spec.get("label") or f"{name} {level if kind == 'Snow Skiing' else kind}"
@@ -1344,9 +1344,10 @@ class FormParser(HTMLParser):
 class Page:
     """A fetched page plus the controls of its <form>."""
 
-    def __init__(self, url, status, body, fresh=True, headers=None):
+    def __init__(self, url, status, body, fresh=True, headers=None, redirects=()):
         self.url, self.status, self.body = url, status, body
         self.headers = {key.lower(): value for key, value in (headers or {}).items()}
+        self.redirects = tuple(redirects)
         self.fresh = fresh  # loaded by GET or redirect, i.e. not the echo of our own postback
         parser = FormParser()
         try:
@@ -1467,12 +1468,14 @@ def origin(url):
 class OriginRedirectHandler(urllib.request.HTTPRedirectHandler):
     def __init__(self, expected, stop):
         self.expected, self.stop = expected, stop
+        self.history = []
 
     def redirect_request(self, request, response, code, message, headers, new_url):
         if self.stop is not None and self.stop.is_set():
             raise Cancelled()
+        self.history.append((code, request.get_method(), request.full_url, new_url))
         if origin(new_url) != self.expected:
-            raise ConfigError("Blocked a redirect outside the configured admission site.")
+            raise RedirectBlocked("Blocked a redirect outside the configured admission site.")
         return super().redirect_request(request, response, code, message, headers, new_url)
 
 
@@ -1492,14 +1495,14 @@ def response_retry_after(page):
 class Http:
     """Cookie-keeping HTTP client; every network-level failure becomes Transient."""
 
-    def __init__(self, base_url, timeout, log, stop=None):
+    def __init__(self, base_url, timeout, log, stop=None, verify=True):
         self.base_url = base_url.rstrip("/") + "/"
         self.origin = origin(base_url)
         self.stop = stop
         self.timeout = timeout
         self.log = log
         self.jar = http.cookiejar.CookieJar()
-        self._build(verify=True)
+        self._build(verify)
 
     def _build(self, verify):
         ctx = ssl.create_default_context()
@@ -1507,9 +1510,10 @@ class Http:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         self.verified = verify
+        self.redirect_handler = OriginRedirectHandler(self.origin, self.stop)
         self.opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx),
                                                   urllib.request.HTTPCookieProcessor(self.jar),
-                                                  OriginRedirectHandler(self.origin, self.stop))
+                                                  self.redirect_handler)
 
     def check_destination(self, url):
         if self.stop is not None and self.stop.is_set():
@@ -1520,9 +1524,47 @@ class Http:
     def get(self, path):
         return self.send("GET", urllib.parse.urljoin(self.base_url, path))
 
+    @staticmethod
+    def _set_read_timeout(response, timeout):
+        pending, seen = [response], set()
+        while pending:
+            value = pending.pop()
+            if value is None or id(value) in seen:
+                continue
+            seen.add(id(value))
+            if isinstance(value, socket.socket):
+                value.settimeout(timeout)
+                return
+            for name in ("fp", "raw", "_sock", "sock"):
+                child = getattr(value, name, None)
+                if child is not None:
+                    pending.append(child)
+
+    def _read_response(self, response, deadline):
+        chunks = []
+        read = getattr(response, "read1", None)
+        if read is None:
+            read = getattr(getattr(response, "fp", None), "read1", None)
+        read = read or response.read
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("response body deadline exceeded")
+            self._set_read_timeout(response, remaining)
+            chunk = read(64 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+
+    def _network_error(self, message, retry_after=None):
+        kind = RedirectFailure if self.redirect_handler.history else Transient
+        return kind(message, retry_after)
+
     def send(self, method, url, data=None, content_type=None, referer=None, timeout=None):
         self.check_destination(url)
         timeout = timeout or self.timeout
+        deadline = time.monotonic() + timeout
+        self.redirect_handler.history = []
         headers = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
                    "Accept-Language": "en-IN,en;q=0.9", "Cache-Control": "no-cache"}
         if content_type:
@@ -1532,12 +1574,12 @@ class Http:
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with self.opener.open(request, timeout=timeout) as resp:
-                raw, status, final = resp.read(), resp.status, resp.geturl()
+                raw, status, final = self._read_response(resp, deadline), resp.status, resp.geturl()
                 response_headers = dict(resp.headers)
         except urllib.error.HTTPError as e:
             try:
-                raw = e.read()
-            except Exception:
+                raw = self._read_response(e, deadline)
+            except (http.client.HTTPException, OSError, TimeoutError):
                 raw = b""
             status, final = e.code, e.geturl() or url
             response_headers = dict(e.headers)
@@ -1545,16 +1587,22 @@ class Http:
         except urllib.error.URLError as e:
             if isinstance(e.reason, ssl.SSLCertVerificationError) and self.verified:
                 self.log.warn("The site's HTTPS certificate did not verify - continuing without verification")
+                redirected = bool(self.redirect_handler.history)
                 self._build(verify=False)
-                return self.send(method, url, data, content_type, referer, timeout)
-            raise Transient(f"network error: {e.reason}")
+                if method == "GET" and not redirected:
+                    return self.send(method, url, data, content_type, referer, timeout)
+                kind = RedirectFailure if redirected else Transient
+                raise kind(f"network error: {e.reason}")
+            raise self._network_error(f"network error: {e.reason}")
         except (socket.timeout, TimeoutError):
-            raise Transient(f"no answer within {timeout:.0f}s")
+            raise self._network_error(f"no answer within {timeout:g}s")
         except (http.client.HTTPException, OSError) as e:
-            raise Transient(f"connection problem: {type(e).__name__} {e}".strip())
-        fresh = method == "GET" or final.split("#")[0] != url
+            raise self._network_error(f"connection problem: {type(e).__name__} {e}".strip())
+        redirects = tuple(self.redirect_handler.history)
+        fresh = method == "GET" or bool(redirects)
         self.check_destination(final)
-        return Page(final, status, raw.decode("utf-8", errors="replace"), fresh=fresh, headers=response_headers)
+        return Page(final, status, raw.decode("utf-8", errors="replace"), fresh=fresh,
+                    headers=response_headers, redirects=redirects)
 
 
 # ---------------------------------------------------------------------------
@@ -1581,22 +1629,14 @@ class Selection:
 class Session:
     def __init__(self, bot, phone, who):
         self.bot, self.phone, self.who = bot, phone, who
-        self.progress = 0       # successful requests so far (resets the failure backoff)
-        self.static = {}        # page name -> messages that are part of the page itself
         self.http = None
-        self.fresh_needed = True  # the next attempt starts from scratch (see cascade)
-        self.attempt_target = None
         self.restart()
 
-    def restart(self, keep=False):
-        """Start over from mobile verification (keep=True: continue from self.entry)."""
-        if not keep or self.http is None:
-            self.http = Http(self.bot.base_url, self.bot.opt["requestTimeoutSec"], self.bot.log, self.bot.stop)
-            self.entry = None
-        self.page = None        # latest admission form page
-        self.form_url = None
-        self.steps = []         # steps of the current attempt already done on self.page
-        self.cursor = 0
+    def restart(self):
+        verify = self.http.verified if self.http is not None else True
+        self.http = Http(self.bot.base_url, self.bot.opt["requestTimeoutSec"], self.bot.log,
+                         self.bot.stop, verify=verify)
+        self.static = {}
 
     # -- plumbing ------------------------------------------------------------
 
@@ -1608,7 +1648,6 @@ class Session:
             what = f"HTTP {page.status}" if page.status >= 400 else "error page"
             title = page.title()
             raise Transient(what + (f" ({title[:80]})" if title else ""), response_retry_after(page))
-        self.progress += 1
         return page
 
     def get(self, path):
@@ -1658,26 +1697,18 @@ class Session:
             self.bot.note(self.who, f"site says: {reason}")
         return msgs
 
-    # -- steps ---------------------------------------------------------------
+    # -- flow ----------------------------------------------------------------
 
     def open_form(self):
-        """Mobile verification + criteria; leaves self.page on the admission form."""
-        if self.page is not None:
-            return self.page
+        """Mobile verification + criteria; returns the admission form."""
+        page = self.get("Admission_instructions.aspx")
         for _ in range(4):
-            if self.entry is None:
-                self.entry = self.get(self.form_url or "Admission_instructions.aspx")
-            page = self.entry
             if page.name == FORM_PAGE:
                 self.verdict(page, full_ok=False)
                 self.bot.number_accepted(self.phone)
-                self.entry = None
-                self.page, self.form_url = page, page.url
                 return page
             if page.name == INSTRUCTIONS_PAGE:
-                self.form_url = None
                 nxt = self.checked(self.postback(page, "lnkbtnSubmit", {"txtMobileNo": self.phone}))
-                self.entry = nxt
                 said = self.verdict(nxt, deep=nxt.name == INSTRUCTIONS_PAGE, full_ok=False)
                 if nxt.name == INSTRUCTIONS_PAGE:
                     if said:
@@ -1686,16 +1717,16 @@ class Session:
                             raise Refused(f"the site refused mobile number {mask(self.phone)}: {reason}", "number")
                         raise Transient(f"mobile verification did not go through: {reason}")
                     raise Transient("mobile verification did not go through")
+                page = nxt
             elif page.name == CRITERIA_PAGE:
                 nxt = self.checked(self.postback(page, "lnkbtnNext", {"chkAccept": "on"}))
-                self.entry = nxt
                 said = self.verdict(nxt, deep=nxt.name == CRITERIA_PAGE, full_ok=False)
                 if nxt.name == CRITERIA_PAGE:
                     if said:
                         raise Refused(f"the terms page did not move on: {'; '.join(said)}", "criteria")
                     raise Transient("the criteria page did not move on")
+                page = nxt
             else:
-                self.entry = None
                 raise Transient(f"unexpected page '{page.name}'")
         raise Transient("could not get through to the admission form")
 
@@ -1705,52 +1736,32 @@ class Session:
         values.setdefault("txtMobileNo", self.phone)
         nxt = self.checked(self.postback(page, event, values))
         if nxt.name != FORM_PAGE:
-            self.page, self.steps = None, []
             if nxt.name in (INSTRUCTIONS_PAGE, CRITERIA_PAGE):
-                self.entry = nxt
-                raise SessionLost(f"the site sent us back to {nxt.name}", resume=True)
+                raise SessionLost(f"the site sent us back to {nxt.name}")
             raise Transient(f"unexpected page '{nxt.name}' after choosing {event}")
         self.verdict(nxt)
         return nxt
 
-    def step(self, key, action):
-        """Run one step of this attempt, unless a retry of the same attempt already got through it
-        (after a timeout or a 5xx we pick up at the step that failed, on the same session)."""
-        i = self.cursor
-        self.cursor += 1
-        if self.steps[i:i + 1] == [key] and self.page is not None:
-            return self.page
-        del self.steps[i:]
-        self.page = action(self.page)
-        self.steps.append(key)
-        return self.page
-
     def cascade(self, target):
         """Choose course, level, batch, state and date of birth for this target.
 
-        Each new attempt starts from scratch - new session, mobile number, terms - because the
-        site only shows newly listed courses to a fresh visit (reloading the form isn't enough),
-        courses appear one by one, and they vanish from the list once full. Only a retry after a
-        crash or timeout continues the attempt in progress."""
+        Each attempt starts from scratch because the site only recovers reliably after a new
+        cookie session repeats mobile verification and every dependent postback."""
         bot = self.bot
-        if self.fresh_needed or self.attempt_target is not target:
-            self.restart()
-            self.fresh_needed, self.attempt_target = False, target
-        self.cursor = 0
-        page = self.step(("form",), lambda p: self.open_form())
+        self.restart()
+        page = self.open_form()
         course_options = page.options("ddlCourse")
         found = None
         for value, text in course_candidates(course_options, target, bot.course_hint.get(target.index)):
-            self.cursor = 1
-            page = self.step(("course", value), lambda p, v=value: self.select(
-                p, "ddlCourse", dict(first_values(p, "ddlCourseLevel", "ddlScheduleCourse"), ddlCourse=v)))
+            page = self.select(page, "ddlCourse",
+                               dict(first_values(page, "ddlCourseLevel", "ddlScheduleCourse"), ddlCourse=value))
             level_options = page.options("ddlCourseLevel")
             level = match_level(level_options, target, loose=kind_score(text, target.kind) > 0)
             if real_options(level_options) and level is None:
                 continue
             if level:
-                page = self.step(("level", value, level[0]), lambda p, v=level[0]: self.select(
-                    p, "ddlCourseLevel", dict(first_values(p, "ddlScheduleCourse"), ddlCourseLevel=v)))
+                page = self.select(page, "ddlCourseLevel",
+                                   dict(first_values(page, "ddlScheduleCourse"), ddlCourseLevel=level[0]))
             batches = page.options("ddlScheduleCourse")
             if any(is_season_batch(t, bot.s.batches) for _, t in real_options(batches)):
                 bot.saw_season()
@@ -1767,8 +1778,7 @@ class Session:
         values = {"ddlScheduleCourse": batch[0]}
         if level:
             values["ddlCourseLevel"] = level[0]
-        page = self.step(("batch", values.get("ddlCourseLevel"), batch[0]),
-                         lambda p: self.select(p, "ddlScheduleCourse", values))
+        page = self.select(page, "ddlScheduleCourse", values)
         seats = to_int(page.value("txtAvailableSeat"))
         if seats == 0:
             raise TargetFull("0 seats left")
@@ -1781,9 +1791,9 @@ class Session:
             state = match_choice(state_options, bot.s.state, state_aliases(bot.s.state))
             if state is None:
                 raise Rejected(f"address.state \"{bot.s.state}\" is not in the site's list" + listing(page, "ddlState"))
-            page = self.step(("state", state[0]), lambda p: self.select(p, "ddlState", {"ddlState": state[0]}))
+            page = self.select(page, "ddlState", {"ddlState": state[0]})
         dob = bot.s.applicant.get("dateOfBirth", "")
-        page = self.step(("dob", dob), lambda p: self.select(p, "txtDateOfBirth", {"txtDateOfBirth": dob}))
+        page = self.select(page, "txtDateOfBirth", {"txtDateOfBirth": dob})
         # outside the age limit the site says "Your Age N Years , Age Allow X To Y Years." and clears the date
         said = self.msgs(page)
         echoed = page.value("txtDateOfBirth")
@@ -1843,8 +1853,12 @@ class Session:
             resp = self.postback(page, event, values, files=files, timeout=bot.opt["submitTimeoutSec"])
             saved = bot.save_page(self.who, f"submit-{target.label}", resp)
             result = self.judge_submit(resp, target, sel, saved)
-        except (RetryableSubmit, Resend, Rejected, TargetFull, NotOpen, PhoneUsed, SessionLost):
+        except (RateLimited, Resend, Rejected, TargetFull, NotOpen, PhoneUsed, SessionLost):
             bot.clear_submitting(self.phone)
+            raise
+        except RedirectBlocked as exc:
+            raise Uncertain(str(exc)) from exc
+        except Uncertain:
             raise
         except (Cancelled, ConfigError):
             raise
@@ -1881,6 +1895,9 @@ class Session:
                 hidden = resp.value("hdfAdmissionFormId") or ""
                 app_id = hidden if hidden not in ("", "0") else ""
             return {"message": message.strip(), "applicationId": app_id, "url": resp.url, "response": str(saved or "")}
+        if resp.redirects:
+            raise Uncertain(f"the final POST redirected, but its receipt did not confirm the application "
+                            f"(HTTP {resp.status}, page '{resp.name}')")
         reason = "; ".join(msgs[:4])
         if resp.status == 429:
             raise RateLimited("submit was rate limited: HTTP 429", response_retry_after(resp))
@@ -1902,7 +1919,7 @@ class Session:
             meaningful = [m for m in msgs if not re.fullmatch(r"Your Age \d+ Years\.?", m, re.I)]
             if meaningful:
                 if has_any(" ".join(meaningful).lower(), TEMPORARY_PHRASES):
-                    raise RetryableSubmit(f"site temporarily refused the form: {reason}")
+                    raise Uncertain(f"the final response was temporary and may have followed acceptance: {reason}")
                 wants_parent = has_any(" ".join(meaningful).lower(), ("parent", "guardian"))
                 if wants_parent and not bot.s.docs.get("parentSignature"):
                     if sel.server_age is None:
@@ -2060,7 +2077,7 @@ class State:
 
 def target_key(target):
     value = [norm(target.location).title(), target.start.isoformat(), target.end.isoformat() if target.end else "",
-             target.kind, norm(target.level or target.level_text).title()]
+             target.kind, norm(target.level).title()]
     return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -2100,11 +2117,18 @@ class Bot:
         self.phone_state = {phone: "free" for phone in self.phones}
         self.owners = {}
         lookup = {target_key(t): t for t in self.targets}
+        unmatched = []
         for booking in self.state.data["bookings"]:
+            self.bookings.append(booking)
             target = lookup.get(booking["targetKey"])
             if target is not None:
                 self.booked[target.index] = booking
-                self.bookings.append(booking)
+            else:
+                unmatched.append(booking)
+        for booking in unmatched:
+            if any(norm(booking.get("batch", "")) == norm(target.when()) for target in self.targets):
+                raise ConfigError("An accepted application matches a current schedule but uses an incompatible "
+                                  "saved identity. Keep the progress file and reconcile it before booking.")
         for phone, item in self.state.data["phones"].items():
             if phone in self.phone_state:
                 self.phone_state[phone] = item["status"]
@@ -2435,10 +2459,8 @@ class Worker(threading.Thread):
                         bot.record_booking(phone, target, {"userConfirmed": True, "message": "User verified the booking."})
                         return
                     bot.clear_submitting(phone)
-                    session.restart()
-                    session.fresh_needed = True
+                    failures = 0
                 bot.set_status(self.name, f"{target.label} with {mask(phone)}")
-                progress = session.progress
                 try:
                     info = session.book(target)
                 except Uncertain as exc:
@@ -2447,33 +2469,30 @@ class Worker(threading.Thread):
                 except PhoneUsed as exc:
                     bot.phone_used(phone, target, str(exc))
                     phone, session = None, None
+                    failures = 0
                 except (TargetFull, NotOpen) as exc:
-                    session.fresh_needed = True
+                    failures = 0
                     with bot.lock:
                         bot.blocked[target.index] = {"why": str(exc), "kind": "pending"}
                     bot.note(session.who, f"{target.label}: {exc}; keeping this preference pending")
                     bot.sleep(bot.poll_delay())
-                except SessionLost as exc:
-                    session.fresh_needed = True
-                    bot.note(session.who, f"{exc}; refreshing the session")
-                    bot.sleep(bot.backoff(1))
                 except Refused as exc:
-                    session.fresh_needed = True
+                    failures += 1
                     if bot.number_refused(phone, exc.what):
                         bot.phone_used(phone, target, str(exc))
                         phone, session = None, None
+                        failures = 0
                     else:
-                        bot.sleep(min(10, bot.opt["rejectedRetrySec"]))
+                        delay = max(min(10, bot.opt["rejectedRetrySec"]), bot.retry_delay(failures, exc))
+                        bot.sleep(delay)
                 except Rejected as exc:
-                    session.fresh_needed = True
                     with bot.lock:
                         bot.blocked[target.index] = {"why": str(exc), "kind": "rejected"}
                     bot.attention(("rejected", target.index, str(exc)), f"the site refused {target.label}",
                                   [str(exc)], fix_hint(str(exc)))
                     return
                 except Transient as exc:
-                    failures = 1 if session.progress > progress else failures + 1
-                    session.fresh_needed = session.fresh_needed or failures >= 6
+                    failures += 1
                     bot.note(session.who, f"{target.label}: {exc}; retrying with capped backoff")
                     bot.sleep(bot.retry_delay(failures, exc))
                 else:
@@ -2599,7 +2618,7 @@ def with_retries(bot, action, tries=15):
     for n in range(1, tries + 1):
         try:
             return action()
-        except (Transient, SessionLost) as e:
+        except Transient as e:
             if n == tries:
                 raise
             bot.log.info(f"  ({e} - retrying)")
@@ -2610,8 +2629,11 @@ def run_discover(bot, phone):
     """Walk the live form with one number and show what the site offers. Never submits."""
     log = bot.log
     session = Session(bot, phone, f"[discover {mask(phone)}] ")
+    def fresh(action):
+        session.restart()
+        return action()
     try:
-        page = with_retries(bot, session.open_form)
+        page = with_retries(bot, lambda: fresh(session.open_form))
     except PhoneUsed as e:
         log.error(f"Number {mask(phone)} is already used on the site: {e}")
         return 1
@@ -2622,12 +2644,11 @@ def run_discover(bot, phone):
     log.info(f"Courses on the form: {len(courses)}")
     for value, text in courses:
         def choose(v=value):
-            session.restart()
             p = session.open_form()
             return session.select(p, "ddlCourse",
                                   dict(first_values(p, "ddlCourseLevel", "ddlScheduleCourse"), ddlCourse=v))
         try:
-            p = with_retries(bot, choose)
+            p = with_retries(bot, lambda: fresh(choose))
         except (TargetFull, NotOpen) as e:
             log.info(f"  [{value}] {text}: {e}")
             continue

@@ -162,6 +162,22 @@ class Matching(unittest.TestCase):
                    ("2", "Snow Skiing Advance Course at Kargil")]
         self.assertEqual(bot.course_candidates(courses, wrong_course), [])
 
+    def test_hint_text_does_not_define_semantic_identity(self):
+        batches = bot.load_season({}, Path("."))[0]
+        plain = bot.parse_priority({"batch": "G2", "level": "Basic"}, 0, batches)
+        hinted = bot.parse_priority({"batch": "g2", "levelText": "Basic SSC", "label": "hinted"}, 1, batches)
+        self.assertEqual(plain.level, "Basic")
+        self.assertEqual(hinted.level, "Basic")
+        self.assertEqual(bot.target_key(plain), bot.target_key(hinted))
+        board = bot.parse_priority({"batch": "G4", "course": "Snow Boarding"}, 0, batches)
+        board_hint = bot.parse_priority({"batch": "G4", "course": "Snow Boarding",
+                                         "levelText": "None", "label": "board hint"}, 1, batches)
+        self.assertEqual(bot.target_key(board), bot.target_key(board_hint))
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = make_config(Path(folder), PHONES[:2], [
+                "G2 Basic", {"batch": "G2", "levelText": "Basic SSC", "label": "duplicate hint"}])
+            self.assertTrue(any("duplicates" in error for error in bot.parse_settings(cfg, None)[1]))
+
     def test_choices(self):
         states = mock_site.STATES
         self.assertEqual(bot.match_choice(states, "Maharashtra")[0], "27")
@@ -560,6 +576,12 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
         self.assertEqual(len(attempts), 2)
         self.assertNotIn(PHONES[1], self.site.used)
+        submits = [(index, item) for index, item in enumerate(self.site.request_log) if item["submit"]]
+        first_index, first_submit = submits[0]
+        next_request = self.site.request_log[first_index + 1]
+        self.assertEqual((next_request["method"], next_request["page"]),
+                         ("GET", "admission_instructions.aspx"))
+        self.assertNotEqual(next_request["sid"], first_submit["sid"])
 
     def test_used_primary_is_replaced_by_a_reserve(self):
         for style in ("label", "alert"):
@@ -599,6 +621,33 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(len(refusals), 4)
         self.assertNotIn(PHONES[1], self.site.used)
 
+    def test_trickled_worker_response_does_not_block_healthy_sibling(self):
+        original = mock_site.Handler.post_instructions
+
+        def trickle_first_phone(handler, session, values):
+            if values.get("txtMobileNo") != PHONES[0]:
+                return original(handler, session, values)
+            data = handler.instructions().encode()
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.end_headers()
+            try:
+                for offset in range(0, len(data), 16):
+                    handler.wfile.write(data[offset:offset + 16])
+                    handler.wfile.flush()
+                    time.sleep(0.03)
+            except OSError:
+                pass
+
+        started = time.monotonic()
+        with mock.patch.object(mock_site.Handler, "post_instructions", trickle_first_phone):
+            instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], timeout=0.7,
+                                     bot={"requestTimeoutSec": 0.15, "submitTimeoutSec": 0.5})
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(self.booked(instance), [("G3 Basic", PHONES[1], "confirmed")])
+        self.assertFalse(instance.finished())
+
     def test_exhausted_numbers_do_not_stop_other_preferences(self):
         self.site.used = {PHONES[0]}
         instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], timeout=0.8)
@@ -620,6 +669,30 @@ class EndToEnd(unittest.TestCase):
         self.site.fail_success_page = 1
         instance = self.run_with(PHONES[:1], ["G2 Basic"],
                                  confirmation_handler=self.feedback_from_receipts)
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "user-confirmed")])
+        self.assertEqual(len(self.site.applications), 1)
+
+    def test_redirected_receipt_errors_require_feedback_without_replay(self):
+        cases = [
+            (500, "<html><body>Validation of viewstate MAC failed.</body></html>", {}),
+            (429, "too many requests", {"Retry-After": "1"}),
+        ]
+        for status, body, headers in cases:
+            with self.subTest(status=status):
+                self.site.used.clear()
+                self.site.applications.clear()
+                self.site.request_log.clear()
+                self.site.success_receipt = (status, body, headers)
+                shutil.rmtree(self.out, ignore_errors=True)
+                instance = self.run_with(PHONES[:1], ["G2 Basic"],
+                                         confirmation_handler=self.feedback_from_receipts)
+                self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "user-confirmed")])
+                self.assertEqual(len(self.site.applications), 1)
+        self.site.success_receipt = None
+
+    def test_same_url_receipt_redirect_is_uncertain_not_replayed(self):
+        self.site.receipt_redirects[PHONES[0]] = f"/admission_form.aspx?mobile={PHONES[0]}"
+        instance = self.run_with(PHONES[:1], ["G2 Basic"], confirmation_handler=self.feedback_from_receipts)
         self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "user-confirmed")])
         self.assertEqual(len(self.site.applications), 1)
 
@@ -672,22 +745,80 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(instance.blocked[0]["kind"], "rejected")
         self.assertNotIn(PHONES[2], self.site.used)
 
-    def test_explicit_temporary_submit_message_retries_without_parking(self):
-        original = mock_site.Handler.submit
+    def test_temporary_submit_message_requires_feedback_without_replay(self):
         temporary = []
 
         def retry_later(handler, mobile, values, files, listed, course, level, batch):
-            if len(temporary) < 3:
-                temporary.append(1)
-                values["lblMsg"] = ("Service temporarily unavailable. Please try again.", "Red")
-                return handler.send(200, handler.form(mobile, values, listed))
-            return original(handler, mobile, values, files, listed, course, level, batch)
+            temporary.append(1)
+            site = handler.site
+            key = (values["ddlCourse"], values["ddlCourseLevel"], values["ddlScheduleCourse"])
+            with site.lock:
+                site.seats[key] -= 1
+                site.used.add(mobile)
+                site.applications.append({"mobile": mobile, "course": key[0], "level": key[1],
+                                          "schedule": key[2], "files": [], "fileHashes": {}})
+            values["lblMsg"] = ("Service temporarily unavailable. Please try again.", "Red")
+            return handler.send(200, handler.form(mobile, values, listed))
 
         with mock.patch.object(mock_site.Handler, "submit", retry_later):
-            instance = self.run_with(PHONES[:2], ["G2 Basic"])
-        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
-        self.assertEqual(len(temporary), 3)
+            instance = self.run_with(PHONES[:2], ["G2 Basic"],
+                                     confirmation_handler=self.feedback_from_receipts)
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "user-confirmed")])
+        self.assertEqual(len(temporary), 1)
+        self.assertEqual(len(self.site.applications), 1)
         self.assertNotIn(PHONES[1], self.site.used)
+
+    def test_repeated_viewstate_failures_restart_from_mobile_and_grow_backoff(self):
+        original = mock_site.Handler.post_form
+        failed_sids = []
+        delays = []
+
+        def fail_state(handler, session, query, values, files):
+            if values.get("__EVENTTARGET") == "ddlState" and len(failed_sids) < 3:
+                failed_sids.append(handler.sid)
+                return handler.ysod("Validation of viewstate MAC failed.")
+            return original(handler, session, query, values, files)
+
+        def record_delay(instance, failures, error):
+            delays.append(failures)
+            return 0
+
+        with mock.patch.object(mock_site.Handler, "post_form", fail_state), \
+                mock.patch.object(bot.Bot, "retry_delay", record_delay):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertTrue(instance.finished())
+        self.assertEqual(delays[:3], [1, 2, 3])
+        cursor = 0
+        for failed_sid in failed_sids:
+            index = next(i for i in range(cursor, len(self.site.request_log))
+                         if self.site.request_log[i]["event"] == "ddlState"
+                         and self.site.request_log[i]["sid"] == failed_sid)
+            next_request = self.site.request_log[index + 1]
+            self.assertEqual((next_request["method"], next_request["page"]),
+                             ("GET", "admission_instructions.aspx"))
+            self.assertNotEqual(next_request["sid"], failed_sid)
+            cursor = index + 1
+
+    def test_discover_restarts_from_mobile_after_postback_failure(self):
+        original = mock_site.Handler.post_form
+        failed = []
+
+        def fail_course_once(handler, session, query, values, files):
+            if values.get("__EVENTTARGET") == "ddlCourse" and not failed:
+                failed.append(handler.sid)
+                return handler.send(500, mock_site.YSOD)
+            return original(handler, session, query, values, files)
+
+        settings = bot.parse_settings(make_config(self.tmp, PHONES[:1], ["G2 Basic"]), None)[0]
+        instance = bot.Bot(settings, self.out, base_url=self.url, dry_run=True, log=bot.Log(echo=False))
+        with mock.patch.object(mock_site.Handler, "post_form", fail_course_once):
+            self.assertEqual(bot.run_discover(instance, PHONES[0]), 0)
+        failed_index = next(i for i, item in enumerate(self.site.request_log)
+                            if item["event"] == "ddlCourse" and item["sid"] == failed[0])
+        next_request = self.site.request_log[failed_index + 1]
+        self.assertEqual((next_request["method"], next_request["page"]),
+                         ("GET", "admission_instructions.aspx"))
+        self.assertNotEqual(next_request["sid"], failed[0])
 
     def test_survives_crashes_sessions_and_application_restarts(self):
         self.site.chaos, self.site.session_loss, self.site.restarts = 0.35, 0.04, 0.02
@@ -721,12 +852,42 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(resumed.finished())
         self.assertEqual(len(self.site.applications), 2)
 
+    def test_hint_only_change_restores_the_same_accepted_preference(self):
+        self.run_with(PHONES[:1], ["G2 Basic"])
+        hinted = {"batch": "g2", "levelText": "Basic SSC", "courseText": "Snow Skiing",
+                  "batchText": "Course", "label": "same preference"}
+        resumed = self.run_with(PHONES[:1], [hinted])
+        self.assertTrue(resumed.finished())
+        self.assertEqual(len(self.site.applications), 1)
+
+    def test_removed_accepted_history_stays_visible_and_protects_its_phone(self):
+        self.run_with(PHONES[:2], ["G2 Basic"])
+        resumed = self.run_with(PHONES[:2], ["G3 Basic"])
+        self.assertTrue(resumed.finished())
+        self.assertEqual({item["target"]: item["phone"] for item in resumed.bookings},
+                         {"G2 Basic": PHONES[0], "G3 Basic": PHONES[1]})
+        self.assertEqual(len(self.site.applications), 2)
+
+    def test_ambiguous_legacy_accepted_identity_fails_closed(self):
+        self.run_with(PHONES[:1], ["G2 Basic"])
+        state_path = self.out / "state.json"
+        state = json.loads(state_path.read_text())
+        state["bookings"][0]["targetKey"] = "legacy-hint-key"
+        state["phones"][PHONES[0]]["targetKey"] = "legacy-hint-key"
+        state_path.write_text(json.dumps(state))
+        settings = bot.parse_settings(
+            make_config(self.tmp, PHONES[:1], [{"batch": "G2", "levelText": "Basic SSC"}]), None)[0]
+        with self.assertRaisesRegex(bot.ConfigError, "incompatible saved identity"):
+            bot.Bot(settings, self.out, base_url=self.url, log=bot.Log(echo=False))
+
     def test_old_booking_does_not_complete_a_changed_date(self):
         self.run_with(PHONES[:1], ["G2 Basic"])
         changed = {"batch": "G2", "from": "2028-01-03", "to": "2028-01-16", "label": "G2 Basic"}
         instance = self.run_with(PHONES[:1], [changed], timeout=0.3)
         self.assertFalse(instance.finished())
-        self.assertEqual(instance.bookings, [])
+        self.assertEqual(len(instance.bookings), 1)
+        self.assertEqual(instance.bookings[0]["phone"], PHONES[0])
+        self.assertEqual(instance.phone_state[PHONES[0]], "booked")
         self.assertEqual(len(self.site.applications), 1)
 
     def test_cancellation_after_cascade_prevents_final_post(self):
@@ -783,6 +944,12 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(instance.finished())
         self.assertTrue(instance.parent_fallback)
         self.assertIn("FupParentGuardianSignature", self.site.applications[0]["files"])
+        submits = [(index, item) for index, item in enumerate(self.site.request_log) if item["submit"]]
+        first_index, first_submit = submits[0]
+        next_request = self.site.request_log[first_index + 1]
+        self.assertEqual((next_request["method"], next_request["page"]),
+                         ("GET", "admission_instructions.aspx"))
+        self.assertNotEqual(next_request["sid"], first_submit["sid"])
 
     def test_adult_signature_is_not_sent_in_guardian_slot_unnecessarily(self):
         instance = self.run_with(PHONES[:1], ["G2 Basic"])
