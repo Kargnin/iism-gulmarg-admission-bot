@@ -99,6 +99,17 @@ class Matching(unittest.TestCase):
         options = [("1", "01/03/2027 To 14/03/2027"), ("2", "03/01/2027 To 16/01/2027")]
         self.assertEqual(bot.match_batch(options, target("G2 Basic"))[0], "2")
 
+    def test_explicit_end_date_uses_parsed_written_date_spans(self):
+        g1 = target("G1 Basic")
+        self.assertIsNone(bot.match_batch(
+            [("1", "Dec 20, 2026 - Jan 9, 2027")], g1))
+        self.assertEqual(bot.match_batch(
+            [("1", "Dec 20, 2026 - Jan 2, 2027")], g1)[0], "1")
+        self.assertEqual(bot.match_batch(
+            [("2", "03/01/2027")], target("G2 Basic"))[0], "2")
+        self.assertEqual(bot.match_batch(
+            [("3", "1st Course (20.12.2026 - 02.01.2027)")], g1)[0], "3")
+
     def test_does_not_match_other_batches(self):
         options = [("70", "Course from 13 Sep to 26 Sep 2026"), ("71", "Course from 20 Dec to 02 Jan 2027"),
                    ("73", "Course from 17 Jan to 30 Jan 2027")]
@@ -112,8 +123,25 @@ class Matching(unittest.TestCase):
         self.assertEqual(target("G5 MOI").kind, "MOI")
         self.assertEqual(target("K1 inter").level, "Intermediate")
         self.assertEqual(target("G6").level, "Basic")
+        self.assertEqual(target("G2 Snow Skiing").level, "Basic")
         with self.assertRaises(bot.ConfigError):
             target("G9 Basic")
+
+    def test_priority_semantics_reject_unknown_and_incompatible_levels(self):
+        for label in ("G2 Adventure Courses", "G2 Winter Training"):
+            with self.subTest(label=label), self.assertRaises(bot.ConfigError):
+                target(label)
+        batches = bot.load_season({}, Path("."))[0]
+        for item in ({"batch": "G4", "course": "Snow Boarding", "level": "Basic"},
+                     {"batch": "G5", "course": "MOI", "level": "Advance"}):
+            with self.subTest(item=item), self.assertRaisesRegex(bot.ConfigError, "combines"):
+                bot.parse_priority(item, 0, batches)
+        self.assertEqual(bot.parse_priority({"batch": "G4", "course": "Snow Boarding"},
+                                            0, batches).kind, "Snow Boarding")
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = make_config(Path(folder), PHONES[:1],
+                              [{"batch": "G4", "course": "Snow Boarding", "level": "Basic"}])
+            self.assertTrue(any("combines" in error for error in bot.parse_settings(cfg, None)[1]))
 
     def test_course_candidates(self):
         options = [("0", "Select Course"), ("9", "Adventure Courses"), ("1", "SNOW SKIING COURSE (GULMARG)"),
@@ -801,6 +829,39 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.site.requests, requests)
         self.assertEqual(len(self.site.applications), 1)
 
+    def test_direct_viewstate_error_after_commit_stays_pending_with_sibling_progress(self):
+        original = mock_site.Handler.submit
+        attempts = []
+
+        def commit_then_viewstate_error(handler, mobile, values, files, listed, course, level, batch):
+            if mobile != PHONES[0]:
+                return original(handler, mobile, values, files, listed, course, level, batch)
+            attempts.append(mobile)
+            site = handler.site
+            key = (values["ddlCourse"], values["ddlCourseLevel"], values["ddlScheduleCourse"])
+            with site.lock:
+                site.seats[key] -= 1
+                site.used.add(mobile)
+                site.applications.append({"mobile": mobile, "course": key[0], "level": key[1],
+                                          "schedule": key[2], "files": [], "fileHashes": {}})
+            return handler.ysod("Validation of viewstate MAC failed.")
+
+        with mock.patch.object(mock_site.Handler, "submit", commit_then_viewstate_error):
+            first = self.run_with(PHONES, ["G2 Basic", "G3 Basic"], timeout=0.8,
+                                  confirmation_handler=lambda *args: None)
+        self.assertEqual(self.booked(first), [("G3 Basic", PHONES[1], "confirmed")])
+        self.assertEqual(first.pending, {PHONES[0]: bot.target_key(first.targets[0])})
+        self.assertEqual(attempts, [PHONES[0]])
+        self.assertEqual(len(self.site.applications), 2)
+        self.assertNotIn(PHONES[2], self.site.used)
+
+        requests = self.site.requests
+        resumed = self.run_with(PHONES, ["G2 Basic", "G3 Basic"],
+                                confirmation_handler=lambda *args: "booked")
+        self.assertTrue(resumed.finished())
+        self.assertEqual(self.site.requests, requests)
+        self.assertEqual(len(self.site.applications), 2)
+
     def test_repeated_viewstate_failures_restart_from_mobile_and_grow_backoff(self):
         original = mock_site.Handler.post_form
         failed_sids = []
@@ -904,7 +965,11 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(len(self.site.applications), 2)
 
     def test_hint_only_change_restores_the_same_accepted_preference(self):
-        self.run_with(PHONES[:1], ["G2 Basic"])
+        first = self.run_with(PHONES[:1], ["G2 Basic"])
+        state = json.loads((self.out / "state.json").read_text())
+        self.assertEqual((state["version"], state["targetKeyVersion"]),
+                         (bot.STATE_VERSION, bot.TARGET_KEY_VERSION))
+        self.assertEqual(state["bookings"][0]["targetIdentity"], bot.target_identity(first.targets[0]))
         hinted = {"batch": "g2", "levelText": "Basic SSC", "courseText": "Snow Skiing",
                   "batchText": "Course", "label": "same preference"}
         resumed = self.run_with(PHONES[:1], [hinted])
@@ -919,17 +984,35 @@ class EndToEnd(unittest.TestCase):
                          {"G2 Basic": PHONES[0], "G3 Basic": PHONES[1]})
         self.assertEqual(len(self.site.applications), 2)
 
-    def test_ambiguous_legacy_accepted_identity_fails_closed(self):
+    def test_same_date_changed_kind_uses_reserve_without_hiding_history(self):
+        self.run_with(PHONES[:2], ["G4 Basic"])
+        resumed = self.run_with(PHONES[:2], ["G4 Snowboarding"])
+        self.assertTrue(resumed.finished())
+        self.assertEqual([item["phone"] for item in resumed.bookings], PHONES[:2])
+        self.assertEqual(self.site.applications[-1]["mobile"], PHONES[1])
+
+    def test_same_date_changed_level_uses_reserve_without_hiding_history(self):
+        self.run_with(PHONES[:2], ["G4 Basic"])
+        resumed = self.run_with(PHONES[:2], ["G4 Intermediate"])
+        self.assertTrue(resumed.finished())
+        self.assertEqual([item["phone"] for item in resumed.bookings], PHONES[:2])
+        self.assertEqual(self.site.applications[-1]["mobile"], PHONES[1])
+
+    def test_unsupported_old_progress_schema_is_preserved_and_fails_closed(self):
         self.run_with(PHONES[:1], ["G2 Basic"])
         state_path = self.out / "state.json"
         state = json.loads(state_path.read_text())
-        state["bookings"][0]["targetKey"] = "legacy-hint-key"
-        state["phones"][PHONES[0]]["targetKey"] = "legacy-hint-key"
+        state["version"] = 1
+        state.pop("targetKeyVersion")
         state_path.write_text(json.dumps(state))
+        preserved = state_path.read_bytes()
         settings = bot.parse_settings(
             make_config(self.tmp, PHONES[:1], [{"batch": "G2", "levelText": "Basic SSC"}]), None)[0]
-        with self.assertRaisesRegex(bot.ConfigError, "incompatible saved identity"):
+        requests = self.site.requests
+        with self.assertRaisesRegex(bot.ConfigError, "unsupported progress schema"):
             bot.Bot(settings, self.out, base_url=self.url, log=bot.Log(echo=False))
+        self.assertEqual(state_path.read_bytes(), preserved)
+        self.assertEqual(self.site.requests, requests)
 
     def test_old_booking_does_not_complete_a_changed_date(self):
         self.run_with(PHONES[:1], ["G2 Basic"])

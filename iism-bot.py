@@ -225,7 +225,11 @@ KIND_PATTERNS = {  # course kind -> (words that identify it in the site's text, 
     "Snow Boarding": (r"board", r"water"),
     "MOI": (r"\bmoi\b|\bm o i\b|method of instruction|instructor", r"water"),
 }
-LEVEL_WORDS = [("Basic", ("basic", "beginner")), ("Intermediate", ("inter",)), ("Advance", ("adv",))]  # your text
+CONFIG_LEVEL_PATTERNS = {
+    "Basic": r"\b(?:basic|beginner)\b",
+    "Intermediate": r"\b(?:inter|intermediate|intermidiate)\b",
+    "Advance": r"\b(?:adv|advance|advanced)\b",
+}
 LEVEL_PATTERNS = {"Basic": r"\bbasic|\bbeginner", "Intermediate": r"\binter",  # the site's text ("Intermidiate")
                   "Advance": r"\badvance"}                                      # ("adv" would match "Adventure")
 GENERIC_LEVELS = ("none", "na", "n a", "nil", "general", "all", "not applicable")  # the real form has a level "None"
@@ -480,33 +484,43 @@ def first_values(page, *names):
 # Dates and matching the site's dropdown texts
 # ---------------------------------------------------------------------------
 
+class DateReading:
+    __slots__ = ("year", "month", "day", "reading", "span")
+
+    def __init__(self, year, month, day, reading, span):
+        self.year, self.month, self.day = year, month, day
+        self.reading, self.span = reading, span
+
+
 def dates_in(text):
-    """Dates in a dropdown text as (year or None, month, day, reading).
-    Numeric dates are read both day-first and month-first; matching prefers day-first."""
+    """Parsed date interpretations with the source span of each written date."""
     t = str(text or "").lower()
     out = []
 
-    def add(y, m, d, how):
+    def add(y, m, d, how, span):
         if y is not None and y < 100:
             y += 2000
         if 1 <= m <= 12 and 1 <= d <= 31:
-            out.append((y, m, d, how))
+            out.append(DateReading(y, m, d, how, span))
 
-    for a, b, c in re.findall(r"(\d{1,4})[/.\-](\d{1,2})[/.\-](\d{2,4})", t):
+    for match in re.finditer(r"(\d{1,4})[/.\-](\d{1,2})[/.\-](\d{2,4})", t):
+        a, b, c = match.groups()
         if len(a) == 4:
-            add(int(a), int(b), int(c), "iso")
+            add(int(a), int(b), int(c), "iso", match.span())
         else:
-            add(int(c), int(b), int(a), "dmy")
-            add(int(c), int(a), int(b), "mdy")
-    # "20 Dec 2026", "20-Dec-26", "20th December"; a 2-digit year only when tightly attached,
-    # so "20 Dec - 02 Jan" is not read as the year 2002
-    for d, mon, y4, y2 in re.findall(r"\b(\d{1,2})(?:st|nd|rd|th)?[\s\-/.,]*([a-z]{3,9})\.?"
-                                     r"(?:[\s\-/.,']*(\d{4})\b|[\-/.'](\d{2})\b)?", t):
+            add(int(c), int(b), int(a), "dmy", match.span())
+            add(int(c), int(a), int(b), "mdy", match.span())
+    day_month = (r"\b(\d{1,2})(?:st|nd|rd|th)?[\s\-/.,]*([a-z]{3,9})\.?"
+                 r"(?:[\s\-/.,']*(\d{4})\b|[\-/.'](\d{2})\b)?")
+    for match in re.finditer(day_month, t):
+        d, mon, y4, y2 = match.groups()
         if mon[:3] in MONTHS:
-            add(int(y4 or y2) if (y4 or y2) else None, MONTHS[mon[:3]], int(d), "text")
-    for mon, d, y in re.findall(r"\b([a-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b,?(?:\s*(\d{4}))?", t):
+            add(int(y4 or y2) if (y4 or y2) else None, MONTHS[mon[:3]], int(d), "text", match.span())
+    month_day = r"\b([a-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b,?(?:\s*(\d{4}))?"
+    for match in re.finditer(month_day, t):
+        mon, d, y = match.groups()
         if mon[:3] in MONTHS:
-            add(int(y) if y else None, MONTHS[mon[:3]], int(d), "text")
+            add(int(y) if y else None, MONTHS[mon[:3]], int(d), "text", match.span())
     return out
 
 
@@ -515,9 +529,10 @@ def date_match(found, day):
     if day is None:
         return 0
     best = 0
-    for y, m, d, how in found:
-        if (m, d) == (day.month, day.day) and (y is None or y == day.year):
-            best = max(best, 1 if how == "mdy" else 2)
+    for reading in found:
+        if ((reading.month, reading.day) == (day.month, day.day)
+                and (reading.year is None or reading.year == day.year)):
+            best = max(best, 1 if reading.reading == "mdy" else 2)
     return best
 
 
@@ -527,10 +542,10 @@ def parse_day(value):
         return None
     if isinstance(value, date):
         return value
-    for y, m, d, how in dates_in(value):
-        if how != "mdy" and y:
+    for reading in dates_in(value):
+        if reading.reading != "mdy" and reading.year:
             try:
-                return date(y, m, d)
+                return date(reading.year, reading.month, reading.day)
             except ValueError:
                 pass
     return None
@@ -635,8 +650,7 @@ def match_batch(options, target):
         start = date_match(found, target.start)
         if not start:
             continue
-        written_dates = re.findall(r"\d{1,4}[/.\-]\d{1,2}[/.\-]\d{2,4}|\b\d{1,2}(?:st|nd|rd|th)?[\s\-/.]*[A-Za-z]{3,9}", text)
-        if target.end and len(written_dates) >= 2 and not date_match(found, target.end):
+        if target.end and len({reading.span for reading in found}) >= 2 and not date_match(found, target.end):
             continue
         location = location_score(text, target.location)
         level = level_score(text, target)
@@ -652,7 +666,7 @@ def match_batch(options, target):
 def is_season_batch(text, batches):
     """Whether a dropdown text is one of this season's batches (by its start date)."""
     found = dates_in(text)
-    return any(date_match(found, b["from"]) == 2 for b in batches.values())
+    return any(date_match(found, b["from"]) > 0 for b in batches.values())
 
 
 def match_choice(options, wanted, aliases=()):
@@ -774,19 +788,25 @@ class Target:
 
 def course_kind(text):
     t = norm(text)
-    if "board" in t:
-        return "Snow Boarding"
+    found = []
+    if re.search(r"\bsnow\s*board(?:ing)?\b|\bboard(?:ing)?\b", t):
+        found.append("Snow Boarding")
     if re.search(KIND_PATTERNS["MOI"][0], t):
-        return "MOI"
-    return "Snow Skiing"
+        found.append("MOI")
+    if re.search(r"\bski(?:ing)?\b", t):
+        found.append("Snow Skiing")
+    if len(found) > 1:
+        raise ConfigError(f"course {text!r} names more than one course kind")
+    return found[0] if found else None
 
 
-def course_level(text):
+def configured_levels(text):
     t = norm(text)
-    return next((level for level, words in LEVEL_WORDS if has_any(t, words)), None)
+    return [level for level, pattern in CONFIG_LEVEL_PATTERNS.items() if re.search(pattern, t)]
 
 
 def parse_priority(item, index, batches):
+    text_priority = isinstance(item, str)
     if isinstance(item, str):
         words = item.replace(",", " ").split()
         if not words:
@@ -806,10 +826,27 @@ def parse_priority(item, index, batches):
     start = configured_day(spec.get("from"), f"coursePriorities[{index}].from") or batch.get("from")
     if start is None:
         raise ConfigError(f"coursePriorities: {item!r} needs a batch code (G1..G6, K1, K2) or a \"from\" date")
-    kind = course_kind(spec.get("course", ""))
-    level = course_level(spec.get("level") or spec.get("levelText") or "")
+    course_value = str(spec.get("course") or "").strip()
+    level_value = str(spec.get("level") or "").strip()
+    kind = course_kind(course_value)
+    levels = configured_levels(level_value)
+    if len(levels) > 1:
+        raise ConfigError(f"coursePriorities[{index}].level {level_value!r} is ambiguous")
+    level = levels[0] if levels else None
+    if kind is None:
+        if not course_value:
+            kind = "Snow Skiing"
+        elif text_priority and level is not None and norm(course_value) == norm(level_value):
+            kind = "Snow Skiing"
+        else:
+            raise ConfigError(f"coursePriorities[{index}].course {course_value!r} is not a recognized course kind")
+    if level_value and level is None and not (text_priority and norm(course_value) == norm(level_value)):
+        raise ConfigError(f"coursePriorities[{index}].level {level_value!r} is not Basic, Intermediate or Advance")
+    if kind != "Snow Skiing" and level is not None:
+        raise ConfigError(f"coursePriorities[{index}] combines {kind} with skiing level {level}")
     if kind == "Snow Skiing" and level is None:
-        level = "Basic"
+        hinted_levels = configured_levels(spec.get("levelText") or "")
+        level = hinted_levels[0] if len(hinted_levels) == 1 else "Basic"
     name = bid or start.strftime("%d%b")
     label = spec.get("label") or f"{name} {level if kind == 'Snow Skiing' else kind}"
     end = configured_day(spec.get("to"), f"coursePriorities[{index}].to") or batch.get("to")
@@ -1838,7 +1875,7 @@ class Session:
             resp = self.postback(page, event, values, files=files, timeout=bot.opt["submitTimeoutSec"])
             saved = bot.save_page(self.who, f"submit-{target.label}", resp)
             result = self.judge_submit(resp, target, sel, saved)
-        except (RateLimited, Resend, Rejected, TargetFull, NotOpen, PhoneUsed, SessionLost):
+        except (RateLimited, Resend, Rejected, TargetFull, NotOpen, PhoneUsed):
             bot.clear_submitting(self.phone)
             raise
         except RedirectBlocked as exc:
@@ -1934,6 +1971,49 @@ class Session:
 # Coordinating numbers and choices
 # ---------------------------------------------------------------------------
 
+STATE_VERSION = 2
+TARGET_KEY_VERSION = 1
+TARGET_IDENTITY_FIELDS = {"location", "from", "to", "kind", "level"}
+STATE_FIELDS = {"version", "targetKeyVersion", "identity", "bookings", "phones", "assignments"}
+
+
+def target_identity(target):
+    return {"location": norm(target.location), "from": target.start.isoformat(),
+            "to": target.end.isoformat() if target.end else "", "kind": target.kind,
+            "level": target.level or ""}
+
+
+def target_key_from_identity(identity):
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def target_key(target):
+    return target_key_from_identity(target_identity(target))
+
+
+def valid_target_key(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def valid_target_identity(identity):
+    if not isinstance(identity, dict) or set(identity) != TARGET_IDENTITY_FIELDS:
+        return False
+    if any(not isinstance(value, str) for value in identity.values()):
+        return False
+    if identity["location"] != norm(identity["location"]):
+        return False
+    try:
+        date.fromisoformat(identity["from"])
+        if identity["to"]:
+            date.fromisoformat(identity["to"])
+    except ValueError:
+        return False
+    if identity["kind"] == "Snow Skiing":
+        return identity["level"] in ("Basic", "Intermediate", "Advance")
+    return identity["kind"] in ("Snow Boarding", "MOI") and identity["level"] == ""
+
+
 class State:
     """Versioned progress, locked for a run and atomically made durable before submit."""
 
@@ -1941,7 +2021,8 @@ class State:
         self.path, self.enabled = Path(path), enabled
         self.lease = None
         self.identity = None
-        self.data = {"version": 1, "identity": None, "bookings": [], "phones": {}, "assignments": {}}
+        self.data = {"version": STATE_VERSION, "targetKeyVersion": TARGET_KEY_VERSION,
+                     "identity": None, "bookings": [], "phones": {}, "assignments": {}}
         self.reload()
 
     def reload(self):
@@ -1949,8 +2030,15 @@ class State:
             return
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
-            if (not isinstance(value, dict) or value.get("version") != 1
-                    or not isinstance(value.get("identity"), str)
+            if not isinstance(value, dict):
+                raise ValueError("invalid progress root")
+            if (type(value.get("version")) is not int or value["version"] != STATE_VERSION
+                    or type(value.get("targetKeyVersion")) is not int
+                    or value["targetKeyVersion"] != TARGET_KEY_VERSION):
+                raise ValueError("unsupported progress schema or target-key version")
+            if set(value) != STATE_FIELDS:
+                raise ValueError("invalid progress root")
+            if (not isinstance(value.get("identity"), str)
                     or not isinstance(value.get("bookings"), list)
                     or not isinstance(value.get("phones"), dict)
                     or not isinstance(value.get("assignments"), dict)):
@@ -1958,7 +2046,9 @@ class State:
             booked_phones, booked_targets = set(), set()
             for item in value["bookings"]:
                 if (not isinstance(item, dict) or item.get("status") not in ("confirmed", "user-confirmed")
-                        or not isinstance(item.get("targetKey"), str) or not parse_phone(item.get("phone"))):
+                        or not valid_target_key(item.get("targetKey")) or not parse_phone(item.get("phone"))
+                        or not valid_target_identity(item.get("targetIdentity"))
+                        or target_key_from_identity(item["targetIdentity"]) != item["targetKey"]):
                     raise ValueError("invalid booking record")
                 if item["phone"] in booked_phones or item["targetKey"] in booked_targets:
                     raise ValueError("duplicate booking records")
@@ -1971,11 +2061,11 @@ class State:
                 if (not parse_phone(phone) or not isinstance(item, dict)
                         or item.get("status") not in ("used", "submitting", "booked")):
                     raise ValueError("invalid phone record")
-                if item["status"] == "submitting" and not isinstance(item.get("targetKey"), str):
+                if item["status"] == "submitting" and not valid_target_key(item.get("targetKey")):
                     raise ValueError("invalid pending submission")
                 if item["status"] == "booked" and phone not in booked_phones:
                     raise ValueError("booked phone has no booking record")
-            if any(not isinstance(k, str) or not parse_phone(v) for k, v in value["assignments"].items()):
+            if any(not valid_target_key(k) or not parse_phone(v) for k, v in value["assignments"].items()):
                 raise ValueError("invalid phone assignments")
             assigned_phones = list(value["assignments"].values())
             if len(assigned_phones) != len(set(assigned_phones)):
@@ -2062,12 +2152,6 @@ class State:
                 temporary.unlink(missing_ok=True)
 
 
-def target_key(target):
-    value = [norm(target.location).title(), target.start.isoformat(), target.end.isoformat() if target.end else "",
-             target.kind, norm(target.level).title()]
-    return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).hexdigest()
-
-
 class Bot:
     """One persistent worker per preference; primary numbers and a shared reserve pool."""
 
@@ -2104,18 +2188,11 @@ class Bot:
         self.phone_state = {phone: "free" for phone in self.phones}
         self.owners = {}
         lookup = {target_key(t): t for t in self.targets}
-        unmatched = []
         for booking in self.state.data["bookings"]:
             self.bookings.append(booking)
             target = lookup.get(booking["targetKey"])
             if target is not None:
                 self.booked[target.index] = booking
-            else:
-                unmatched.append(booking)
-        for booking in unmatched:
-            if any(norm(booking.get("batch", "")) == norm(target.when()) for target in self.targets):
-                raise ConfigError("An accepted application matches a current schedule but uses an incompatible "
-                                  "saved identity. Keep the progress file and reconcile it before booking.")
         for phone, item in self.state.data["phones"].items():
             if phone in self.phone_state:
                 self.phone_state[phone] = item["status"]
@@ -2345,7 +2422,8 @@ class Bot:
                 return
             status = "dry-run" if info.get("dryRun") else (
                 "user-confirmed" if info.get("userConfirmed") else "confirmed")
-            booking = {"target": target.label, "targetKey": key, "batch": target.when(), "phone": phone,
+            booking = {"target": target.label, "targetKey": key, "targetIdentity": target_identity(target),
+                       "batch": target.when(), "phone": phone,
                        "status": status, "at": now_ist().isoformat(timespec="seconds")}
             booking.update({k: v for k, v in info.items() if k not in ("dryRun", "userConfirmed")})
             if not self.dry_run:

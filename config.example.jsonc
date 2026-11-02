@@ -39,7 +39,8 @@
   // Your choices, best first. Each one is "<batch> <level or course>".
   //   Gulmarg: G1 20 Dec-02 Jan, G2 03-16 Jan, G3 17-30 Jan, G4 31 Jan-13 Feb,
   //            G5 14-27 Feb, G6 28 Feb-13 Mar          Kargil: K1 08-21 Feb, K2 22 Feb-07 Mar
-  //   Levels: Basic, Intermediate, Advance.  Other courses: "G4 Snowboarding", "G5 MOI".
+  //   Snow Skiing levels: Basic, Intermediate, Advance. Do not add a skiing level to
+  //   other courses; use "G4 Snowboarding" or "G5 MOI" directly.
   // Every preference stays active independently, including missing/full slots.
   // Intermediate/Advance are not supported yet and produce a warning.
   "coursePriorities": ["G2 Basic", "G3 Basic", "G6 Basic"],

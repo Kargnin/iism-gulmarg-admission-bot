@@ -120,7 +120,7 @@ class Resilience(unittest.TestCase):
         first.state.acquire()
         try:
             first._restore()
-            first.state.data["assignments"]["removed-target"] = PHONES[2]
+            first.state.data["assignments"]["f" * 64] = PHONES[2]
             first.state.save()
         finally:
             first.state.release()
@@ -140,8 +140,10 @@ class Resilience(unittest.TestCase):
 
     def test_duplicate_assignment_owners_and_reordered_pending_state_fail_closed(self):
         duplicate = self.root / "duplicate-state.json"
-        duplicate.write_text(json.dumps({"version": 1, "identity": "test", "bookings": [], "phones": {},
-                                         "assignments": {"first": PHONES[0], "second": PHONES[0]}}))
+        duplicate.write_text(json.dumps({"version": bot.STATE_VERSION,
+                                         "targetKeyVersion": bot.TARGET_KEY_VERSION,
+                                         "identity": "test", "bookings": [], "phones": {},
+                                         "assignments": {"a" * 64: PHONES[0], "b" * 64: PHONES[0]}}))
         with self.assertRaisesRegex(bot.ConfigError, "assigned to multiple"):
             bot.State(duplicate, True)
 
