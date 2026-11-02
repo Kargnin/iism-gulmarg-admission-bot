@@ -1,8 +1,11 @@
 """Failure and boundary tests through runtime interfaces and real local HTTP."""
+import contextlib
+import io
 import json
 import hashlib
 import os
 import signal
+import shutil
 import ssl
 import subprocess
 import sys
@@ -875,6 +878,68 @@ class Resilience(unittest.TestCase):
         self.assertIn(reason, log)
         self.assertIn("NEEDS YOUR ATTENTION", log)
 
+    def test_exhausted_discovery_initial_form_returns_controlled_cli_failure(self):
+        class Unavailable(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Unavailable)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        cfg = make_config(self.root, PHONES[:1], ["G2 Basic"],
+                          bot={"retryDelaySec": 0.001, "maxRetryDelaySec": 0.002})
+        config_path = self.root / f"discover-{os.urandom(4).hex()}.jsonc"
+        config_path.write_text(json.dumps(cfg))
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                result = bot.main(["--config", str(config_path), "--discover",
+                                   "--base-url", f"http://127.0.0.1:{server.server_port}"])
+            self.assertNotEqual(result, 0)
+            self.assertIn("HTTP 503", output.getvalue())
+            self.assertIn("preserving --config, --base-url and --phone", output.getvalue())
+        finally:
+            for artifact in (Path(bot.__file__).parent / "runs").glob(config_path.stem + "-*"):
+                shutil.rmtree(artifact)
+
+    def test_exhausted_discovery_course_and_target_stages_return_controlled_failures(self):
+        for stage in ("course", "target"):
+            with self.subTest(stage=stage):
+                class UnavailableStage(mock_site.Handler):
+                    def post_form(self, session, query, values, files):
+                        if values.get("__EVENTTARGET") == "ddlCourse":
+                            self.site.course_posts += 1
+                            if stage == "course" or self.site.course_posts > len(self.site.courses):
+                                return self.send(503, mock_site.IIS_503)
+                        return super().post_form(session, query, values, files)
+
+                site, url = self.local_site(UnavailableStage)
+                site.course_posts = 0
+                cfg = make_config(self.root, PHONES[:1], ["G2 Basic"],
+                                  bot={"retryDelaySec": 0.001, "maxRetryDelaySec": 0.002})
+                settings = bot.parse_settings(cfg, None)[0]
+                out = self.root / f"discover-{stage}"
+                log = bot.Log(echo=False)
+                log.open(out / "bot.log")
+                instance = bot.Bot(settings, out, base_url=url, dry_run=True, log=log)
+                try:
+                    result = bot.run_discover(instance, PHONES[0])
+                finally:
+                    log.file.close()
+                emitted = (out / "bot.log").read_text()
+                self.assertNotEqual(result, 0)
+                self.assertIn("HTTP 503", emitted)
+                self.assertIn("preserving --config, --base-url and --phone", emitted)
+                self.assertEqual(site.applications, [])
+                self.assertGreaterEqual(site.course_posts, 15)
+
     def test_foreign_form_destination_is_blocked_before_sending(self):
         instance = offline_bot()
         session = bot.Session(instance, PHONES[0], "")
@@ -1136,6 +1201,9 @@ class Resilience(unittest.TestCase):
             "Application submitted successfully provided payment completes",
             "Application submitted successfully unless verification fails",
             'The page may say "Application submitted successfully" after approval',
+            "Application submitted successfully?",
+            "Application submitted successfully; only if payment completes",
+            "Application submitted successfully; provided that payment completes",
         )
         for message in messages:
             with self.subTest(message=message):

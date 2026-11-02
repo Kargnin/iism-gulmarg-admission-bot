@@ -221,8 +221,8 @@ AFFIRMATIVE_OUTCOME_PATTERNS = (
     r"successfully\s+registered|saved\s+successfully|successfully\s+saved)",
 )
 AFFIRMATIVE_RECEIPT_SUFFIX = (
-    r"(?:,\s*payment\s+(?:details|link)\s+(?:has|have)\s+been\s+sent"
-    r"(?:\s+(?:to|on)\s+(?:your\s+)?(?:registered\s+)?(?:email|email\s+id))?)?"
+    r"(?:(?:,\s*|\.\s+)payment\s+(?:details|link)\s+(?:has|have)\s+been\s+sent"
+    r"(?:\s+(?:to|on)\s+(?:your\s+)?(?:registered\s+)?(?:email|email\s+id))?)?\.?"
 )
 AGE_PHRASES = ["age allow", "not eligible", "age should", "age must", "age limit", "invalid date"]
 
@@ -1855,30 +1855,42 @@ def normalize_outcome_text(text):
     return " ".join(normalized.split())
 
 
-def outcome_clauses(text):
-    return re.split(r"(?:[.!?;]+|\s+\|\s+|\r?\n+)", normalize_outcome_text(text))
+def outcome_envelopes(text):
+    return re.split(r"\s+\|\s+", normalize_outcome_text(text))
 
 
 def outcome_negative(text):
-    for clause in outcome_clauses(text):
-        if has_any(clause, OUTCOME_NEGATIVE_PHRASES):
+    for envelope in outcome_envelopes(text):
+        if has_any(envelope, OUTCOME_NEGATIVE_PHRASES):
             return True
         if re.search(r"\b(?:no|not|never|nothing|none|neither|cannot)\b[^.!?;|]*"
-                     r"\b(?:submit|accept|register|save|receiv|confirm|verif)\w*\b", clause):
+                     r"\b(?:submit|accept|register|save|receiv|confirm|verif)\w*\b", envelope):
             return True
     return False
 
 
 def affirmative_success(text):
-    clauses = outcome_clauses(text)
-    for clause in clauses:
-        if outcome_negative(clause):
+    envelopes = outcome_envelopes(text)
+    for envelope in envelopes:
+        if outcome_negative(envelope):
             continue
         for pattern in AFFIRMATIVE_OUTCOME_PATTERNS:
-            match = re.fullmatch(rf"(?:{pattern}){AFFIRMATIVE_RECEIPT_SUFFIX}", clause.strip())
+            match = re.fullmatch(rf"(?:{pattern}){AFFIRMATIVE_RECEIPT_SUFFIX}", envelope.strip())
             if match is not None:
                 return match.group(0)
     return None
+
+
+def affirmative_evidence(text):
+    for envelope in outcome_envelopes(text):
+        for pattern in AFFIRMATIVE_OUTCOME_PATTERNS:
+            for match in re.finditer(rf"(?<!\w)(?:{pattern})(?!\w)", envelope):
+                prefix = envelope[:match.start()]
+                if (outcome_negative(prefix)
+                        or re.search(r"\b(?:no|not|never|nothing|none|neither|cannot)\b", prefix)):
+                    continue
+                return True
+    return False
 
 
 class Http:
@@ -2443,14 +2455,17 @@ class Session:
                                 if affirmative_success(message.lower())), None)
         page_success = affirmative_success(text) if actual_page == "admissionformsuccess.aspx" else None
         explicit_success = bool(message_success or page_success)
+        positive_evidence = (any(affirmative_evidence(message) for message in msgs)
+                             or (actual_page == "admissionformsuccess.aspx" and affirmative_evidence(text)))
         phone_used = has_any(said, PHONE_USED_PHRASES)
         full = has_any(said, FULL_PHRASES)
         closed = has_any(said, CLOSED_PHRASES)
         failed_validators = failed_validator_messages(resp.body) if resp.name == FORM_PAGE else []
-        success_evidence = explicit_success or payment_receipt
-        if success_evidence and (negative or phone_used or full or closed or failed_validators or resp.status == 429):
+        confirmed_evidence = explicit_success or payment_receipt
+        if (positive_evidence or payment_receipt) and (
+                negative or phone_used or full or closed or failed_validators or resp.status == 429):
             raise Uncertain("the final response contains conflicting success and rejection evidence")
-        if 200 <= resp.status < 300 and success_evidence:
+        if 200 <= resp.status < 300 and confirmed_evidence:
             message = next((m for m in msgs if affirmative_success(m.lower())), "") or query.get("resp", "")
             if not message:
                 hit = page_success
@@ -3356,7 +3371,7 @@ def with_retries(bot, action, tries=15):
             bot.sleep(bot.backoff(n))
 
 
-def run_discover(bot, phone):
+def _run_discover(bot, phone):
     """Walk the live form with one number and show what the site offers. Never submits."""
     log = bot.log
     session = Session(bot, phone, f"[discover {mask(phone)}] ")
@@ -3399,6 +3414,15 @@ def run_discover(bot, phone):
             return 1
     log.info("Nothing was submitted.")
     return 0
+
+
+def run_discover(bot, phone):
+    try:
+        return _run_discover(bot, phone)
+    except Transient as exc:
+        bot.log.error(f"Discovery stopped after fresh-session retries: {exc}")
+        bot.log.error("Rerun the same --discover invocation, preserving --config, --base-url and --phone.")
+        return 1
 
 
 def find_config(arg):
