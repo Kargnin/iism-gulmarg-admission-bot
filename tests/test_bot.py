@@ -547,9 +547,11 @@ class ConfigurationAndDocuments(unittest.TestCase):
 
             page = bot.Page("https://example.test/admission_form.aspx", 200,
                             '<form action="admission_form.aspx" enctype="multipart/form-data">'
+                            f'<input name="txtMobileNo" value="{PHONES[0]}" />'
                             '<input type="file" name="FupPhototOfApplicant" /></form>')
             session = object.__new__(bot.Session)
             session.http = mock.Mock()
+            session.phone = PHONES[0]
             session.postback(page, "", {}, files={"FupPhototOfApplicant": first_prepared})
             multipart_body = session.http.send.call_args.args[2]
             self.assertIn(first.read_bytes(), multipart_body)

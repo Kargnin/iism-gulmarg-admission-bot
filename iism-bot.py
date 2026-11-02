@@ -47,6 +47,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -380,9 +381,13 @@ def mask(phone):
     return ".." + phone[-4:]
 
 
-def to_int(value):
-    m = re.search(r"\d+", str(value or "").replace(",", ""))
-    return int(m.group()) if m else None
+def parse_server_number(value, allow_decimal=False):
+    text = str(value or "").strip()
+    fraction = r"(?:\.\d+)?" if allow_decimal else ""
+    if re.fullmatch(rf"(?:\d+|\d{{1,3}}(?:,\d{{3}})+){fraction}", text) is None:
+        return None
+    normalized = text.replace(",", "")
+    return Decimal(normalized) if allow_decimal else int(normalized)
 
 
 def now_ist():
@@ -1883,13 +1888,14 @@ def affirmative_success(text):
 
 def affirmative_evidence(text):
     for envelope in outcome_envelopes(text):
-        for pattern in AFFIRMATIVE_OUTCOME_PATTERNS:
-            for match in re.finditer(rf"(?<!\w)(?:{pattern})(?!\w)", envelope):
-                prefix = envelope[:match.start()]
-                if (outcome_negative(prefix)
-                        or re.search(r"\b(?:no|not|never|nothing|none|neither|cannot)\b", prefix)):
-                    continue
-                return True
+        for candidate in re.split(r"[.!?;]+", envelope):
+            for pattern in AFFIRMATIVE_OUTCOME_PATTERNS:
+                for match in re.finditer(rf"(?<!\w)(?:{pattern})(?!\w)", candidate):
+                    prefix = candidate[:match.start()]
+                    if (outcome_negative(prefix)
+                            or re.search(r"\b(?:no|not|never|nothing|none|neither|cannot)\b", prefix)):
+                        continue
+                    return True
     return False
 
 
@@ -2085,6 +2091,9 @@ class Session:
 
     def postback(self, page, event, values, files=None, timeout=None, on_start=None):
         self.http.check_destination(page.post_url)
+        source_page = urllib.parse.urlparse(page.url).path.rsplit("/", 1)[-1].lower()
+        if (page.name == FORM_PAGE or source_page == FORM_PAGE) and page.value("txtMobileNo") != self.phone:
+            raise SessionLost("the admission form no longer echoes the assigned mobile number")
         data = dict(page.fields())
         data.update({"__EVENTTARGET": event, "__EVENTARGUMENT": ""})
         data.update(values)
@@ -2166,7 +2175,6 @@ class Session:
     def select(self, page, event, values, classify_full=False):
         """Postback after changing a dropdown/date; returns the refreshed form page."""
         values = dict(values)
-        values.setdefault("txtMobileNo", self.phone)
         nxt = self.checked(self.postback(page, event, values))
         if nxt.name != FORM_PAGE:
             if nxt.name in (INSTRUCTIONS_PAGE, CRITERIA_PAGE):
@@ -2235,8 +2243,14 @@ class Session:
                         if level:
                             values["ddlCourseLevel"] = level[0]
                         candidate_page, full = self.select(page, "ddlScheduleCourse", values, classify_full=True)
-                        seats = to_int(candidate_page.value("txtAvailableSeat"))
-                        if full or seats == 0:
+                        if full:
+                            excluded_batches.add(batch_key)
+                            restart = True
+                            break
+                        seats = parse_server_number(candidate_page.value("txtAvailableSeat"))
+                        if seats is None:
+                            raise Transient("the selected schedule reported an invalid seat count")
+                        if seats == 0:
                             excluded_batches.add(batch_key)
                             restart = True
                             break
@@ -2287,6 +2301,8 @@ class Session:
             raise Rejected(f"the site classifies the applicant as age {sel.server_age} for {target.label}; "
                            "documents.parentSignature must contain the real guardian signature")
         self.http.check_destination(page.post_url)
+        if page.value("txtMobileNo") != self.phone:
+            raise SessionLost("the latest form no longer echoes the assigned mobile number")
         required_paths = set(REQUIRED_FIELDS)
         required_text = {field for field, section, key in TEXT_FIELDS if (section, key) in required_paths}
         required_controls = required_text | {
@@ -2351,15 +2367,18 @@ class Session:
         echoed_dob = page.value("txtDateOfBirth")
         if parse_day(echoed_dob) != bot.s.dob:
             raise Transient("the latest form no longer echoes the configured date of birth")
-        seats = to_int(page.value("txtAvailableSeat"))
+        seats = parse_server_number(page.value("txtAvailableSeat"))
         if seats is None:
-            raise Transient("the latest form does not report available seats")
+            raise Transient("the latest form does not report a valid seat count")
         if seats <= 0:
             raise TargetFull("0 seats left on the latest form")
-        current_fee, selected_fee = to_int(page.value("txtCourseFee")), to_int(sel.fee)
-        if not current_fee:
+        current_fee = parse_server_number(page.value("txtCourseFee"), allow_decimal=True)
+        selected_fee = parse_server_number(sel.fee, allow_decimal=True)
+        if current_fee is None or current_fee <= 0:
             raise Transient("the latest form does not report a valid course fee")
-        if selected_fee is not None and current_fee != selected_fee:
+        if selected_fee is None or selected_fee <= 0:
+            raise Transient("the selected form did not report a valid course fee")
+        if current_fee != selected_fee:
             raise Transient("the latest form reports a different course fee")
         values = {}
         for field, section, key in TEXT_FIELDS:
@@ -2373,7 +2392,7 @@ class Session:
                     bot.note(self.who, f"{target.label}: configured optional {section}.{key} control is unavailable; "
                              "omitting that value", warning=True)
         values.update({"ddlCourse": sel.course[0], "ddlScheduleCourse": sel.batch[0],
-                       "ddlState": sel.state[0], "txtMobileNo": self.phone, "chkIAgree": "on"})
+                       "ddlState": sel.state[0], "chkIAgree": "on"})
         values["ddlCourseLevel"] = sel.level[0]
         for field, key, wanted in (("ddlEduationQualification", "applicant.education", bot.s.education),
                                    ("ddlVegetarianOrNon", "applicant.diet", bot.s.diet)):

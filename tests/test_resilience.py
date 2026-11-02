@@ -4,6 +4,7 @@ import io
 import json
 import hashlib
 import os
+import re
 import signal
 import shutil
 import ssl
@@ -688,7 +689,8 @@ class Resilience(unittest.TestCase):
             phone = owner.assign_phone(owner.targets[0])
             request_page = bot.Page(
                 url + "/admission_form.aspx", 200,
-                '<form action="/admission_form.aspx"><input name="__VIEWSTATE" value="a"></form>')
+                '<form action="/admission_form.aspx"><input name="__VIEWSTATE" value="a">'
+                f'<input name="txtMobileNo" value="{phone}"></form>')
             selection = type("PreparedSelection", (), {"page": request_page})()
             final_session = bot.Session(owner, phone, "")
             with self.assertRaises(bot.Uncertain):
@@ -1214,6 +1216,181 @@ class Resilience(unittest.TestCase):
                     f'<span id="lblMsg">{message}</span></form>')
                 with self.assertRaises(bot.Uncertain):
                     session.judge_submit(page, instance.targets[0], None, None, set())
+
+    def test_negative_before_completed_success_remains_conflicting(self):
+        instance = offline_bot()
+        session = bot.Session(instance, PHONES[0], "")
+        cases = (
+            (429, "Application was rejected. Application submitted successfully."),
+            (500, "Application contains invalid data. Application submitted successfully."),
+            (429, "An error occurred. Application submitted successfully."),
+            (200, "This Mobile No. is already registered. Application submitted successfully."),
+            (200, "Seat not available. Application submitted successfully."),
+            (200, "Registration is closed. Application submitted successfully."),
+        )
+        for status, message in cases:
+            with self.subTest(status=status, message=message):
+                session.static = {}
+                page = bot.Page(
+                    "http://127.0.0.1:9/admission_form.aspx", status,
+                    '<form action="admission_form.aspx"><input name="__VIEWSTATE" value="a">'
+                    f'<span id="lblMsg">{message}</span></form>')
+                with self.assertRaises(bot.Uncertain):
+                    session.judge_submit(page, instance.targets[0], None, None, set())
+
+    def test_negative_before_success_after_commit_requires_feedback_without_reserve(self):
+        site, url = self.local_site()
+        site.success_receipt = (
+            429,
+            '<form action="AdmissionFormSuccess.aspx"><input name="__VIEWSTATE" value="a">'
+            '<span id="lblMsg">Application was rejected. Application submitted successfully.</span></form>',
+            {},
+        )
+        answers = []
+        instance = run_bot(make_config(self.root, PHONES[:2], ["G2 Basic"]), url,
+                           self.root / "negative-before-success", timeout=4,
+                           confirmation_handler=lambda *args: answers.append("booked") or "booked")
+        self.assertTrue(instance.finished())
+        self.assertEqual(answers, ["booked"])
+        self.assertEqual(instance.bookings[0]["status"], "user-confirmed")
+        self.assertEqual(len(site.applications), 1)
+        self.assertEqual(site.applications[0]["mobile"], PHONES[0])
+        self.assertNotIn(PHONES[1], site.used)
+
+    def test_invalid_complete_numeric_fields_block_real_and_dry_final_requests(self):
+        site, url = self.local_site()
+        original = mock_site.Handler.form
+        cases = (
+            ("seat-negative", "txtAvailableSeat", "-1"),
+            ("seat-description", "txtAvailableSeat", "1 seat"),
+            ("seat-fraction", "txtAvailableSeat", "1.5"),
+            ("seat-grouping", "txtAvailableSeat", "1,00"),
+            ("fee-description", "txtCourseFee", "unavailable 500"),
+            ("fee-negative", "txtCourseFee", "-500"),
+            ("fee-grouping", "txtCourseFee", "20,00"),
+            ("fee-fraction", "txtCourseFee", "500."),
+        )
+        for dry_run in (False, True):
+            for label, field, replacement in cases:
+                with self.subTest(dry_run=dry_run, value=label):
+                    def malformed_number(handler, mobile, values, listed, invalid=(), alert=None):
+                        body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
+                        if values.get("__EVENTTARGET") != "txtDateOfBirth":
+                            return body
+                        pattern = rf'(<input\b[^>]*\bname="{field}"[^>]*\bvalue=")[^"]*(")'
+                        return re.sub(pattern, rf'\g<1>{replacement}\2', body, count=1, flags=re.I)
+
+                    start = len(site.request_log)
+                    out = self.root / f"numeric-{dry_run}-{label}"
+                    with mock.patch.object(mock_site.Handler, "form", malformed_number):
+                        instance = run_bot(make_config(self.root, PHONES[:1], ["G2 Basic"]), url, out,
+                                           dry_run=dry_run, timeout=0.3)
+                    requests = site.request_log[start:]
+                    self.assertFalse(any(item["submit"] for item in requests))
+                    self.assertEqual(instance.pending, {})
+                    self.assertEqual(instance.bookings, [])
+                    self.assertEqual(instance.failures, [])
+                    self.assertEqual(site.applications, [])
+
+    def test_grouped_and_decimal_fee_formats_remain_valid(self):
+        site, url = self.local_site()
+        original = mock_site.Handler.form
+        cases = (("grouped", "20,000.00", "1,000"), ("decimal", "20000.00", "3"))
+        for label, fee, seats in cases:
+            with self.subTest(label=label):
+                def formatted_numbers(handler, mobile, values, listed, invalid=(), alert=None):
+                    body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
+                    if values.get("__EVENTTARGET") != "txtDateOfBirth":
+                        return body
+                    for field, replacement in (("txtCourseFee", fee), ("txtAvailableSeat", seats)):
+                        pattern = rf'(<input\b[^>]*\bname="{field}"[^>]*\bvalue=")[^"]*(")'
+                        body = re.sub(pattern, rf'\g<1>{replacement}\2', body, count=1, flags=re.I)
+                    return body
+
+                site.used.clear()
+                site.applications.clear()
+                site.sessions.clear()
+                site.viewstates.clear()
+                out = self.root / f"valid-numeric-{label}"
+                with mock.patch.object(mock_site.Handler, "form", formatted_numbers):
+                    instance = run_bot(make_config(self.root, PHONES[:1], ["G2 Basic"]), url, out, timeout=4)
+                self.assertTrue(instance.finished())
+                self.assertEqual(site.applications[0]["fee"], fee)
+
+    def test_invalid_schedule_seat_restarts_before_state_or_dob(self):
+        site, url = self.local_site()
+        original = mock_site.Handler.form
+
+        def invalid_schedule_seat(handler, mobile, values, listed, invalid=(), alert=None):
+            body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
+            if values.get("__EVENTTARGET") != "ddlScheduleCourse":
+                return body
+            return re.sub(
+                r'(<input\b[^>]*\bname="txtAvailableSeat"[^>]*\bvalue=")[^"]*(")',
+                r'\g<1>-1\2', body, count=1, flags=re.I)
+
+        with mock.patch.object(mock_site.Handler, "form", invalid_schedule_seat):
+            instance = run_bot(make_config(self.root, PHONES[:1], ["G2 Basic"]), url,
+                               self.root / "invalid-schedule-seat", timeout=0.4)
+        form_posts = [item for item in site.request_log
+                      if item["page"] == "admission_form.aspx" and item["method"] == "POST"]
+        self.assertTrue(any(item["event"] == "ddlScheduleCourse" for item in form_posts))
+        self.assertFalse(any(item["event"] in ("ddlState", "txtDateOfBirth") or item["submit"]
+                             for item in form_posts))
+        self.assertEqual(instance.pending, {})
+        self.assertEqual(site.applications, [])
+
+    def test_blank_missing_or_other_mobile_echo_blocks_real_and_dry_final_requests(self):
+        site, url = self.local_site()
+        original = mock_site.Handler.form
+        cases = (("blank", ""), ("other", PHONES[1]), ("missing", None))
+        for dry_run in (False, True):
+            for label, replacement in cases:
+                with self.subTest(dry_run=dry_run, echo=label):
+                    def unbound_form(handler, mobile, values, listed, invalid=(), alert=None):
+                        body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
+                        if values.get("__EVENTTARGET") != "txtDateOfBirth":
+                            return body
+                        pattern = r'<input\b[^>]*\bname="txtMobileNo"[^>]*>\s*'
+                        if replacement is None:
+                            return re.sub(pattern, "", body, count=1, flags=re.I)
+                        return re.sub(
+                            r'(<input\b[^>]*\bname="txtMobileNo"[^>]*\bvalue=")[^"]*(")',
+                            rf'\g<1>{replacement}\2', body, count=1, flags=re.I)
+
+                    start = len(site.request_log)
+                    out = self.root / f"mobile-{dry_run}-{label}"
+                    with mock.patch.object(mock_site.Handler, "form", unbound_form):
+                        instance = run_bot(make_config(self.root, PHONES[:1], ["G2 Basic"]), url, out,
+                                           dry_run=dry_run, timeout=0.3)
+                    requests = site.request_log[start:]
+                    self.assertFalse(any(item["submit"] for item in requests))
+                    self.assertEqual(instance.pending, {})
+                    self.assertEqual(instance.bookings, [])
+                    self.assertEqual(instance.failures, [])
+                    self.assertEqual(site.applications, [])
+
+    def test_unbound_admission_form_stops_before_further_postbacks(self):
+        site, url = self.local_site()
+        original = mock_site.Handler.form
+
+        def unbind_after_course(handler, mobile, values, listed, invalid=(), alert=None):
+            body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
+            if values.get("__EVENTTARGET") != "ddlCourse":
+                return body
+            return re.sub(
+                r'(<input\b[^>]*\bname="txtMobileNo"[^>]*\bvalue=")[^"]*(")',
+                r'\g<1>\2', body, count=1, flags=re.I)
+
+        with mock.patch.object(mock_site.Handler, "form", unbind_after_course):
+            instance = run_bot(make_config(self.root, PHONES[:1], ["G2 Basic"]), url,
+                               self.root / "mobile-postback", timeout=0.4)
+        form_events = [item["event"] for item in site.request_log
+                       if item["page"] == "admission_form.aspx" and item["method"] == "POST"]
+        self.assertTrue(form_events)
+        self.assertEqual(set(form_events), {"ddlCourse"})
+        self.assertEqual(instance.pending, {})
+        self.assertEqual(site.applications, [])
 
     def test_future_submission_prose_requires_feedback_before_persisting_completion(self):
         site, url = self.local_site()
