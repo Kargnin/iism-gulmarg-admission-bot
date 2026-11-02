@@ -1288,6 +1288,85 @@ class Resilience(unittest.TestCase):
         self.assertEqual(site.applications[0]["mobile"], PHONES[0])
         self.assertNotIn(PHONES[1], site.used)
 
+    def test_unstructured_form_route_bodies_use_visible_final_evidence(self):
+        instance = offline_bot()
+        session = bot.Session(instance, PHONES[0], "")
+        for body in (
+                "Application submitted successfully",
+                "<html><body>Application was rejected. It was submitted successfully.</body></html>"):
+            with self.subTest(body=body):
+                page = bot.Page("http://127.0.0.1:9/admission_form.aspx", 429, body)
+                with self.assertRaises(bot.Uncertain):
+                    session.judge_submit(page, instance.targets[0], None, None, set())
+
+        negative = bot.Page(
+            "http://127.0.0.1:9/admission_form.aspx", 429,
+            "Application was not submitted successfully because the request was rate limited")
+        with self.assertRaises(bot.RateLimited):
+            session.judge_submit(negative, instance.targets[0], None, None, set())
+
+        static_form = bot.Page(
+            "http://127.0.0.1:9/admission_form.aspx", 429,
+            '<form action="admission_form.aspx"><input name="__VIEWSTATE" value="a">'
+            '<p>Applications are submitted successfully after verification.</p></form>')
+        with self.assertRaises(bot.RateLimited):
+            session.judge_submit(static_form, instance.targets[0], None, None, set())
+
+    def test_unstructured_direct_429_after_commit_requires_feedback_without_reserve(self):
+        original_redirect = mock_site.Handler.redirect
+        cases = (
+            ("plain", "Application submitted successfully", "text/plain; charset=utf-8"),
+            ("html", "<html><body>Application was rejected. It was submitted successfully.</body></html>",
+             "text/html; charset=utf-8"),
+        )
+        for label, body, content_type in cases:
+            with self.subTest(label=label):
+                site, url = self.local_site()
+                answers = []
+
+                def direct_receipt(handler, location, response=body, mime=content_type):
+                    if location.lower().startswith("/admissionformsuccess.aspx"):
+                        return handler.send(429, response, {"Content-Type": mime})
+                    return original_redirect(handler, location)
+
+                with mock.patch.object(mock_site.Handler, "redirect", direct_receipt):
+                    instance = run_bot(
+                        make_config(self.root, PHONES[:2], ["G2 Basic"]), url,
+                        self.root / f"unstructured-{label}", timeout=4,
+                        confirmation_handler=lambda *args: answers.append("booked") or "booked")
+                self.assertTrue(instance.finished())
+                self.assertEqual(answers, ["booked"])
+                self.assertEqual(instance.bookings[0]["status"], "user-confirmed")
+                self.assertEqual(len(site.applications), 1)
+                self.assertEqual(site.applications[0]["mobile"], PHONES[0])
+                self.assertNotIn(PHONES[1], site.used)
+
+    def test_unstructured_negated_429_retries_the_same_primary(self):
+        site, url = self.local_site()
+        original_submit = mock_site.Handler.submit
+        submitted = []
+        answers = []
+
+        def rate_limit_once(handler, mobile, values, files, listed, course, level, batch):
+            submitted.append(mobile)
+            if len(submitted) == 1:
+                return handler.send(
+                    429, "Application was not submitted successfully because the request was rate limited",
+                    {"Content-Type": "text/plain; charset=utf-8"})
+            return original_submit(handler, mobile, values, files, listed, course, level, batch)
+
+        with mock.patch.object(mock_site.Handler, "submit", rate_limit_once):
+            instance = run_bot(
+                make_config(self.root, PHONES[:2], ["G2 Basic"]), url,
+                self.root / "unstructured-negative", timeout=4,
+                confirmation_handler=lambda *args: answers.append("unexpected") or "booked")
+        self.assertTrue(instance.finished())
+        self.assertEqual(answers, [])
+        self.assertEqual(instance.bookings[0]["status"], "confirmed")
+        self.assertEqual(submitted, [PHONES[0], PHONES[0]])
+        self.assertEqual(len(site.applications), 1)
+        self.assertNotIn(PHONES[1], site.used)
+
     def test_invalid_complete_numeric_fields_block_real_and_dry_final_requests(self):
         site, url = self.local_site()
         original = mock_site.Handler.form

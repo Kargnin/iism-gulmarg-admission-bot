@@ -449,6 +449,35 @@ class ConfigurationAndDocuments(unittest.TestCase):
         with self.assertRaises(bot.ConfigError):
             bot.parse_settings([], None)
 
+    def test_batch_codes_are_unique_per_source_but_inline_overrides_the_schedule(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            record = {"from": "2027-01-03", "to": "2027-01-16", "location": "Gulmarg"}
+            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"],
+                              batches={"G2": record, " g2 ": dict(record)})
+            path = tmp / "duplicate-inline.json"
+            path.write_text(json.dumps(cfg))
+            with mock.patch.object(bot, "Http") as http:
+                self.assertEqual(bot.main(["--check", "--config", str(path)]), 2)
+            http.assert_not_called()
+
+            duplicate_schedule = tmp / "duplicate-schedule.json"
+            duplicate_schedule.write_text(json.dumps({"batches": {"G2": record, " g2 ": dict(record)}}))
+            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(duplicate_schedule))
+            with self.assertRaisesRegex(bot.ConfigError, "defines batch G2 more than once"):
+                bot.parse_settings(cfg, None)
+
+            base_schedule = tmp / "base-schedule.json"
+            base_schedule.write_text(json.dumps({"batches": {"G2": record}}))
+            override = {"from": "2028-01-04", "to": "2028-01-17", "location": "Kargil"}
+            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(base_schedule),
+                              batches={" g2 ": override})
+            settings, errors, _ = bot.parse_settings(cfg, None)
+            self.assertEqual(errors, [])
+            self.assertEqual(settings.batches["G2"]["from"], date(2028, 1, 4))
+            self.assertEqual(settings.batches["G2"]["location"], "Kargil")
+            self.assertEqual(settings.targets[0].start, date(2028, 1, 4))
+
     def test_rejects_unreadable_configured_dates_and_missing_schedule(self):
         with tempfile.TemporaryDirectory() as folder:
             tmp = Path(folder)

@@ -27,6 +27,31 @@ Each preference gets the phone number at the same position in `phoneNumbers`. Fo
 
 Basic skiing is the supported path. Intermediate/Advance choices produce a warning; those paths are not fully supported or validated.
 
+### Advanced preference objects
+
+Use an object only when a batch string cannot express the choice, for example when you need explicit date/location evidence or optional website-text hints. Every value is text:
+
+```json
+{
+  "batch": "G2",
+  "course": "Snow Skiing",
+  "level": "Basic",
+  "from": "2027-01-03",
+  "to": "2027-01-16",
+  "location": "Gulmarg",
+  "label": "G2 Basic",
+  "courseText": "Snow Skiing",
+  "levelText": "Basic SSC",
+  "batchText": "03 Jan"
+}
+```
+
+- `batch` names a code from the active schedule. Without one, `from` is required.
+- `course` is `Snow Skiing`, `Snow Boarding`, or `MOI`; `level` is a skiing level such as `Basic` (Intermediate/Advance remain unsupported paths).
+- `from`, optional `to`, and `location` supply or override the schedule evidence used for matching. Dates must be unambiguous and the end cannot precede the start.
+- `label` is the name shown in logs and prompts.
+- `courseText`, `levelText`, and `batchText` are optional live-label hints. They only break ties among semantically compatible choices and cannot override conflicting course, level, date, or location evidence.
+
 The checked-in 2026–27 schedule opens **12 November 2026 at 10:00 IST**:
 
 | Batch | Location | Course dates |

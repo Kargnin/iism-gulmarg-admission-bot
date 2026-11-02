@@ -228,22 +228,6 @@ AFFIRMATIVE_RECEIPT_SUFFIX = (
     r"(?:(?:,\s*|\.\s+)payment\s+(?:details|link)\s+(?:has|have)\s+been\s+sent"
     r"(?:\s+(?:to|on)\s+(?:your\s+)?(?:registered\s+)?(?:email|email\s+id))?)?\.?"
 )
-NEGATED_OUTCOME_SUBJECT = (
-    r"(?:(?:(?:the|your|this)\s+)?(?:admission\s+form|application|form|registration)|it)"
-)
-NEGATED_OUTCOME_MODIFIERS = r"(?:(?:in\s+fact|actually|yet|ever|under\s+any\s+circumstances)\s+)*"
-NEGATIVE_ONLY_OUTCOME_PATTERNS = (
-    rf"(?:{NEGATED_OUTCOME_SUBJECT}\s+)?"
-    rf"(?:(?:has|have|had|is|was|were|will|would|could|should|can|may|might|does|did)\s+)?"
-    rf"(?:not|never)\s+{NEGATED_OUTCOME_MODIFIERS}(?:(?:be|been)\s+)?{COMPLETION_REFERENCE_PATTERN}",
-    rf"{NEGATED_OUTCOME_SUBJECT}\s+(?:cannot|(?:is|was|were)\s+unable\s+to|failed\s+to)\s+"
-    rf"(?:be\s+)?{COMPLETION_REFERENCE_PATTERN}",
-    rf"(?:we|the\s+site|this\s+page)\s+(?:cannot|could\s+not|did\s+not)\s+(?:confirm|verify)\s+"
-    rf"(?:that\s+)?(?:{NEGATED_OUTCOME_SUBJECT}\s+)?(?:(?:has|have|was|is)\s+)?"
-    rf"(?:(?:be|been)\s+)?{COMPLETION_REFERENCE_PATTERN}",
-    r"no\s+(?:(?:the|your|this)\s+)?(?:admission\s+form|application|form|registration)\s+"
-    r"(?:has|have)\s+been\s+(?:submitted|registered|saved)",
-)
 AGE_PHRASES = ["age allow", "not eligible", "age should", "age must", "age limit", "invalid date"]
 
 # Words in the site's (or our own) message -> what in the config to look at. Most specific first.
@@ -1071,9 +1055,13 @@ def parse_phone(raw):
 def validate_batch_records(records, where):
     if not isinstance(records, dict):
         raise ConfigError(f"{where} must be an object")
+    normalized = {}
     for bid, record in records.items():
         if not isinstance(bid, str) or not bid.strip():
             raise ConfigError(f"{where} has an invalid batch code {bid!r}")
+        canonical = bid.strip().upper()
+        if canonical in normalized:
+            raise ConfigError(f"{where} defines batch {canonical} more than once after case/whitespace normalization")
         if not isinstance(record, dict):
             raise ConfigError(f"{where}.{bid} must be an object")
         known = {"from", "to", "location", "offers", "seats"}
@@ -1085,7 +1073,8 @@ def validate_batch_records(records, where):
         offers = record.get("offers", [])
         if not isinstance(offers, list) or any(not isinstance(item, str) for item in offers):
             raise ConfigError(f"{where}.{bid}.offers must be a list of course names")
-    return records
+        normalized[canonical] = record
+    return normalized
 
 
 def validate_config_structure(cfg):
@@ -1152,16 +1141,18 @@ def load_season(cfg, config_dir):
     batches = {}
     scheduled = data["batches"] if "batches" in data else {}
     configured = cfg["batches"] if "batches" in cfg else {}
-    merged = dict(validate_batch_records(scheduled, f"{path}: batches"))
-    merged.update(validate_batch_records(configured, "batches"))
+    scheduled_records = validate_batch_records(scheduled, f"{path}: batches")
+    configured_records = validate_batch_records(configured, "batches")
+    merged = dict(scheduled_records)
+    merged.update(configured_records)
     for bid, b in merged.items():
-        source = "batches" if bid in configured else f"{path}: batches"
+        source = "batches" if bid in configured_records else f"{path}: batches"
         start = configured_day(b.get("from"), f"{source}.{bid}.from", required=True)
         end = configured_day(b.get("to"), f"{source}.{bid}.to")
         require_date_range(start, end, f"{source}.{bid}")
-        batches[bid.upper()] = {"location": b.get("location", ""), "from": start,
-                                "to": end, "offers": b.get("offers") or [],
-                                "seats": b.get("seats", "")}
+        batches[bid] = {"location": b.get("location", ""), "from": start,
+                        "to": end, "offers": b.get("offers") or [],
+                        "seats": b.get("seats", "")}
     opens = cfg.get("bookingOpensAt") or data.get("bookingOpensAt")
     opens_at = None
     if opens:
@@ -1906,22 +1897,32 @@ def affirmative_success(text):
     return None
 
 
-def negative_only_outcome(text):
-    normalized = normalize_outcome_text(text).strip()
-    return any(re.fullmatch(rf"(?:{pattern})\.?", normalized) is not None
-               for pattern in NEGATIVE_ONLY_OUTCOME_PATTERNS)
+def completion_reference_negated(prefix):
+    normalized = normalize_outcome_text(prefix).strip()
+    subject = r"(?:(?:(?:the|your|this)\s+)?(?:admission\s+form|application|form|registration)|it)"
+    patterns = (
+        r"\b(?:not|never)(?:\s+(?:in\s+fact|actually|yet|ever|under\s+any\s+circumstances))*"
+        r"(?:\s+(?:be|been))?$",
+        r"\bcannot(?:\s+be)?$",
+        r"\b(?:unable|failed)\s+to(?:\s+be)?$",
+        r"\bno$",
+        rf"\bno\s+{subject}(?:\s+(?:has|have|is|was))?(?:\s+(?:be|been))?$",
+        rf"\b(?:cannot|could\s+not|did\s+not)\s+(?:confirm|verify)(?:\s+that)?"
+        rf"(?:\s+{subject})?(?:\s+(?:has|have|is|was))?(?:\s+(?:be|been))?$",
+    )
+    return any(re.search(pattern, normalized) is not None for pattern in patterns)
 
 
 def affirmative_evidence(text):
     for envelope in outcome_envelopes(text):
-        if negative_only_outcome(envelope):
-            continue
         for pattern in AFFIRMATIVE_OUTCOME_PATTERNS:
             for match in re.finditer(rf"(?<!\w)(?:{pattern})(?!\w)", envelope):
                 prefix = envelope[:match.start()]
                 local_prefix = re.split(r"[.!?;|]+", prefix)[-1]
                 suffix = envelope[match.end():]
                 if match.group(0).endswith("submitted") and re.match(r"\s+successfully\b", suffix):
+                    continue
+                if completion_reference_negated(prefix):
                     continue
                 if prefix.count('"') % 2:
                     continue
@@ -2502,22 +2503,23 @@ class Session:
         msgs = self.msgs(resp) if resp.is_aspx else server_messages(resp.body)
         said = " | ".join(msgs).lower()
         own_page = resp.name in (INSTRUCTIONS_PAGE, CRITERIA_PAGE, FORM_PAGE)
-        text = "" if own_page else resp.text().lower()
+        text = resp.text().lower() if not own_page or (not resp.is_aspx and not msgs) else ""
+        evidence = " | ".join(item for item in (said, text) if item)
         path = parsed.path.lower()
         actual_page = path.rsplit("/", 1)[-1]
         hidden_id = resp.value("hdfAdmissionFormId") or ""
         payment_receipt = (actual_page == "admission_formpayment.aspx" and query.get("rid")
                            and hidden_id == query["rid"] and hidden_id != "0")
-        negative = outcome_negative(said + " | " + text)
+        negative = outcome_negative(evidence)
         message_success = next((affirmative_success(message.lower()) for message in msgs
                                 if affirmative_success(message.lower())), None)
         page_success = affirmative_success(text) if actual_page == "admissionformsuccess.aspx" else None
         explicit_success = bool(message_success or page_success)
         positive_evidence = (any(affirmative_evidence(message) for message in msgs)
-                             or (actual_page == "admissionformsuccess.aspx" and affirmative_evidence(text)))
-        phone_used = has_any(said, PHONE_USED_PHRASES)
-        full = has_any(said, FULL_PHRASES)
-        closed = has_any(said, CLOSED_PHRASES)
+                             or bool(text and affirmative_evidence(text)))
+        phone_used = has_any(evidence, PHONE_USED_PHRASES)
+        full = has_any(evidence, FULL_PHRASES)
+        closed = has_any(evidence, CLOSED_PHRASES)
         failed_validators = failed_validator_messages(resp.body) if resp.name == FORM_PAGE else []
         confirmed_evidence = explicit_success or payment_receipt
         if (positive_evidence or payment_receipt) and (
