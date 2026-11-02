@@ -935,11 +935,45 @@ class EndToEnd(unittest.TestCase):
 
     def test_survives_crashes_sessions_and_application_restarts(self):
         self.site.chaos, self.site.session_loss, self.site.restarts = 0.35, 0.04, 0.02
-        self.site.slow_seconds = 2.5
-        instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], timeout=90,
-                                 confirmation_handler=self.feedback_from_receipts)
+        self.site.slow_seconds = 0.3
+        original = mock_site.Handler.misbehave
+        injected = []
+
+        def finite_fault_burst(handler):
+            if handler.site.requests > 40:
+                handler.site.chaos = handler.site.session_loss = handler.site.restarts = 0
+            result = original(handler)
+            if result:
+                injected.append(True)
+            return result
+
+        def settled_feedback(phone, target, reason):
+            # A human must establish the outcome, not infer non-acceptance from an
+            # immediate absence while a timed-out server handler is still running.
+            time.sleep(self.site.slow_seconds + 0.1)
+            return self.feedback_from_receipts(phone, target, reason)
+
+        with mock.patch.object(mock_site.Handler, "misbehave", finite_fault_burst):
+            instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], timeout=15,
+                                     bot={"requestTimeoutSec": 0.2, "submitTimeoutSec": 0.2},
+                                     confirmation_handler=settled_feedback)
+        self.assertTrue(injected)
         self.assertTrue(instance.finished())
         self.assertEqual(self.applied(), sorted([self.key("G2"), self.key("G3")]))
+
+    def test_persistent_outage_keeps_retrying_until_stopped(self):
+        def unavailable(handler):
+            handler.send(503, mock_site.IIS_503)
+            return True
+        with mock.patch.object(mock_site.Handler, "misbehave", unavailable):
+            instance = self.run_with(PHONES[:2], ["G2 Basic"], timeout=0.6)
+        self.assertFalse(instance.finished())
+        self.assertTrue(instance.stop.is_set())
+        self.assertGreaterEqual(self.site.requests, 3)
+        self.assertEqual(instance.failures, [])
+        self.assertEqual(instance.pending, {})
+        self.assertEqual(self.site.applications, [])
+        self.assertNotIn(PHONES[1], self.site.used)
 
     def test_courses_may_open_early_late_or_one_at_a_time(self):
         self.site.opens_at = time.time() + 0.5
