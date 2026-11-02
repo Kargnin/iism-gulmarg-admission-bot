@@ -1888,14 +1888,33 @@ def affirmative_success(text):
 
 def affirmative_evidence(text):
     for envelope in outcome_envelopes(text):
-        for candidate in re.split(r"[.!?;]+", envelope):
-            for pattern in AFFIRMATIVE_OUTCOME_PATTERNS:
-                for match in re.finditer(rf"(?<!\w)(?:{pattern})(?!\w)", candidate):
-                    prefix = candidate[:match.start()]
-                    if (outcome_negative(prefix)
-                            or re.search(r"\b(?:no|not|never|nothing|none|neither|cannot)\b", prefix)):
-                        continue
-                    return True
+        claim_start = (
+            r"(?:(?:(?:the|your)\s+)?(?:admission\s+form|application|form|registration)\b|"
+            r"(?:submitted\s+successfully|successfully\s+submitted|registered\s+successfully|"
+            r"successfully\s+registered|saved\s+successfully|successfully\s+saved)\b)"
+        )
+        boundary = (
+            r"(?:[.!?;]+|\balthough\b[^,;.!?]*,\s*|"
+            r",\s*(?=(?:(?:the|your)\s+)?(?:admission\s+form|application|form|registration)\b)|"
+            rf"\b(?:but|yet|however)\b(?=\s*,?\s*{claim_start})|"
+            rf"\band\b(?=\s*{claim_start}))"
+        )
+        for pattern in AFFIRMATIVE_OUTCOME_PATTERNS:
+            for match in re.finditer(rf"(?<!\w)(?:{pattern})(?!\w)", envelope):
+                prefix = re.split(boundary, envelope[:match.start()])[-1]
+                suffix = envelope[match.end():]
+                if (outcome_negative(prefix)
+                        or re.search(r"\b(?:no|not|never|nothing|none|neither|cannot)\b", prefix)
+                        or re.search(r"\b(?:if|unless|when|whenever|once|after|before|until|will|shall|"
+                                     r"would|should|could|may|might|can|verify|check)\b", prefix)):
+                    continue
+                if re.match(r"\s*\?", suffix):
+                    continue
+                if re.match(r"\s*(?:(?:[,;:]\s*)|(?:\b(?:but|yet|however)\b\s*))?"
+                            r"(?:only\s+if|provided(?:\s+that)?|unless|if|when|whenever|once|after|"
+                            r"before|until|subject\s+to|pending)\b", suffix):
+                    continue
+                return True
     return False
 
 

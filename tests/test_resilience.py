@@ -1224,9 +1224,18 @@ class Resilience(unittest.TestCase):
             (429, "Application was rejected. Application submitted successfully."),
             (500, "Application contains invalid data. Application submitted successfully."),
             (429, "An error occurred. Application submitted successfully."),
+            (429, "Application was rejected, but application submitted successfully."),
+            (429, "Application was rejected and application submitted successfully."),
+            (500, "Application contains invalid data; however, application submitted successfully."),
+            (429, "An error occurred, yet application submitted successfully."),
+            (200, "Although application was rejected, application submitted successfully."),
+            (200, "Application was rejected, application submitted successfully."),
             (200, "This Mobile No. is already registered. Application submitted successfully."),
+            (200, "This Mobile No. is already registered, but application submitted successfully."),
             (200, "Seat not available. Application submitted successfully."),
+            (200, "Seat not available; yet application submitted successfully."),
             (200, "Registration is closed. Application submitted successfully."),
+            (200, "Registration is closed, however application submitted successfully."),
         )
         for status, message in cases:
             with self.subTest(status=status, message=message):
@@ -1243,7 +1252,7 @@ class Resilience(unittest.TestCase):
         site.success_receipt = (
             429,
             '<form action="AdmissionFormSuccess.aspx"><input name="__VIEWSTATE" value="a">'
-            '<span id="lblMsg">Application was rejected. Application submitted successfully.</span></form>',
+            '<span id="lblMsg">Application was rejected, but application submitted successfully.</span></form>',
             {},
         )
         answers = []
