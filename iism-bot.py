@@ -1613,6 +1613,59 @@ class OriginRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(request, response, code, message, headers, new_url)
 
 
+class TransportStartMixin:
+    def __init__(self, *args, on_write, **kwargs):
+        self._on_write = on_write
+        self._write_started = False
+        self._in_tunnel = False
+        super().__init__(*args, **kwargs)
+
+    def _tunnel(self):
+        self._in_tunnel = True
+        try:
+            return super()._tunnel()
+        finally:
+            self._in_tunnel = False
+
+    def send(self, data):
+        if self.sock is None:
+            self.connect()
+        if not self._in_tunnel and not self._write_started:
+            self._on_write()
+            self._write_started = True
+        return super().send(data)
+
+
+class TrackedHTTPConnection(TransportStartMixin, http.client.HTTPConnection):
+    pass
+
+
+class TrackedHTTPSConnection(TransportStartMixin, http.client.HTTPSConnection):
+    pass
+
+
+class TrackedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, on_write):
+        super().__init__()
+        self.on_write = on_write
+
+    def http_open(self, request):
+        def factory(host, **kwargs):
+            return TrackedHTTPConnection(host, on_write=self.on_write, **kwargs)
+        return self.do_open(factory, request)
+
+
+class TrackedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, on_write, context):
+        super().__init__(context=context)
+        self.on_write = on_write
+
+    def https_open(self, request):
+        def factory(host, **kwargs):
+            return TrackedHTTPSConnection(host, on_write=self.on_write, **kwargs)
+        return self.do_open(factory, request, context=self._context)
+
+
 def response_retry_after(page):
     value = page.headers.get("retry-after", "")
     try:
@@ -1636,6 +1689,7 @@ class Http:
         self.timeout = timeout
         self.log = log
         self.jar = http.cookiejar.CookieJar()
+        self._on_write = None
         self._build(verify)
 
     def _build(self, verify):
@@ -1645,9 +1699,14 @@ class Http:
             ctx.verify_mode = ssl.CERT_NONE
         self.verified = verify
         self.redirect_handler = OriginRedirectHandler(self.origin, self.stop)
-        self.opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx),
+        self.opener = urllib.request.build_opener(TrackedHTTPHandler(self._before_write),
+                                                  TrackedHTTPSHandler(self._before_write, ctx),
                                                   urllib.request.HTTPCookieProcessor(self.jar),
                                                   self.redirect_handler)
+
+    def _before_write(self):
+        if self._on_write is not None:
+            self._on_write()
 
     def check_destination(self, url):
         if self.stop is not None and self.stop.is_set():
@@ -1704,9 +1763,8 @@ class Http:
         if referer:
             headers["Referer"] = referer
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        previous_on_write, self._on_write = self._on_write, on_start
         try:
-            if on_start is not None:
-                on_start()
             with self.opener.open(request, timeout=timeout) as resp:
                 raw, status, final = self._read_response(resp, deadline), resp.status, resp.geturl()
                 response_headers = dict(resp.headers)
@@ -1732,6 +1790,8 @@ class Http:
             raise self._network_error(f"no answer within {timeout:g}s")
         except (http.client.HTTPException, OSError) as e:
             raise self._network_error(f"connection problem: {type(e).__name__} {e}".strip())
+        finally:
+            self._on_write = previous_on_write
         redirects = tuple(self.redirect_handler.history)
         fresh = method == "GET" or bool(redirects)
         self.check_destination(final)
@@ -1941,7 +2001,7 @@ class Session:
         server_age = observed_server_age(page, bot.s.dob) if bot.s.dob else None
         return Selection(course, level, batch, state, seats, page.value("txtCourseFee"), page, server_age)
 
-    def submit(self, target, sel):
+    def prepare_submit(self, target, sel):
         bot = self.bot
         page = sel.page
         minor = sel.server_age is not None and sel.server_age < 18
@@ -2045,6 +2105,11 @@ class Session:
         if button is None:
             raise Transient("the required final submit control is missing or disabled")
         values[button[0]] = button[1]
+        return values, files
+
+    def submit(self, target, sel, values, files):
+        bot = self.bot
+        page = sel.page
 
         request_started = False
 
@@ -2163,10 +2228,13 @@ class Session:
         sel = self.cascade(target)
         if self.bot.stop.is_set():
             raise Cancelled()
+        values, files = self.prepare_submit(target, sel)
+        if self.bot.stop.is_set():
+            raise Cancelled()
         if self.bot.dry_run:
             self.bot.log.info(f"{self.who}DRY RUN - would submit {target.label} now: {sel}")
             return {"message": f"dry run: {sel}", "applicationId": "", "dryRun": True}
-        return self.submit(target, sel)
+        return self.submit(target, sel, values, files)
 
 
 # ---------------------------------------------------------------------------
@@ -2855,13 +2923,19 @@ class Worker(threading.Thread):
         except ConfigError as exc:
             with bot.lock:
                 bot.failures.append(str(exc))
-            bot.log.error(str(exc))
             bot.stop.set()
+            try:
+                bot.log.error(str(exc))
+            except Exception:
+                pass
         except Exception:
             with bot.lock:
                 bot.failures.append(f"{target.label}: unexpected worker failure")
-            bot.log.error(f"[{self.name}] failed:\n{traceback.format_exc()}")
             bot.stop.set()
+            try:
+                bot.log.error(f"[{self.name}] failed:\n{traceback.format_exc()}")
+            except Exception:
+                pass
         finally:
             bot.set_status(self.name, None)
 

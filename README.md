@@ -58,7 +58,7 @@ For an optional supervised live rehearsal:
 python3 iism-bot.py --config configs/me.jsonc --dry-run --now
 ```
 
-This sends your mobile number, course choices, state, and DOB to the live form, but stops before final submission and document uploads. It can wait indefinitely for unpublished slots. Press **Ctrl+C** after readiness is demonstrated or the expected missing-slot state appears. An AI-assisted setup can also rehearse against the local mock with fictional data; see [prompt.md](prompt.md).
+This sends your mobile number, course choices, state, and DOB to the live form and validates the latest final-form controls, selections, seats/fee presence, and applicable prepared documents. It stops before durable submission state, final application transmission, and document uploads. It can wait indefinitely for unpublished slots. Press **Ctrl+C** after readiness is demonstrated or the expected missing-slot state appears. An AI-assisted setup can also rehearse against the local mock with fictional data; see [prompt.md](prompt.md).
 
 ## 4. Run on booking day
 

@@ -409,6 +409,117 @@ class Resilience(unittest.TestCase):
         self.assertEqual(instance.pending, {PHONES[0]: bot.target_key(instance.targets[0])})
         self.assertEqual(instance.state.data["phones"][PHONES[0]]["status"], "submitting")
 
+    def test_transport_provenance_starts_only_at_first_write(self):
+        started = []
+
+        class FakeSocket:
+            def __init__(self, fail=False):
+                self.fail = fail
+                self.writes = []
+            def sendall(self, data):
+                self.writes.append(data)
+                if self.fail:
+                    raise OSError("partial write")
+            def close(self):
+                pass
+
+        refused = bot.Http("http://127.0.0.1:9", 0.2, bot.Log(echo=False))
+        with mock.patch.object(bot.TrackedHTTPConnection, "connect",
+                               side_effect=ConnectionRefusedError("refused")):
+            with self.assertRaises(bot.Transient):
+                refused.send("POST", "http://127.0.0.1:9/admission_form.aspx", b"body",
+                             on_start=lambda: started.append("refused"))
+        self.assertEqual(started, [])
+
+        tls = bot.Http("https://example.test", 0.2, bot.Log(echo=False))
+        with mock.patch.object(bot.TrackedHTTPSConnection, "connect",
+                               side_effect=ssl.SSLCertVerificationError(1, "certificate verify failed")):
+            with self.assertRaises(bot.Transient):
+                tls.send("POST", "https://example.test/admission_form.aspx", b"body",
+                         on_start=lambda: started.append("tls"))
+        self.assertEqual(started, [])
+        self.assertFalse(tls.verified)
+
+        stop = threading.Event()
+        cancelled_socket = FakeSocket()
+        cancelled = bot.Http("http://example.test", 1, bot.Log(echo=False), stop)
+
+        def connect_then_cancel(connection):
+            connection.sock = cancelled_socket
+            stop.set()
+
+        def cancellation_gate():
+            if stop.is_set():
+                raise bot.Cancelled()
+            started.append("cancelled")
+
+        with mock.patch.object(bot.TrackedHTTPConnection, "connect", connect_then_cancel):
+            with self.assertRaises(bot.Cancelled):
+                cancelled.send("POST", "http://example.test/admission_form.aspx", b"body",
+                               on_start=cancellation_gate)
+        self.assertEqual(cancelled_socket.writes, [])
+        self.assertNotIn("cancelled", started)
+
+        partial_socket = FakeSocket(fail=True)
+        partial = bot.Http("http://example.test", 1, bot.Log(echo=False))
+        with mock.patch.object(bot.TrackedHTTPConnection, "connect",
+                               lambda connection: setattr(connection, "sock", partial_socket)):
+            with self.assertRaises(bot.Transient):
+                partial.send("POST", "http://example.test/admission_form.aspx", b"body",
+                             on_start=lambda: started.append("partial"))
+        self.assertIn("partial", started)
+        self.assertTrue(partial_socket.writes)
+
+    def test_final_connect_failure_clears_pending_before_feedback(self):
+        site, url = self.local_site()
+        settings = bot.parse_settings(make_config(self.root, PHONES[:1], ["G2 Basic"]), None)[0]
+        out = self.root / "connect-failure"
+        self.assertEqual(bot.prepare_documents(settings, out)[0], [])
+        instance = bot.Bot(settings, out, base_url=url, log=bot.Log(echo=False))
+        instance.state.acquire()
+        try:
+            instance._restore()
+            phone = instance.assign_phone(instance.targets[0])
+            session = bot.Session(instance, phone, "")
+            selection = session.cascade(instance.targets[0])
+            values, files = session.prepare_submit(instance.targets[0], selection)
+            with mock.patch.object(bot.TrackedHTTPConnection, "connect",
+                                   side_effect=ConnectionRefusedError("refused")):
+                with self.assertRaises(bot.Transient):
+                    session.submit(instance.targets[0], selection, values, files)
+            self.assertEqual(instance.pending, {})
+            self.assertFalse(any(item.get("status") == "submitting"
+                                 for item in instance.state.data["phones"].values()))
+            self.assertEqual(site.applications, [])
+        finally:
+            instance.state.release()
+
+    def test_fatal_worker_logging_failure_still_stops_siblings(self):
+        for error in (bot.ConfigError("fatal config"), RuntimeError("fatal bug")):
+            with self.subTest(error=type(error).__name__):
+                settings = bot.parse_settings(
+                    make_config(self.root, PHONES[:2], ["G2 Basic", "G3 Basic"]), None)[0]
+                instance = bot.Bot(settings, self.root / ("log-failure-" + type(error).__name__),
+                                   base_url="http://127.0.0.1:9", dry_run=True, log=bot.Log(echo=False))
+                guard_fired = threading.Event()
+
+                def fail_or_poll(session, target):
+                    if target.index == 0:
+                        raise error
+                    raise bot.TargetFull("still unavailable")
+
+                guard = threading.Timer(1, lambda: (guard_fired.set(), instance.stop.set()))
+                guard.start()
+                try:
+                    with mock.patch.object(bot.Session, "book", fail_or_poll), \
+                            mock.patch.object(instance.log, "error", side_effect=OSError("broken log")):
+                        instance.run()
+                finally:
+                    guard.cancel()
+                self.assertFalse(guard_fired.is_set())
+                self.assertTrue(instance.stop.is_set())
+                self.assertTrue(instance.failures)
+
     def test_retry_after_delta_and_date_are_capped_and_cancel_aware(self):
         instance = offline_bot()
         for value in ("120", "Wed, 12 Nov 2036 10:00:00 GMT"):

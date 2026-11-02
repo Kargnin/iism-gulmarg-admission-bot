@@ -1587,6 +1587,55 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.site.applications, [])
         self.assertFalse((self.out / "state.json").exists())
 
+    def test_dry_run_requires_a_ready_final_form(self):
+        original = mock_site.Handler.form
+        batch_key = self.key("G2")
+        cases = ("submit", "course-meaning", "dob", "seats", "fee", "photo", "minor-guardian")
+        for case in cases:
+            with self.subTest(case=case):
+                def unready_form(handler, mobile, values, listed, invalid=(), alert=None):
+                    rendered = dict(values)
+                    if values.get("__EVENTTARGET") == "txtDateOfBirth":
+                        if case == "dob":
+                            rendered["txtDateOfBirth"] = "01/01/1990"
+                        elif case == "seats":
+                            rendered["txtAvailableSeat"] = "0"
+                        elif case == "fee":
+                            rendered["txtCourseFee"] = "0"
+                    body = original(handler, mobile, rendered, listed, invalid=invalid, alert=alert)
+                    if values.get("__EVENTTARGET") != "txtDateOfBirth":
+                        return body
+                    if case == "submit":
+                        return re.sub(r'<input\b(?=[^>]*\bid="btnSubmit")[^>]*>\s*', "", body,
+                                      count=1, flags=re.I)
+                    if case == "course-meaning":
+                        value = values["ddlCourse"]
+                        pattern = rf'(<option selected="selected" value="{re.escape(value)}">)[^<]*(</option>)'
+                        return re.sub(pattern, r'\1Snow Boarding Course\2', body, count=1)
+                    control = {"photo": "FupPhototOfApplicant",
+                               "minor-guardian": "FupParentGuardianSignature"}.get(case)
+                    if control:
+                        return body.replace(f'type="file" name="{control}"',
+                                            f'type="file" disabled="disabled" name="{control}"')
+                    return body
+
+                self.site.used.clear()
+                self.site.applications.clear()
+                self.site.request_log.clear()
+                self.site.seats[batch_key] = 3
+                self.site.sessions.clear()
+                self.site.viewstates.clear()
+                applicant = {"dateOfBirth": "15/05/2010"} if case == "minor-guardian" else {}
+                cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"], applicant=applicant)
+                if case == "minor-guardian":
+                    cfg["documents"]["parentSignature"] = "sign.jpg"
+                out = self.tmp / f"dry-unready-{case}"
+                with mock.patch.object(mock_site.Handler, "form", unready_form):
+                    instance = run_bot(cfg, self.url, out, dry_run=True, timeout=0.4)
+                self.assertEqual(instance.bookings, [])
+                self.assertEqual(self.site.applications, [])
+                self.assertFalse((out / "state.json").exists())
+
     def test_missing_required_document_fails_preflight(self):
         cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"])
         cfg["documents"]["photo"] = ""
