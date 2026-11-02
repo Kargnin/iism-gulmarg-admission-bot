@@ -800,6 +800,58 @@ class Resilience(unittest.TestCase):
         self.assertEqual(site.applications[0]["mobile"], PHONES[0])
         self.assertNotIn(PHONES[1], site.used)
 
+    def test_malformed_final_redirects_affect_only_the_submitted_preference(self):
+        received = []
+
+        class Receiver(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        receiver = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
+        receiver.daemon_threads = True
+        threading.Thread(target=receiver.serve_forever, daemon=True).start()
+        self.addCleanup(receiver.server_close)
+        self.addCleanup(receiver.shutdown)
+        destinations = (
+            "ftp://example.invalid/receipt",
+            "javascript:alert(1)",
+            f"http://user:fake-password@127.0.0.1:{receiver.server_port}/receipt",
+            "http://127.0.0.1:invalid-port/receipt",
+            "http://[::1/receipt",
+        )
+        for index, destination in enumerate(destinations):
+            with self.subTest(destination=destination):
+                class BadReceipt(mock_site.Handler):
+                    def submit(self, mobile, *args, **kwargs):
+                        self.submitting_mobile = mobile
+                        return super().submit(mobile, *args, **kwargs)
+
+                    def redirect(self, location):
+                        if (getattr(self, "submitting_mobile", None) == PHONES[0]
+                                and location.lower().startswith("/admissionformsuccess.aspx")):
+                            return self.send(302, "invalid receipt destination", {"Location": destination})
+                        return super().redirect(location)
+
+                site, url = self.local_site(BadReceipt)
+                answers = []
+                out = self.root / f"bad-redirect-{index}"
+                instance = run_bot(make_config(self.root, PHONES[:2], ["G2 Basic", "G3 Basic"]), url, out,
+                                   timeout=4,
+                                   confirmation_handler=lambda *args: answers.append(args[1].label) or "booked")
+                bookings = {item["target"]: (item["phone"], item["status"]) for item in instance.bookings}
+                self.assertTrue(instance.finished())
+                self.assertEqual(instance.failures, [])
+                self.assertEqual(answers, ["G2 Basic"])
+                self.assertEqual(bookings["G2 Basic"], (PHONES[0], "user-confirmed"))
+                self.assertEqual(bookings["G3 Basic"], (PHONES[1], "confirmed"))
+                self.assertEqual(len(site.applications), 2)
+                self.assertEqual(received, [])
+
     def test_criteria_refusal_is_reported_without_retiring_phone(self):
         site, url = self.local_site()
         reason = "The revised declaration must be reviewed before continuing."
@@ -826,10 +878,16 @@ class Resilience(unittest.TestCase):
     def test_foreign_form_destination_is_blocked_before_sending(self):
         instance = offline_bot()
         session = bot.Session(instance, PHONES[0], "")
-        page = bot.Page("http://127.0.0.1:9/admission_form.aspx", 200,
-                        '<form action="http://127.0.0.1:8/collect"><input name="__VIEWSTATE" value="a"></form>')
-        with self.assertRaises(bot.ConfigError):
-            session.postback(page, "", {"txtName": "Test"})
+        destinations = ("http://127.0.0.1:8/collect", "ftp://example.invalid/collect",
+                        "javascript:alert(1)", "http://user:password@127.0.0.1:9/collect",
+                        "http://127.0.0.1:bad/collect")
+        for destination in destinations:
+            with self.subTest(destination=destination):
+                page = bot.Page(
+                    "http://127.0.0.1:9/admission_form.aspx", 200,
+                    f'<form action="{destination}"><input name="__VIEWSTATE" value="a"></form>')
+                with self.assertRaises(bot.ConfigError):
+                    session.postback(page, "", {"txtName": "Test"})
 
     def test_foreign_redirect_never_contacts_receiver(self):
         received = []
@@ -1069,6 +1127,15 @@ class Resilience(unittest.TestCase):
             "Application will be submitted successfully after payment",
             "If the application is submitted successfully, you will receive a payment link",
             "When your application has been submitted successfully, payment details will appear",
+            "We can't confirm that your application was submitted successfully",
+            "We can’t confirm that your application was submitted successfully",
+            "This application can't be submitted successfully",
+            "Please verify that your application was submitted successfully",
+            "Please check whether your application was submitted successfully",
+            "Application submitted successfully only if payment completes",
+            "Application submitted successfully provided payment completes",
+            "Application submitted successfully unless verification fails",
+            'The page may say "Application submitted successfully" after approval',
         )
         for message in messages:
             with self.subTest(message=message):

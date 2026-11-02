@@ -196,7 +196,8 @@ SUCCESS_PHRASES = [
 ]
 OUTCOME_NEGATIVE_PHRASES = [
     "not successfully", "unsuccessful", "not submitted", "failed", "failure", "could not", "error",
-    "invalid", "reject", "not accepted", "declined", "unable",
+    "invalid", "reject", "not accepted", "declined", "unable", "cannot confirm", "cannot verify",
+    "not confirmed", "not verified",
 ]
 OUTCOME_CONTRACTIONS = (
     ("ain't", "is not"), ("aren't", "are not"), ("can't", "cannot"), ("couldn't", "could not"),
@@ -206,18 +207,22 @@ OUTCOME_CONTRACTIONS = (
     ("wouldn't", "would not"),
 )
 AFFIRMATIVE_OUTCOME_PATTERNS = (
-    r"\b(?:(?:the|your)\s+)?(?:admission\s+form|application|form)\s+"
-    r"(?:(?:has|have)\s+been\s+|was\s+)?submitted\s+successfully\b",
-    r"\b(?:(?:the|your)\s+)?(?:admission\s+form|application|form)\s+"
-    r"(?:(?:has|have)\s+been\s+|was\s+)?successfully\s+submitted\b",
-    r"\b(?:(?:the|your)\s+)?(?:admission\s+form|application|form)\s+(?:has|have)\s+been\s+submitted\b",
-    r"\b(?:(?:the|your)\s+)?(?:admission\s+form|application|form)\s+submitted\b",
-    r"\b(?:(?:the|your)\s+)?(?:application|form|registration)\s+"
-    r"(?:(?:has|have)\s+been\s+|was\s+)?(?:registered|saved)\s+successfully\b",
-    r"\b(?:(?:the|your)\s+)?(?:application|form|registration)\s+"
-    r"(?:(?:has|have)\s+been\s+|was\s+)?successfully\s+(?:registered|saved)\b",
-    r"^\s*(?:submitted\s+successfully|successfully\s+submitted|registered\s+successfully|"
-    r"successfully\s+registered|saved\s+successfully|successfully\s+saved)\b",
+    r"(?:(?:the|your)\s+)?(?:admission\s+form|application|form)\s+"
+    r"(?:(?:has|have)\s+been\s+|was\s+)?submitted\s+successfully",
+    r"(?:(?:the|your)\s+)?(?:admission\s+form|application|form)\s+"
+    r"(?:(?:has|have)\s+been\s+|was\s+)?successfully\s+submitted",
+    r"(?:(?:the|your)\s+)?(?:admission\s+form|application|form)\s+(?:has|have)\s+been\s+submitted",
+    r"(?:(?:the|your)\s+)?(?:admission\s+form|application|form)\s+submitted",
+    r"(?:(?:the|your)\s+)?(?:application|form|registration)\s+"
+    r"(?:(?:has|have)\s+been\s+|was\s+)?(?:registered|saved)\s+successfully",
+    r"(?:(?:the|your)\s+)?(?:application|form|registration)\s+"
+    r"(?:(?:has|have)\s+been\s+|was\s+)?successfully\s+(?:registered|saved)",
+    r"(?:submitted\s+successfully|successfully\s+submitted|registered\s+successfully|"
+    r"successfully\s+registered|saved\s+successfully|successfully\s+saved)",
+)
+AFFIRMATIVE_RECEIPT_SUFFIX = (
+    r"(?:,\s*payment\s+(?:details|link)\s+(?:has|have)\s+been\s+sent"
+    r"(?:\s+(?:to|on)\s+(?:your\s+)?(?:registered\s+)?(?:email|email\s+id))?)?"
 )
 AGE_PHRASES = ["age allow", "not eligible", "age should", "age must", "age limit", "invalid date"]
 
@@ -1677,13 +1682,13 @@ class Multipart:
 
 
 def origin(url):
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
-        raise ConfigError("The request URL has an invalid origin.")
     try:
+        parsed = urllib.parse.urlsplit(url)
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
     except ValueError as exc:
-        raise ConfigError("The request URL has an invalid port.") from exc
+        raise ConfigError("The request URL has an invalid port or host.") from exc
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise ConfigError("The request URL has an invalid origin.")
     return parsed.scheme.lower(), parsed.hostname.lower(), port
 
 
@@ -1696,11 +1701,25 @@ class OriginRedirectHandler(urllib.request.HTTPRedirectHandler):
         if self.stop is not None and self.stop.is_set():
             raise Cancelled()
         self.history.append((code, request.get_method(), request.full_url, new_url))
-        if origin(new_url) != self.expected:
-            raise RedirectBlocked("Blocked a redirect outside the configured admission site.")
+        self.check_redirect(new_url)
         return super().redirect_request(request, response, code, message, headers, new_url)
 
+    def check_redirect(self, new_url):
+        try:
+            redirected_origin = origin(new_url)
+        except ConfigError as exc:
+            raise RedirectBlocked("Blocked an invalid redirect outside the configured admission site.") from exc
+        if redirected_origin != self.expected:
+            raise RedirectBlocked("Blocked a redirect outside the configured admission site.")
+
     def http_error_302(self, request, response, code, message, headers):
+        location = headers.get("location") or headers.get("uri")
+        if location:
+            try:
+                new_url = urllib.parse.urljoin(request.full_url, location)
+            except ValueError as exc:
+                raise RedirectBlocked("Blocked an invalid redirect outside the configured admission site.") from exc
+            self.check_redirect(new_url)
         wrapped = RedirectResponse(response, self.drain)
         return super().http_error_302(request, wrapped, code, message, headers)
 
@@ -1844,8 +1863,8 @@ def outcome_negative(text):
     for clause in outcome_clauses(text):
         if has_any(clause, OUTCOME_NEGATIVE_PHRASES):
             return True
-        if re.search(r"\b(?:no|not|never|nothing|none|neither)\b[^.!?;|]*"
-                     r"\b(?:submit|accept|register|save|receiv)\w*\b", clause):
+        if re.search(r"\b(?:no|not|never|nothing|none|neither|cannot)\b[^.!?;|]*"
+                     r"\b(?:submit|accept|register|save|receiv|confirm|verif)\w*\b", clause):
             return True
     return False
 
@@ -1856,13 +1875,9 @@ def affirmative_success(text):
         if outcome_negative(clause):
             continue
         for pattern in AFFIRMATIVE_OUTCOME_PATTERNS:
-            match = re.search(pattern, clause)
-            if match is None:
-                continue
-            if re.search(r"\b(?:if|unless|when|whenever|once|after|before|until|should|would|could|may|"
-                         r"might|will|shall|can)\b", clause[:match.start()]):
-                continue
-            return match.group(0)
+            match = re.fullmatch(rf"(?:{pattern}){AFFIRMATIVE_RECEIPT_SUFFIX}", clause.strip())
+            if match is not None:
+                return match.group(0)
     return None
 
 
