@@ -707,6 +707,40 @@ class Resilience(unittest.TestCase):
                 with self.assertRaises(bot.Transient):
                     session.judge_submit(page, instance.targets[0], None, None, set())
 
+    def test_success_mixed_with_decisive_negative_evidence_is_uncertain(self):
+        instance = offline_bot()
+        session = bot.Session(instance, PHONES[0], "")
+        success = "Admission Form submitted successfully. Payment link has been sent."
+        cases = {
+            "used": '<span id="lblerrorMsg">This Mobile No. is already registered.</span>',
+            "full": '<span id="lblerrorMsg">Seat not available.</span>',
+            "closed": '<span id="lblerrorMsg">Registration is closed.</span>',
+            "validator": ('<script>rfvtxtName.errormessage = "Please Enter Name.";'
+                          'rfvtxtName.isvalid = "False";</script>'),
+        }
+        for name, evidence in cases.items():
+            with self.subTest(name=name):
+                session.static = {}
+                body = ('<form action="admission_form.aspx"><input name="__VIEWSTATE" value="a">'
+                        f'<span id="lblMsg">{success}</span>{evidence}</form>')
+                page = bot.Page("http://127.0.0.1:9/admission_form.aspx", 200, body)
+                with self.assertRaises(bot.Uncertain):
+                    session.judge_submit(page, instance.targets[0], None, None, set())
+
+        pure = {
+            "used": ("This Mobile No. is already registered.", bot.PhoneUsed),
+            "full": ("Seat not available.", bot.TargetFull),
+            "closed": ("Registration is closed.", bot.NotOpen),
+        }
+        for name, (message, error) in pure.items():
+            with self.subTest(pure=name):
+                session.static = {}
+                body = ('<form action="admission_form.aspx"><input name="__VIEWSTATE" value="a">'
+                        f'<span id="lblMsg">{message}</span></form>')
+                page = bot.Page("http://127.0.0.1:9/admission_form.aspx", 200, body)
+                with self.assertRaises(error):
+                    session.judge_submit(page, instance.targets[0], None, None, set())
+
     def test_explicit_historical_success_does_not_require_an_id(self):
         instance = offline_bot()
         session = bot.Session(instance, PHONES[0], "")

@@ -623,7 +623,7 @@ def course_candidates(options, target, hint=None):
     """Course dropdown entries that could hold this choice, most likely first."""
     real = real_options(options)
     fits = lambda text: not course_conflicts(text, target)
-    scored = []
+    ranked = []
     for n, (value, text) in enumerate(real):
         s = kind_score(text, target.kind)
         if s <= 0:
@@ -632,20 +632,25 @@ def course_candidates(options, target, hint=None):
         if date_match(dates_in(text), target.start):
             s += 8
         if s > 0:
-            scored.append((-s, n, (value, text)))
-    picks = [o for _, _, o in sorted(scored)]
+            ranked.append((-s, n, (value, text)))
+    included = {option for _, _, option in ranked}
     if target.kind != "Snow Skiing":
-        picks += [o for o in real if o not in picks and kind_score(o[1], "Snow Skiing") > 0 and fits(o[1])]
+        for n, option in enumerate(real):
+            if option not in included and kind_score(option[1], "Snow Skiing") > 0 and fits(option[1]):
+                ranked.append((0, n, option))
+                included.add(option)
     exclude = KIND_PATTERNS[target.kind][1]
-    picks += [o for o in real if o not in picks and not re.search(exclude, norm(o[1])) and fits(o[1])]
-    if target.course_text:
-        picks.sort(key=lambda o: norm(target.course_text) not in norm(o[1]))
-    if hint:
-        picks.sort(key=lambda o: o[0] != hint)
-    return picks
+    for n, option in enumerate(real):
+        if option not in included and not re.search(exclude, norm(option[1])) and fits(option[1]):
+            ranked.append((1, n, option))
+            included.add(option)
+    configured = norm(target.course_text)
+    return [option for _, _, option in sorted(
+        ranked, key=lambda item: (item[0], bool(configured and configured not in norm(item[2][1])),
+                                  bool(hint and item[2][0] != hint), item[1]))]
 
 
-def match_level(options, target, loose):
+def level_candidates(options, target, loose):
     real = real_options(options)
     if target.level:
         picks = [o for o in real if re.search(LEVEL_PATTERNS[target.level], norm(o[1]))]
@@ -657,6 +662,11 @@ def match_level(options, target, loose):
         picks = list(real)
     if target.level_text:
         picks.sort(key=lambda o: norm(target.level_text) not in norm(o[1]))
+    return picks
+
+
+def match_level(options, target, loose):
+    picks = level_candidates(options, target, loose)
     return picks[0] if picks else None
 
 
@@ -1951,35 +1961,43 @@ class Session:
             page = self.select(page, "ddlCourse",
                                dict(first_values(page, "ddlCourseLevel", "ddlScheduleCourse"), ddlCourse=value))
             level_options = page.options("ddlCourseLevel")
-            level = match_level(level_options, target, loose=kind_score(text, target.kind) > 0)
-            if real_options(level_options) and level is None:
+            levels = level_candidates(level_options, target, loose=kind_score(text, target.kind) > 0)
+            if real_options(level_options) and not levels:
                 continue
-            if level:
-                page = self.select(page, "ddlCourseLevel",
-                                   dict(first_values(page, "ddlScheduleCourse"), ddlCourseLevel=level[0]))
-            batches = page.options("ddlScheduleCourse")
-            if any(is_season_batch(t, bot.s.batches) for _, t in real_options(batches)):
-                bot.saw_season()
-            batch = match_batch(batches, target)
-            if batch and not selection_conflicts((value, text), level, batch, target):
-                found = ((value, text), level, batch)
+            for level in levels or [None]:
+                if level:
+                    page = self.select(page, "ddlCourseLevel",
+                                       dict(first_values(page, "ddlScheduleCourse"), ddlCourseLevel=level[0]))
+                batches = page.options("ddlScheduleCourse")
+                if any(is_season_batch(t, bot.s.batches) for _, t in real_options(batches)):
+                    bot.saw_season()
+                batch = match_batch(batches, target)
+                if not batch or selection_conflicts((value, text), level, batch, target):
+                    continue
+                values = {"ddlScheduleCourse": batch[0]}
+                if level:
+                    values["ddlCourseLevel"] = level[0]
+                try:
+                    candidate_page = self.select(page, "ddlScheduleCourse", values)
+                except TargetFull:
+                    continue
+                seats = to_int(candidate_page.value("txtAvailableSeat"))
+                if seats == 0:
+                    page = candidate_page
+                    continue
+                found = ((value, text), level, batch, candidate_page, seats)
+                break
+            if found:
                 break
         if not found:
             if bot.season_seen is None:
                 raise NotOpen("the snow courses are not listed yet" + listing(page, "ddlCourse"))
             raise TargetFull(f"{target.when()} is not listed" + listing(page, "ddlScheduleCourse"))
-        course, level, batch = found
+        course, level, batch, page, seats = found
         if not has_semantic_evidence(course, level, batch, target):
             bot.note(self.who, f"{target.label}: only the configured dates support this generic course/level match; "
                      "proceeding with the approved permissive attempt", warning=True)
         bot.course_hint[target.index] = course[0]
-        values = {"ddlScheduleCourse": batch[0]}
-        if level:
-            values["ddlCourseLevel"] = level[0]
-        page = self.select(page, "ddlScheduleCourse", values)
-        seats = to_int(page.value("txtAvailableSeat"))
-        if seats == 0:
-            raise TargetFull("0 seats left")
         if seats:
             bot.saw_seats(target)
 
@@ -2166,7 +2184,13 @@ class Session:
         negative = has_any(said + " | " + text, ("not successfully", "unsuccessful", "not submitted", "failed", "could not", "error"))
         explicit_success = has_any(said, SUCCESS_PHRASES) or (
             actual_page == "admissionformsuccess.aspx" and has_any(text, SUCCESS_PHRASES))
-        if 200 <= resp.status < 300 and not negative and (explicit_success or payment_receipt):
+        phone_used = has_any(said, PHONE_USED_PHRASES)
+        full = has_any(said, FULL_PHRASES)
+        closed = has_any(said, CLOSED_PHRASES)
+        failed_validators = failed_validator_messages(resp.body) if resp.name == FORM_PAGE else []
+        if 200 <= resp.status < 300 and (explicit_success or payment_receipt):
+            if negative or phone_used or full or closed or failed_validators:
+                raise Uncertain("the final response contains conflicting success and rejection evidence")
             message = next((m for m in msgs if has_any(m.lower(), SUCCESS_PHRASES)), "") or query.get("resp", "")
             if not message:
                 hit = next((p for p in SUCCESS_PHRASES if p in text), None)
@@ -2185,11 +2209,11 @@ class Session:
         reason = "; ".join(msgs[:4])
         if resp.status == 429:
             raise RateLimited("submit was rate limited: HTTP 429", response_retry_after(resp))
-        if has_any(said, PHONE_USED_PHRASES):
+        if phone_used:
             raise PhoneUsed(reason)
-        if has_any(said, FULL_PHRASES):
+        if full:
             raise TargetFull(f"site says: {reason}")
-        if has_any(said, CLOSED_PHRASES):
+        if closed:
             raise NotOpen(f"site says: {reason}")
         if resp.status >= 400 or not resp.is_aspx:
             if has_any(resp.body.lower(), VIEWSTATE_ERRORS):
@@ -2201,7 +2225,6 @@ class Session:
         if resp.name == FORM_PAGE:
             bot = self.bot
             meaningful = [m for m in msgs if not re.fullmatch(r"Your Age \d+ Years\.?", m, re.I)]
-            failed_validators = failed_validator_messages(resp.body)
             wants_parent = has_any(" ".join(failed_validators).lower(), ("parent", "guardian"))
             if wants_parent:
                 if sel.server_age is None:

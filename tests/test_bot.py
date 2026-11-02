@@ -218,6 +218,14 @@ class Matching(unittest.TestCase):
                    ("2", "Snow Skiing Advance Course at Kargil")]
         self.assertEqual(bot.course_candidates(courses, wrong_course), [])
 
+    def test_course_hints_only_break_ties_within_semantic_rank(self):
+        batches = bot.load_season({}, Path("."))[0]
+        configured = bot.parse_priority({"batch": "G2", "course": "Snow Skiing", "level": "Basic",
+                                         "courseText": "Generic Adventure"}, 0, batches)
+        options = [("9", "Generic Adventure"), ("10", "Snow Skiing Course at Gulmarg")]
+        self.assertEqual(bot.course_candidates(options, configured)[0][0], "10")
+        self.assertEqual(bot.course_candidates(options, configured, hint="9")[0][0], "10")
+
     def test_hint_text_does_not_define_semantic_identity(self):
         batches = bot.load_season({}, Path("."))[0]
         plain = bot.parse_priority({"batch": "G2", "level": "Basic"}, 0, batches)
@@ -659,6 +667,69 @@ class EndToEnd(unittest.TestCase):
                          {"G2 Basic": PHONES[0], "G3 Basic": PHONES[1]})
         self.assertNotIn(PHONES[2], self.site.used)
 
+    def test_full_hinted_course_continues_to_later_compatible_course(self):
+        original_id = self.key("G2")[0]
+        original_course = self.site.courses[original_id]
+        full_id = "98"
+        full_course = dict(original_course)
+        full_course["name"] = original_course["name"] + " Preferred"
+        full_course["levels"] = list(original_course["levels"])
+        full_course["batches"] = list(original_course["batches"])
+        self.site.courses[full_id] = full_course
+        for level, _ in full_course["levels"]:
+            for batch, *_ in full_course["batches"]:
+                self.site.seats[(full_id, level, batch)] = 0
+
+        priorities = ({"batch": "G2", "course": "Snow Skiing", "level": "Basic",
+                       "courseText": "Preferred"}, "G2 Basic")
+        for mode, priority in zip(("configured", "runtime"), priorities):
+            with self.subTest(mode=mode):
+                self.site.used.clear()
+                self.site.applications.clear()
+                self.site.sessions.clear()
+                self.site.viewstates.clear()
+                self.site.request_log.clear()
+                attempted = []
+                original_post = mock_site.Handler.post_form
+
+                def record_courses(handler, session, query, values, files):
+                    if values.get("__EVENTTARGET") == "ddlCourse":
+                        attempted.append(values.get("ddlCourse"))
+                    return original_post(handler, session, query, values, files)
+
+                cfg = make_config(self.tmp, PHONES[:1], [priority])
+                out = self.tmp / f"full-hint-{mode}"
+                with mock.patch.object(mock_site.Handler, "post_form", record_courses):
+                    if mode == "configured":
+                        instance = run_bot(cfg, self.url, out, timeout=4)
+                    else:
+                        settings = bot.parse_settings(cfg, None)[0]
+                        self.assertEqual(bot.prepare_documents(settings, out)[0], [])
+                        instance = bot.Bot(settings, out, base_url=self.url, log=bot.Log(echo=False))
+                        instance.course_hint[0] = full_id
+                        guard = threading.Timer(4, instance.stop.set)
+                        guard.start()
+                        try:
+                            instance.run()
+                        finally:
+                            guard.cancel()
+                self.assertTrue(instance.finished())
+                self.assertEqual(attempted[:2], [full_id, original_id])
+                self.assertEqual(self.site.applications[0]["course"], original_id)
+
+    def test_full_first_compatible_level_continues_to_later_level(self):
+        if self.layout != "levels":
+            self.skipTest("multi-level layout only")
+        course_id, first_level, batch_id = self.key("G2")
+        course = self.site.courses[course_id]
+        course["levels"] = list(course["levels"]) + [("19", "Basic alternate")]
+        for batch, *_ in course["batches"]:
+            self.site.seats[(course_id, "19", batch)] = 3
+        self.site.seats[(course_id, first_level, batch_id)] = 0
+        instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertTrue(instance.finished())
+        self.assertEqual(self.site.applications[0]["level"], "19")
+
     def test_batch_appears_later_inside_an_already_visible_course(self):
         self.site.batch_opens[self.key("G2")[2]] = time.time() + 0.8
         instance = self.run_with(PHONES, ["G2 Basic", "G3 Basic"])
@@ -999,6 +1070,37 @@ class EndToEnd(unittest.TestCase):
                                  confirmation_handler=self.feedback_from_receipts)
         self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "user-confirmed")])
         self.assertEqual(len(self.site.applications), 1)
+
+    def test_mixed_success_and_rejection_evidence_requires_feedback(self):
+        cases = {
+            "used": "This Mobile No. is already registered.",
+            "full": "Seat not available.",
+            "closed": "Registration is closed.",
+            "validator": None,
+        }
+        for name, negative in cases.items():
+            with self.subTest(name=name):
+                feedback = []
+                self.site.used.clear()
+                self.site.applications.clear()
+                self.site.request_log.clear()
+                shutil.rmtree(self.out, ignore_errors=True)
+
+                def mixed(handler, mobile, values, files, listed, course, level, batch):
+                    success = "Admission Form submitted successfully. Payment link has been sent."
+                    values["lblMsg"] = (success + ((" " + negative) if negative else ""), "Green")
+                    invalid = ["rfvtxtName"] if name == "validator" else []
+                    return handler.send(200, handler.form(mobile, values, listed, invalid=invalid))
+
+                def confirm(phone, target, reason):
+                    feedback.append((phone, target.label, reason))
+                    return "booked"
+
+                with mock.patch.object(mock_site.Handler, "submit", mixed):
+                    instance = self.run_with(PHONES[:2], ["G2 Basic"], confirmation_handler=confirm)
+                self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "user-confirmed")])
+                self.assertEqual(len(feedback), 1)
+                self.assertNotIn(PHONES[1], self.site.used)
 
     def test_redirected_receipt_errors_require_feedback_without_replay(self):
         cases = [
