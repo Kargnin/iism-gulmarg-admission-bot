@@ -169,10 +169,6 @@ SUCCESS_PHRASES = [
     "form submitted", "registered successfully", "successfully registered", "saved successfully",
     "successfully saved", "application received",
 ]
-TEMPORARY_PHRASES = [
-    "temporarily", "temporary", "try again", "service unavailable", "server busy", "server error",
-    "timed out", "timeout", "please retry", "try later",
-]
 AGE_PHRASES = ["age allow", "not eligible", "age should", "age must", "age limit", "invalid date"]
 
 # Words in the site's (or our own) message -> what in the config to look at. Most specific first.
@@ -436,14 +432,22 @@ def server_messages(body):
         sid = m.group(1).lower() if m else ""
         if sid.startswith("lbl") and has_any(sid, ("msg", "err", "message", "alert", "status", "result")):
             found.append(clean_html(inner))
-    for vid in re.findall(r'(\w+)\.isvalid\s*=\s*"False"', body):
-        m = re.search(re.escape(vid) + r'\.errormessage\s*=\s*"((?:[^"\\]|\\.)*)"', body)
-        found.append(js_text(m.group(1)) if m else vid + " failed")
+    found.extend(failed_validator_messages(body))
     out = []
     for text in found:
         if text and text not in out:
             out.append(text)
     return out
+
+
+def failed_validator_messages(body):
+    found = []
+    for vid in re.findall(r'(\w+)\.isvalid\s*=\s*"False"', body):
+        match = re.search(re.escape(vid) + r'\.errormessage\s*=\s*"((?:[^"\\]|\\.)*)"', body)
+        message = js_text(match.group(1)) if match else vid + " failed"
+        if message not in found:
+            found.append(message)
+    return found
 
 
 def real_options(options):
@@ -581,28 +585,24 @@ def course_conflicts(text, target):
 def course_candidates(options, target, hint=None):
     """Course dropdown entries that could hold this choice, most likely first."""
     real = real_options(options)
+    fits = lambda text: not course_conflicts(text, target)
+    scored = []
+    for n, (value, text) in enumerate(real):
+        s = kind_score(text, target.kind)
+        if s <= 0:
+            continue
+        s += location_score(text, target.location) + level_score(text, target)
+        if date_match(dates_in(text), target.start):
+            s += 8
+        if s > 0:
+            scored.append((-s, n, (value, text)))
+    picks = [o for _, _, o in sorted(scored)]
+    if target.kind != "Snow Skiing":
+        picks += [o for o in real if o not in picks and kind_score(o[1], "Snow Skiing") > 0 and fits(o[1])]
+    exclude = KIND_PATTERNS[target.kind][1]
+    picks += [o for o in real if o not in picks and not re.search(exclude, norm(o[1])) and fits(o[1])]
     if target.course_text:
-        picks = [o for o in real if norm(target.course_text) in norm(o[1]) and not course_conflicts(o[1], target)]
-    else:
-        fits = lambda text: not course_conflicts(text, target)
-        scored = []
-        for n, (value, text) in enumerate(real):
-            s = kind_score(text, target.kind)
-            if s <= 0:
-                continue
-            s += location_score(text, target.location) + level_score(text, target)
-            if date_match(dates_in(text), target.start):
-                s += 8
-            if s > 0:
-                scored.append((-s, n, (value, text)))
-        picks = [o for _, _, o in sorted(scored)]
-        if target.kind != "Snow Skiing":
-            # snowboarding / MOI may be offered as a level of the skiing course
-            picks += [o for o in real if o not in picks and kind_score(o[1], "Snow Skiing") > 0 and fits(o[1])]
-        # then anything not clearly another kind of course, in case the site names it unexpectedly
-        # (today the real form lists just "Adventure Courses"); the batch dates decide
-        exclude = KIND_PATTERNS[target.kind][1]
-        picks += [o for o in real if o not in picks and not re.search(exclude, norm(o[1])) and fits(o[1])]
+        picks.sort(key=lambda o: norm(target.course_text) not in norm(o[1]))
     if hint:
         picks.sort(key=lambda o: o[0] != hint)
     return picks
@@ -610,18 +610,17 @@ def course_candidates(options, target, hint=None):
 
 def match_level(options, target, loose):
     real = real_options(options)
-    if target.level_text:
-        hinted = [o for o in real if norm(target.level_text) in norm(o[1]) and level_score(o[1], target) >= 0]
-        pick = hinted[0] if len(hinted) == 1 else None
-    elif target.level:
-        pick = next((o for o in real if re.search(LEVEL_PATTERNS[target.level], norm(o[1]))), None)
+    if target.level:
+        picks = [o for o in real if re.search(LEVEL_PATTERNS[target.level], norm(o[1]))]
     else:
-        pick = next((o for o in real if kind_score(o[1], target.kind) > 0), None)
-        if pick is None and loose and real:
-            pick = real[0]  # e.g. the only level of the snowboarding course
-    if pick is None and not target.level_text and real and all(norm(t) in GENERIC_LEVELS for _, t in real):
-        pick = real[0]  # the course has no real levels, just "None"
-    return pick
+        picks = [o for o in real if kind_score(o[1], target.kind) > 0]
+        if not picks and loose:
+            picks = list(real)
+    if not picks and real and all(norm(t) in GENERIC_LEVELS for _, t in real):
+        picks = list(real)
+    if target.level_text:
+        picks.sort(key=lambda o: norm(target.level_text) not in norm(o[1]))
+    return picks[0] if picks else None
 
 
 def state_aliases(name):
@@ -630,22 +629,6 @@ def state_aliases(name):
 
 
 def match_batch(options, target):
-    if target.batch_text:
-        hinted = []
-        for value, text in real_options(options):
-            if norm(target.batch_text) not in norm(text):
-                continue
-            found = dates_in(text)
-            if found and not date_match(found, target.start):
-                continue
-            written_dates = re.findall(r"\d{1,4}[/\.\-]\d{1,2}[/\.\-]\d{2,4}|\b\d{1,2}(?:st|nd|rd|th)?[\s\-/.]*[A-Za-z]{3,9}", text)
-            if target.end and len(written_dates) >= 2 and not date_match(found, target.end):
-                continue
-            if location_score(text, target.location) < 0 or level_score(text, target) < 0:
-                continue
-            hinted.append((value, text))
-        return hinted[0] if len(hinted) == 1 else None
-
     best, best_score = None, 0
     for value, text in real_options(options):
         found = dates_in(text)
@@ -655,8 +638,12 @@ def match_batch(options, target):
         written_dates = re.findall(r"\d{1,4}[/.\-]\d{1,2}[/.\-]\d{2,4}|\b\d{1,2}(?:st|nd|rd|th)?[\s\-/.]*[A-Za-z]{3,9}", text)
         if target.end and len(written_dates) >= 2 and not date_match(found, target.end):
             continue
-        score = (10 * start + 5 * date_match(found, target.end) + location_score(text, target.location)
-                 + level_score(text, target))
+        location = location_score(text, target.location)
+        level = level_score(text, target)
+        if location < 0 or level < 0:
+            continue
+        score = (10 * start + 5 * date_match(found, target.end) + location + level
+                 + (100 if target.batch_text and norm(target.batch_text) in norm(text) else 0))
         if score > best_score:
             best, best_score = (value, text), score
     return best
@@ -1526,32 +1513,30 @@ class Http:
 
     @staticmethod
     def _set_read_timeout(response, timeout):
-        pending, seen = [response], set()
-        while pending:
-            value = pending.pop()
-            if value is None or id(value) in seen:
-                continue
-            seen.add(id(value))
-            if isinstance(value, socket.socket):
-                value.settimeout(timeout)
-                return
-            for name in ("fp", "raw", "_sock", "sock"):
-                child = getattr(value, name, None)
-                if child is not None:
-                    pending.append(child)
+        if not isinstance(response, http.client.HTTPResponse):
+            raise Transient(f"unsupported stdlib HTTP response type: {type(response).__name__}")
+        try:
+            response_socket = response.fp.raw._sock
+        except AttributeError as exc:
+            raise Transient("stdlib HTTP response is missing its required socket stream") from exc
+        if not isinstance(response_socket, socket.socket):
+            raise Transient("stdlib HTTP response has an invalid socket stream")
+        response_socket.settimeout(timeout)
 
     def _read_response(self, response, deadline):
+        if not isinstance(response, http.client.HTTPResponse):
+            raise Transient(f"unsupported stdlib HTTP response type: {type(response).__name__}")
+        if response.length == 0 or response.isclosed():
+            return b""
         chunks = []
-        read = getattr(response, "read1", None)
-        if read is None:
-            read = getattr(getattr(response, "fp", None), "read1", None)
-        read = read or response.read
         while True:
+            if response.length == 0 or response.isclosed():
+                return b"".join(chunks)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("response body deadline exceeded")
             self._set_read_timeout(response, remaining)
-            chunk = read(64 * 1024)
+            chunk = response.read1(64 * 1024)
             if not chunk:
                 return b"".join(chunks)
             chunks.append(chunk)
@@ -1578,12 +1563,12 @@ class Http:
                 response_headers = dict(resp.headers)
         except urllib.error.HTTPError as e:
             try:
-                raw = self._read_response(e, deadline)
+                raw = self._read_response(e.fp, deadline)
             except (http.client.HTTPException, OSError, TimeoutError):
                 raw = b""
-            status, final = e.code, e.geturl() or url
-            response_headers = dict(e.headers)
-            e.close()
+            finally:
+                e.close()
+            status, final, response_headers = e.code, e.geturl() or url, dict(e.headers)
         except urllib.error.URLError as e:
             if isinstance(e.reason, ssl.SSLCertVerificationError) and self.verified:
                 self.log.warn("The site's HTTPS certificate did not verify - continuing without verification")
@@ -1917,19 +1902,21 @@ class Session:
         if resp.name == FORM_PAGE:
             bot = self.bot
             meaningful = [m for m in msgs if not re.fullmatch(r"Your Age \d+ Years\.?", m, re.I)]
-            if meaningful:
-                if has_any(" ".join(meaningful).lower(), TEMPORARY_PHRASES):
-                    raise Uncertain(f"the final response was temporary and may have followed acceptance: {reason}")
-                wants_parent = has_any(" ".join(meaningful).lower(), ("parent", "guardian"))
-                if wants_parent and not bot.s.docs.get("parentSignature"):
-                    if sel.server_age is None:
-                        raise Rejected("the site requested a guardian signature, but its age response did not "
-                                       "establish that the applicant is an adult")
-                    if (not bot.parent_fallback and sel.server_age >= 18 and bot.s.docs.get("signature")
-                            and bot.opt.get("parentSignatureFallback")):
-                        bot.use_parent_fallback(reason)
-                        raise Resend("the site wants a parent/guardian signature - resending with the applicant's signature")
+            failed_validators = failed_validator_messages(resp.body)
+            wants_parent = has_any(" ".join(failed_validators).lower(), ("parent", "guardian"))
+            if wants_parent and not bot.s.docs.get("parentSignature"):
+                if sel.server_age is None:
+                    raise Rejected("the site requested a guardian signature, but its age response did not "
+                                   "establish that the applicant is an adult")
+                if (not bot.parent_fallback and sel.server_age >= 18 and bot.s.docs.get("signature")
+                        and bot.opt.get("parentSignatureFallback")):
+                    bot.use_parent_fallback(reason)
+                    raise Resend("the site wants a parent/guardian signature - resending with the applicant's signature")
+            if failed_validators:
                 raise Rejected(f"{reason} (page saved: {saved})")
+            if meaningful:
+                raise Uncertain(f"the final form returned an unverified message and may have accepted the application: "
+                                f"{reason}")
             raise Transient("the form came back without any message")
         raise Transient(f"unexpected page '{resp.name}' after submitting (saved: {saved})")
 

@@ -353,6 +353,44 @@ class Resilience(unittest.TestCase):
             client.get("/")
         self.assertLess(time.monotonic() - started, 0.8)
 
+    def test_stdlib_empty_and_http_error_bodies_use_one_response_contract(self):
+        class EmptyBodies(BaseHTTPRequestHandler):
+            def do_GET(self):
+                status = 429 if self.path == "/error" else 204
+                self.send_response(status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), EmptyBodies)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = bot.Http(f"http://127.0.0.1:{server.server_port}", 1, bot.Log(echo=False))
+        empty = client.get("/empty")
+        error = client.get("/error")
+        self.assertEqual((empty.status, empty.body), (204, ""))
+        self.assertEqual((error.status, error.body), (429, ""))
+
+    def test_unsupported_response_interface_fails_clearly(self):
+        class UnsupportedResponse:
+            status = 200
+            headers = {}
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def geturl(self):
+                return "http://127.0.0.1:9/"
+        class UnsupportedOpener:
+            def open(self, request, timeout):
+                return UnsupportedResponse()
+        client = bot.Http("http://127.0.0.1:9", 1, bot.Log(echo=False))
+        client.opener = UnsupportedOpener()
+        with self.assertRaisesRegex(bot.Transient, "unsupported stdlib HTTP response type"):
+            client.get("/")
+
     def test_error_or_negative_success_page_is_not_a_confirmation(self):
         instance = offline_bot()
         session = bot.Session(instance, PHONES[0], "")

@@ -150,11 +150,14 @@ class Matching(unittest.TestCase):
         batches = bot.load_season({}, Path("."))[0]
         advanced = bot.parse_priority({"batch": "G2", "course": "Snow Skiing", "level": "Advance",
                                        "levelText": "Basic SSC", "batchText": "Course"}, 0, batches)
-        self.assertIsNone(bot.match_level([("13", "Basic SSC"), ("15", "Advance SSC")], advanced, loose=True))
+        self.assertEqual(bot.match_level([("13", "Basic SSC"), ("15", "Advance SSC")],
+                                         advanced, loose=True)[0], "15")
         options = [("71", "Course from 20 Dec 2026 to 02 Jan 2027"),
                    ("72", "Course from 03 Jan 2027 to 16 Jan 2027")]
         self.assertEqual(bot.match_batch(options, advanced)[0], "72")
         self.assertIsNone(bot.match_batch([("1", "Course A"), ("2", "Course B")], advanced))
+        self.assertIsNone(bot.match_batch(
+            [("72", "Course at Kargil from 03 Jan 2027 to 16 Jan 2027")], advanced))
 
         wrong_course = bot.parse_priority({"batch": "G2", "course": "Snow Skiing", "level": "Advance",
                                            "courseText": "Basic Course"}, 0, batches)
@@ -735,7 +738,7 @@ class EndToEnd(unittest.TestCase):
             if batch and batch[0] == rejected_batch:
                 rejections.append(mobile)
                 values["lblMsg"] = ("Please Enter Name.", "Red")
-                return handler.send(200, handler.form(mobile, values, listed))
+                return handler.send(200, handler.form(mobile, values, listed, invalid=["rfvtxtName"]))
             return original(handler, mobile, values, files, listed, course, level, batch)
 
         with mock.patch.object(mock_site.Handler, "submit", reject_local_data):
@@ -767,6 +770,36 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(len(temporary), 1)
         self.assertEqual(len(self.site.applications), 1)
         self.assertNotIn(PHONES[1], self.site.used)
+
+    def test_unknown_error_form_stays_pending_across_restart(self):
+        attempts = []
+
+        def commit_then_error(handler, mobile, values, files, listed, course, level, batch):
+            attempts.append(mobile)
+            site = handler.site
+            key = (values["ddlCourse"], values["ddlCourseLevel"], values["ddlScheduleCourse"])
+            with site.lock:
+                site.seats[key] -= 1
+                site.used.add(mobile)
+                site.applications.append({"mobile": mobile, "course": key[0], "level": key[1],
+                                          "schedule": key[2], "files": [], "fileHashes": {}})
+            values["lblMsg"] = ("Unexpected error while processing request", "Red")
+            return handler.send(200, handler.form(mobile, values, listed))
+
+        with mock.patch.object(mock_site.Handler, "submit", commit_then_error):
+            first = self.run_with(PHONES[:2], ["G2 Basic"], timeout=0.6,
+                                  confirmation_handler=lambda *args: None)
+        self.assertEqual(first.bookings, [])
+        self.assertEqual(first.pending, {PHONES[0]: bot.target_key(first.targets[0])})
+        self.assertEqual(attempts, [PHONES[0]])
+        self.assertEqual(len(self.site.applications), 1)
+        self.assertNotIn(PHONES[1], self.site.used)
+
+        requests = self.site.requests
+        resumed = self.run_with(PHONES[:2], ["G2 Basic"], confirmation_handler=lambda *args: "booked")
+        self.assertEqual(self.booked(resumed), [("G2 Basic", PHONES[0], "user-confirmed")])
+        self.assertEqual(self.site.requests, requests)
+        self.assertEqual(len(self.site.applications), 1)
 
     def test_repeated_viewstate_failures_restart_from_mobile_and_grow_backoff(self):
         original = mock_site.Handler.post_form
@@ -845,6 +878,24 @@ class EndToEnd(unittest.TestCase):
         instance = self.run_with(PHONES[:1], ["G2 Basic"])
         self.assertTrue(instance.finished())
         self.assertEqual(self.site.applications[0]["level"], "13")
+
+    def test_stale_text_hints_rank_but_never_block_semantic_match(self):
+        course_id, level_id, batch_id = self.key("G2")
+        course = dict(self.site.courses[course_id])
+        course["name"] = "Gulmarg Winter Training"
+        course["levels"] = [(level_id, "Basic SSC")]
+        course["batches"] = [
+            (value, "Winter session 03 Jan 2027 through 16 Jan 2027", start, location)
+            if value == batch_id else (value, text, start, location)
+            for value, text, start, location in course["batches"]]
+        self.site.courses[course_id] = course
+        priority = {"batch": "G2", "course": "Snow Skiing", "level": "Basic",
+                    "courseText": "Snow Skiing Courses at Gulmarg",
+                    "levelText": "Beginner Level", "batchText": "Old G2 January Batch"}
+        instance = self.run_with(PHONES[:1], [priority])
+        self.assertTrue(instance.finished())
+        self.assertEqual((self.site.applications[0]["course"], self.site.applications[0]["level"],
+                          self.site.applications[0]["schedule"]), (course_id, level_id, batch_id))
 
     def test_resume_preserves_bookings_when_another_preference_is_added(self):
         self.run_with(PHONES[:2], ["G2 Basic"])
