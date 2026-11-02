@@ -97,12 +97,74 @@ class Resilience(unittest.TestCase):
         _, files = mock_site.parse_multipart(payload.body(), payload.content_type())
         self.assertEqual(files["FupPhototOfApplicant"][1], expected)
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission contract")
+    def test_generated_private_artifacts_do_not_change_source_document_modes(self):
+        site, url = self.local_site()
+        cfg = make_config(self.root, PHONES[:1], ["G2 Basic"])
+        sources = list((self.root / "docs").iterdir())
+        for source in sources:
+            source.chmod(0o644)
+        previous_umask = os.umask(0o022)
+        try:
+            out = self.root / "private-run"
+            instance = run_bot(cfg, url, out, timeout=4)
+        finally:
+            os.umask(previous_umask)
+        self.assertTrue(instance.finished())
+        self.assertEqual(out.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((out / "bot.log").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((out / "state.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((out / "state.lock").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((out / "responses").stat().st_mode & 0o777, 0o700)
+        for response in (out / "responses").iterdir():
+            self.assertEqual(response.stat().st_mode & 0o777, 0o600)
+        self.assertTrue(all(source.stat().st_mode & 0o777 == 0o644 for source in sources))
+
+        settings = bot.parse_settings(cfg, None)[0]
+        source = self.root / "docs" / "convert.pdf"
+        source.write_bytes(b"source document")
+        source.chmod(0o644)
+        settings.doc_sources["photo"] = source
+
+        def converted(src, dst):
+            dst.write_bytes(b"\xff\xd8\xff" + b"converted")
+            return dst
+
+        previous_umask = os.umask(0o022)
+        try:
+            with mock.patch.object(bot, "can_convert", return_value=True), \
+                    mock.patch.object(bot, "convert_to_jpeg", side_effect=converted):
+                problems, _ = bot.prepare_documents(settings, self.root / "converted-run")
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(problems, [])
+        converted_path = next((self.root / "converted-run" / "upload-ready").glob("photo-*.jpg"))
+        self.assertEqual((self.root / "converted-run").stat().st_mode & 0o777, 0o700)
+        self.assertEqual(converted_path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(converted_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(source.stat().st_mode & 0o777, 0o644)
+
     def test_corrupt_progress_is_preserved_and_rejected(self):
         path = self.root / "state.json"
         path.write_text("{broken")
         with self.assertRaises(bot.ConfigError):
             bot.State(path, True)
         self.assertEqual(path.read_text(), "{broken")
+
+    def test_duplicate_json_keys_fail_closed_without_changing_progress(self):
+        config = self.root / "duplicate.jsonc"
+        config.write_text('{"applicant": {"name": "First", "name": "Second"}}')
+        with self.assertRaisesRegex(bot.ConfigError, "duplicate JSON object key 'name'"):
+            bot.load_jsonc(config)
+
+        state = self.root / "duplicate-state.json"
+        state.write_text(
+            '{"version":2,"targetKeyVersion":1,"identity":"test","bookings":[],'
+            '"phones":{"9000000011":{"status":"used","note":"used"}},"phones":{},"assignments":{}}')
+        preserved = state.read_bytes()
+        with self.assertRaisesRegex(bot.ConfigError, "duplicate JSON object key 'phones'"):
+            bot.State(state, True)
+        self.assertEqual(state.read_bytes(), preserved)
 
     def test_target_identity_is_canonical_for_harmless_casing(self):
         batches = bot.load_season({}, self.root)[0]
@@ -217,6 +279,26 @@ class Resilience(unittest.TestCase):
             instance = run_bot(cfg, url, self.root / "out", timeout=4)
         self.assertEqual(site.applications, [])
         self.assertTrue(instance.failures)
+
+    def test_mark_submitting_updates_phone_status_only_after_durable_save(self):
+        settings = bot.parse_settings(make_config(self.root, PHONES[:1], ["G2 Basic"]), None)[0]
+        instance = bot.Bot(settings, self.root / "mark-state", base_url="http://127.0.0.1:9",
+                           log=bot.Log(echo=False))
+        instance.state.acquire()
+        try:
+            instance._restore()
+            phone = instance.assign_phone(instance.targets[0])
+            with mock.patch.object(instance.state, "save", side_effect=bot.ConfigError("disk full")):
+                with self.assertRaises(bot.ConfigError):
+                    instance.mark_submitting(phone, instance.targets[0])
+            self.assertEqual(instance.phone_state[phone], "free")
+            self.assertNotIn(phone, instance.pending)
+            self.assertNotIn(phone, instance.state.data["phones"])
+            instance.mark_submitting(phone, instance.targets[0])
+            self.assertEqual(instance.phone_state[phone], "submitting")
+            self.assertEqual(instance.pending[phone], bot.target_key(instance.targets[0]))
+        finally:
+            instance.state.release()
 
     def test_unexpected_worker_failure_stops_polling_siblings(self):
         settings = bot.parse_settings(
@@ -544,6 +626,77 @@ class Resilience(unittest.TestCase):
         self.assertTrue(instance.finished())
         self.assertEqual(site.applications[0]["mobile"], PHONES[0])
 
+    def test_429_already_used_reply_retires_primary_for_reserve(self):
+        site, url = self.local_site()
+        original_submit = mock_site.Handler.submit
+
+        def used_primary(handler, mobile, values, files, listed, course, level, batch):
+            if mobile == PHONES[0]:
+                values["lblMsg"] = ("This Mobile No. is already registered.", "Red")
+                return handler.send(429, handler.form(mobile, values, listed))
+            return original_submit(handler, mobile, values, files, listed, course, level, batch)
+
+        with mock.patch.object(mock_site.Handler, "submit", used_primary):
+            instance = run_bot(make_config(self.root, PHONES[:2], ["G2 Basic"]), url,
+                               self.root / "used-429", timeout=5)
+        self.assertTrue(instance.finished())
+        self.assertEqual(instance.bookings[0]["phone"], PHONES[1])
+        self.assertEqual(site.applications[0]["mobile"], PHONES[1])
+
+    def test_truncated_http_error_body_is_not_a_safe_rate_limit(self):
+        partial = (b'<form action="admission_form.aspx"><input name="__VIEWSTATE" value="a">'
+                   b'<span id="lblMsg">Admission Form submitted successfully.</span>')
+
+        class Truncated429(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(429)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(partial) + 200))
+                self.end_headers()
+                self.wfile.write(partial)
+                self.wfile.flush()
+                time.sleep(0.5)
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Truncated429)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}"
+        client = bot.Http(url, 0.15, bot.Log(echo=False))
+        page = client.send("POST", url + "/admission_form.aspx", b"x")
+        self.assertEqual(page.status, 429)
+        self.assertFalse(page.complete)
+        instance = offline_bot()
+        session = bot.Session(instance, PHONES[0], "")
+        session.http = client
+        with self.assertRaises(bot.Uncertain):
+            session.judge_submit(page, instance.targets[0], None, None, set())
+
+        settings = bot.parse_settings(make_config(self.root, PHONES[:1], ["G2 Basic"]), None)[0]
+        settings.opt["submitTimeoutSec"] = 0.15
+        owner = bot.Bot(settings, self.root / "truncated-submit", base_url=url, log=bot.Log(echo=False))
+        owner.state.acquire()
+        try:
+            owner._restore()
+            phone = owner.assign_phone(owner.targets[0])
+            request_page = bot.Page(
+                url + "/admission_form.aspx", 200,
+                '<form action="/admission_form.aspx"><input name="__VIEWSTATE" value="a"></form>')
+            selection = type("PreparedSelection", (), {"page": request_page})()
+            final_session = bot.Session(owner, phone, "")
+            with self.assertRaises(bot.Uncertain):
+                final_session.submit(owner.targets[0], selection, {}, {})
+            self.assertEqual(owner.phone_state[phone], "submitting")
+            self.assertEqual(owner.pending[phone], bot.target_key(owner.targets[0]))
+            saved = bot.strict_json_loads(owner.state.path.read_text())
+            self.assertEqual(saved["phones"][phone]["status"], "submitting")
+        finally:
+            owner.state.release()
+
     def test_foreign_form_destination_is_blocked_before_sending(self):
         instance = offline_bot()
         session = bot.Session(instance, PHONES[0], "")
@@ -772,6 +925,24 @@ class Resilience(unittest.TestCase):
                 body = ('<form action="admission_form.aspx"><input name="__VIEWSTATE" value="a">'
                         f'<span id="lblMsg">{message}</span></form>')
                 page = bot.Page("http://127.0.0.1:9/admission_form.aspx", 200, body)
+                with self.assertRaises(error):
+                    session.judge_submit(page, instance.targets[0], None, None, set())
+
+        decisive = {
+            "429-used": (429, '<span id="lblMsg">This Mobile No. is already registered.</span>', bot.PhoneUsed),
+            "429-full": (429, '<span id="lblMsg">Seat not available.</span>', bot.TargetFull),
+            "429-closed": (429, '<span id="lblMsg">Registration is closed.</span>', bot.NotOpen),
+            "429-validator": (429, '<script>rfvtxtName.errormessage = "Please Enter Name.";'
+                                     'rfvtxtName.isvalid = "False";</script>', bot.Rejected),
+            "500-validator": (500, '<script>rfvtxtName.errormessage = "Please Enter Name.";'
+                                     'rfvtxtName.isvalid = "False";</script>', bot.Rejected),
+        }
+        for name, (status, evidence, error) in decisive.items():
+            with self.subTest(decisive=name):
+                session.static = {}
+                body = ('<form action="admission_form.aspx"><input name="__VIEWSTATE" value="a">'
+                        f'{evidence}</form>')
+                page = bot.Page("http://127.0.0.1:9/admission_form.aspx", status, body)
                 with self.assertRaises(error):
                     session.judge_submit(page, instance.targets[0], None, None, set())
 

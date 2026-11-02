@@ -99,6 +99,32 @@ BOT_NUMBER_MINIMUMS = {
     "statusEverySec": (0, False),
 }
 
+
+def private_dir(path):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        path.chmod(0o700)
+    return path
+
+
+def private_file(path):
+    path = Path(path)
+    if os.name != "nt":
+        path.chmod(0o600)
+    return path
+
+
+def private_descriptor(path, flags):
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
 CONFIG_ROOT_KEYS = {
     "applicant", "address", "phoneNumbers", "coursePriorities",
     "bookingOpensAt", "scheduleFile", "batches", "documentsDir", "documents", "bot",
@@ -804,6 +830,19 @@ def match_choice(options, wanted, aliases=()):
 # Config
 # ---------------------------------------------------------------------------
 
+def unique_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        value[key] = item
+    return value
+
+
+def strict_json_loads(text):
+    return json.loads(text, object_pairs_hook=unique_json_object)
+
+
 def load_jsonc(path):
     """JSON that may contain // and /* */ comments and trailing commas."""
     text = Path(path).read_text(encoding="utf-8-sig")
@@ -854,9 +893,11 @@ def load_jsonc(path):
         result.append(c)
         i += 1
     try:
-        return json.loads("".join(result))
+        return strict_json_loads("".join(result))
     except json.JSONDecodeError as e:
         raise ConfigError(f"{path}: {e.msg} at line {e.lineno}, column {e.colno}")
+    except ValueError as e:
+        raise ConfigError(f"{path}: {e}")
 
 
 def find_placeholders(obj, where=""):
@@ -1266,7 +1307,7 @@ def image_size(path):
 
 def convert_to_jpeg(src, dst):
     """macOS only: first page of a PDF / any image -> JPEG under CONVERTED_MAX_BYTES."""
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    private_dir(dst.parent)
     with tempfile.TemporaryDirectory() as tmp:
         image = src
         if src.suffix.lower() == ".pdf" and shutil.which("qlmanage"):
@@ -1325,12 +1366,17 @@ def prepare_documents(settings, out_dir):
         dst = out_dir / "upload-ready" / f"{key}-{preparation_id}.jpg"
         pending = out_dir / "upload-ready" / f".{key}-{preparation_id}.jpg.tmp"
         try:
+            private_dir(out_dir)
+            private_dir(dst.parent)
             convert_to_jpeg(src, pending)
+            private_file(pending)
             os.replace(pending, dst)
+            private_file(dst)
         except ConfigError as e:
             problems.append(f"documents.{key}: {e}")
             continue
         except (OSError, subprocess.SubprocessError) as e:
+            dst.unlink(missing_ok=True)
             problems.append(f"documents.{key}: converting {src.name} failed: {e}")
             continue
         finally:
@@ -1370,8 +1416,9 @@ class Log:
         self.lock = threading.Lock()
 
     def open(self, path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = open(path, "a", encoding="utf-8")
+        private_dir(path.parent)
+        descriptor = private_descriptor(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        self.file = os.fdopen(descriptor, "a", encoding="utf-8")
 
     def write(self, level, msg):
         stamp = datetime.now()
@@ -1487,10 +1534,11 @@ class FormParser(HTMLParser):
 class Page:
     """A fetched page plus the controls of its <form>."""
 
-    def __init__(self, url, status, body, fresh=True, headers=None, redirects=()):
+    def __init__(self, url, status, body, fresh=True, headers=None, redirects=(), complete=True):
         self.url, self.status, self.body = url, status, body
         self.headers = {key.lower(): value for key, value in (headers or {}).items()}
         self.redirects = tuple(redirects)
+        self.complete = complete
         self.fresh = fresh  # loaded by GET or redirect, i.e. not the echo of our own postback
         parser = FormParser()
         try:
@@ -1831,6 +1879,7 @@ class Http:
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         previous_on_write, self._on_write = self._on_write, on_start
         previous_deadline, self._deadline = self._deadline, deadline
+        complete = True
         try:
             with self.opener.open(request, timeout=timeout) as resp:
                 raw, status, final = self._read_response(resp, deadline), resp.status, resp.geturl()
@@ -1840,6 +1889,7 @@ class Http:
                 raw = self._read_response(e.fp, deadline)
             except (http.client.HTTPException, OSError, TimeoutError):
                 raw = b""
+                complete = False
             finally:
                 e.close()
             status, final, response_headers = e.code, e.geturl() or url, dict(e.headers)
@@ -1864,7 +1914,7 @@ class Http:
         fresh = method == "GET" or bool(redirects)
         self.check_destination(final)
         return Page(final, status, raw.decode("utf-8", errors="replace"), fresh=fresh,
-                    headers=response_headers, redirects=redirects)
+                    headers=response_headers, redirects=redirects, complete=complete)
 
 
 # ---------------------------------------------------------------------------
@@ -2260,6 +2310,8 @@ class Session:
 
     def judge_submit(self, resp, target, sel, saved, sent_files):
         self.http.check_destination(resp.url)
+        if not resp.complete:
+            raise Uncertain("the final HTTP error response ended before its body could be verified")
         parsed = urllib.parse.urlparse(resp.url)
         query = {k.lower(): v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
         msgs = self.msgs(resp) if resp.is_aspx else server_messages(resp.body)
@@ -2300,24 +2352,14 @@ class Session:
             raise Uncertain(f"the final POST redirected, but its receipt did not confirm the application "
                             f"(HTTP {resp.status}, page '{resp.name}')")
         reason = "; ".join(msgs[:4])
-        if resp.status == 429:
-            raise RateLimited("submit was rate limited: HTTP 429", response_retry_after(resp))
         if phone_used:
             raise PhoneUsed(reason)
         if full:
             raise TargetFull(f"site says: {reason}")
         if closed:
             raise NotOpen(f"site says: {reason}")
-        if resp.status >= 400 or not resp.is_aspx:
-            if has_any(resp.body.lower(), VIEWSTATE_ERRORS):
-                raise SessionLost("the site rejected our page state on submit")
-            title = resp.title()
-            raise Transient(f"submit failed: HTTP {resp.status}" + (f" ({title[:80]})" if title else ""))
-        if resp.name in (INSTRUCTIONS_PAGE, CRITERIA_PAGE):
-            raise Transient("the site sent us back to the start after submitting; outcome unknown")
-        if resp.name == FORM_PAGE:
+        if failed_validators:
             bot = self.bot
-            meaningful = [m for m in msgs if not re.fullmatch(r"Your Age \d+ Years\.?", m, re.I)]
             wants_parent = has_any(" ".join(failed_validators).lower(), ("parent", "guardian"))
             if wants_parent:
                 if sel.server_age is None:
@@ -2332,8 +2374,18 @@ class Session:
                         and bot.opt.get("parentSignatureFallback")):
                     bot.use_parent_fallback(reason)
                     raise Resend("the site wants a parent/guardian signature - resending with the applicant's signature")
-            if failed_validators:
-                raise Rejected(f"{reason} (page saved: {saved})")
+            raise Rejected(f"{reason} (page saved: {saved})")
+        if resp.status == 429:
+            raise RateLimited("submit was rate limited: HTTP 429", response_retry_after(resp))
+        if resp.status >= 400 or not resp.is_aspx:
+            if has_any(resp.body.lower(), VIEWSTATE_ERRORS):
+                raise SessionLost("the site rejected our page state on submit")
+            title = resp.title()
+            raise Transient(f"submit failed: HTTP {resp.status}" + (f" ({title[:80]})" if title else ""))
+        if resp.name in (INSTRUCTIONS_PAGE, CRITERIA_PAGE):
+            raise Transient("the site sent us back to the start after submitting; outcome unknown")
+        if resp.name == FORM_PAGE:
+            meaningful = [m for m in msgs if not re.fullmatch(r"Your Age \d+ Years\.?", m, re.I)]
             if meaningful:
                 raise Uncertain(f"the final form returned an unverified message and may have accepted the application: "
                                 f"{reason}")
@@ -2472,7 +2524,7 @@ class State:
         if not self.enabled or not self.path.exists():
             return
         try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
+            value = strict_json_loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(value, dict):
                 raise ValueError("invalid progress root")
             if (type(value.get("version")) is not int or value["version"] != STATE_VERSION
@@ -2538,8 +2590,10 @@ class State:
     def acquire(self):
         if not self.enabled or self.lease is not None:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(self.path.with_suffix(".lock"), "a+b")
+        private_dir(self.path.parent)
+        lock_path = self.path.with_suffix(".lock")
+        descriptor = private_descriptor(lock_path, os.O_RDWR | os.O_CREAT | os.O_APPEND)
+        handle = os.fdopen(descriptor, "a+b")
         try:
             if os.name == "nt":
                 import msvcrt
@@ -2557,6 +2611,8 @@ class State:
         self.lease = handle
         try:
             self.reload()
+            if self.path.exists():
+                private_file(self.path)
             if self.identity is not None:
                 self.bind(self.identity)
         except Exception:
@@ -2582,6 +2638,7 @@ class State:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
+            private_file(self.path)
             if os.name != "nt":
                 fd = os.open(str(self.path.parent), os.O_RDONLY)
                 try:
@@ -2715,8 +2772,10 @@ class Bot:
         name = re.sub(r"[^A-Za-z0-9.-]+", "_", f"{datetime.now():%Y%m%d-%H%M%S}-{who}-{tag}")
         path = folder / f"{name}-{uuid.uuid4().hex}.html"
         try:
-            folder.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"<!-- {page.status} {page.url} -->\n{page.body}", encoding="utf-8")
+            private_dir(folder)
+            descriptor = private_descriptor(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(f"<!-- {page.status} {page.url} -->\n{page.body}")
         except OSError:
             return None
         return path
@@ -2770,10 +2829,15 @@ class Bot:
             key = target_key(target)
             if self.assignments.get(key) != phone or self.owners.get(phone) != key:
                 raise ConfigError("Cannot submit without an exclusive saved phone assignment.")
-            self.pending[phone] = key
             self.state.data["phones"][phone] = {"status": "submitting", "targetKey": key,
                                                  "target": target.label, "at": now_ist().isoformat()}
-            self.state.save()
+            try:
+                self.state.save()
+            except Exception:
+                del self.state.data["phones"][phone]
+                raise
+            self.pending[phone] = key
+            self.phone_state[phone] = "submitting"
 
     def clear_submitting(self, phone):
         with self.lock:

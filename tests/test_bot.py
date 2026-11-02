@@ -695,7 +695,7 @@ class EndToEnd(unittest.TestCase):
 
                 def record_courses(handler, session, query, values, files):
                     if values.get("__EVENTTARGET") == "ddlCourse":
-                        attempted.append(values.get("ddlCourse"))
+                        attempted.append((values.get("ddlCourse"), handler.sid))
                     return original_post(handler, session, query, values, files)
 
                 cfg = make_config(self.tmp, PHONES[:1], [priority])
@@ -715,8 +715,15 @@ class EndToEnd(unittest.TestCase):
                         finally:
                             guard.cancel()
                 self.assertTrue(instance.finished())
-                self.assertEqual(attempted[:2], [full_id, original_id])
+                full_sessions = {sid for course, sid in attempted if course == full_id}
+                available_sessions = {sid for course, sid in attempted if course == original_id}
+                first_full_session = next(sid for course, sid in attempted if course == full_id)
+                self.assertGreaterEqual(len(full_sessions), 2)
+                self.assertTrue(any(sid != first_full_session for sid in available_sessions))
+                self.assertEqual(len(self.site.applications), 1)
                 self.assertEqual(self.site.applications[0]["course"], original_id)
+                self.assertEqual(self.site.applications[0]["mobile"], PHONES[0])
+                self.assertFalse(any(application["course"] == full_id for application in self.site.applications))
 
     def test_full_first_compatible_level_continues_to_later_level(self):
         if self.layout != "levels":

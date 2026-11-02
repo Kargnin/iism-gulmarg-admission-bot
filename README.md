@@ -12,10 +12,12 @@ Install Git and Python 3.8+ first if they are not available. The commands below 
 git clone https://github.com/Kargnin/iism-gulmarg-admission-bot.git
 cd iism-gulmarg-admission-bot
 mkdir -p configs
+chmod 700 configs
 cp config.example.jsonc configs/me.jsonc
+chmod 600 configs/me.jsonc
 ```
 
-Keep `iism-bot.py`, `schedule.json`, and `form-rules.json` together. `configs/`, `documents/`, and `runs/` are ignored by Git; keep personal files there or in your own local document folder. Never commit them.
+Keep `iism-bot.py`, `schedule.json`, and `form-rules.json` together. `configs/`, `documents/`, and `runs/` are ignored by Git; keep personal files there or in your own local document folder. Never commit them. On macOS/Linux, keep each personal config at mode `600` and its containing directory at `700`; bot-owned run artifacts are created with the same owner-only policy.
 
 ## 2. Fill your details and choose batches
 
