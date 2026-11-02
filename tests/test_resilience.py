@@ -1057,6 +1057,50 @@ class Resilience(unittest.TestCase):
                 with self.assertRaises(bot.Transient):
                     session.judge_submit(page, instance.targets[0], None, None, set())
 
+    def test_negated_future_and_conditional_submission_prose_is_uncertain(self):
+        instance = offline_bot()
+        session = bot.Session(instance, PHONES[0], "")
+        messages = (
+            "Application wasn't submitted successfully",
+            "Application wasn’t submitted successfully",
+            "Application hasn't under any circumstances been submitted successfully",
+            "Nothing has been submitted",
+            "No application has been submitted",
+            "Application will be submitted successfully after payment",
+            "If the application is submitted successfully, you will receive a payment link",
+            "When your application has been submitted successfully, payment details will appear",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                session.static = {}
+                page = bot.Page(
+                    "http://127.0.0.1:9/admission_form.aspx", 200,
+                    '<form action="admission_form.aspx"><input name="__VIEWSTATE" value="a">'
+                    f'<span id="lblMsg">{message}</span></form>')
+                with self.assertRaises(bot.Uncertain):
+                    session.judge_submit(page, instance.targets[0], None, None, set())
+
+    def test_future_submission_prose_requires_feedback_before_persisting_completion(self):
+        site, url = self.local_site()
+        site.success_receipt = (
+            200,
+            '<form action="AdmissionFormSuccess.aspx"><input name="__VIEWSTATE" value="a">'
+            '<span id="lblMsg">Application will be submitted successfully after payment.</span></form>',
+            {},
+        )
+        answers = []
+        out = self.root / "future-outcome"
+        instance = run_bot(make_config(self.root, PHONES[:2], ["G2 Basic"]), url, out, timeout=4,
+                           confirmation_handler=lambda *args: answers.append("booked") or "booked")
+        saved = bot.strict_json_loads((out / "state.json").read_text())
+        self.assertTrue(instance.finished())
+        self.assertEqual(answers, ["booked"])
+        self.assertEqual(instance.bookings[0]["status"], "user-confirmed")
+        self.assertEqual(saved["bookings"][0]["status"], "user-confirmed")
+        self.assertEqual(len(site.applications), 1)
+        self.assertEqual(site.applications[0]["mobile"], PHONES[0])
+        self.assertNotIn(PHONES[1], site.used)
+
     def test_success_mixed_with_decisive_negative_evidence_is_uncertain(self):
         instance = offline_bot()
         session = bot.Session(instance, PHONES[0], "")
@@ -1074,6 +1118,7 @@ class Resilience(unittest.TestCase):
             "rejected-clause": (200, '<span id="lblerrorMsg">The application was rejected.</span>'),
             "invalid-clause": (200, '<span id="lblerrorMsg">The application contains invalid data.</span>'),
             "not-accepted-clause": (200, '<span id="lblerrorMsg">The application was not accepted.</span>'),
+            "contracted-negative": (200, '<span id="lblerrorMsg">The application wasn’t accepted.</span>'),
         }
         for name, (status, evidence) in cases.items():
             with self.subTest(name=name):

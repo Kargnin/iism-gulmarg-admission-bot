@@ -198,6 +198,27 @@ OUTCOME_NEGATIVE_PHRASES = [
     "not successfully", "unsuccessful", "not submitted", "failed", "failure", "could not", "error",
     "invalid", "reject", "not accepted", "declined", "unable",
 ]
+OUTCOME_CONTRACTIONS = (
+    ("ain't", "is not"), ("aren't", "are not"), ("can't", "cannot"), ("couldn't", "could not"),
+    ("didn't", "did not"), ("doesn't", "does not"), ("don't", "do not"), ("hadn't", "had not"),
+    ("hasn't", "has not"), ("haven't", "have not"), ("isn't", "is not"), ("shouldn't", "should not"),
+    ("wasn't", "was not"), ("weren't", "were not"), ("won't", "will not"),
+    ("wouldn't", "would not"),
+)
+AFFIRMATIVE_OUTCOME_PATTERNS = (
+    r"\b(?:(?:the|your)\s+)?(?:admission\s+form|application|form)\s+"
+    r"(?:(?:has|have)\s+been\s+|was\s+)?submitted\s+successfully\b",
+    r"\b(?:(?:the|your)\s+)?(?:admission\s+form|application|form)\s+"
+    r"(?:(?:has|have)\s+been\s+|was\s+)?successfully\s+submitted\b",
+    r"\b(?:(?:the|your)\s+)?(?:admission\s+form|application|form)\s+(?:has|have)\s+been\s+submitted\b",
+    r"\b(?:(?:the|your)\s+)?(?:admission\s+form|application|form)\s+submitted\b",
+    r"\b(?:(?:the|your)\s+)?(?:application|form|registration)\s+"
+    r"(?:(?:has|have)\s+been\s+|was\s+)?(?:registered|saved)\s+successfully\b",
+    r"\b(?:(?:the|your)\s+)?(?:application|form|registration)\s+"
+    r"(?:(?:has|have)\s+been\s+|was\s+)?successfully\s+(?:registered|saved)\b",
+    r"^\s*(?:submitted\s+successfully|successfully\s+submitted|registered\s+successfully|"
+    r"successfully\s+registered|saved\s+successfully|successfully\s+saved)\b",
+)
 AGE_PHRASES = ["age allow", "not eligible", "age should", "age must", "age limit", "invalid date"]
 
 # Words in the site's (or our own) message -> what in the config to look at. Most specific first.
@@ -1808,18 +1829,40 @@ def response_retry_after(page):
     return max(0.0, seconds) if math.isfinite(seconds) else None
 
 
-def affirmative_success(text):
-    clauses = re.split(r"(?:[.!?;]+|\s+\|\s+|\r?\n+)", text)
-    for clause in clauses:
+def normalize_outcome_text(text):
+    normalized = str(text or "").lower().replace("’", "'").replace("‘", "'")
+    for contraction, expanded in OUTCOME_CONTRACTIONS:
+        normalized = re.sub(rf"\b{re.escape(contraction)}\b", expanded, normalized)
+    return " ".join(normalized.split())
+
+
+def outcome_clauses(text):
+    return re.split(r"(?:[.!?;]+|\s+\|\s+|\r?\n+)", normalize_outcome_text(text))
+
+
+def outcome_negative(text):
+    for clause in outcome_clauses(text):
         if has_any(clause, OUTCOME_NEGATIVE_PHRASES):
+            return True
+        if re.search(r"\b(?:no|not|never|nothing|none|neither)\b[^.!?;|]*"
+                     r"\b(?:submit|accept|register|save|receiv)\w*\b", clause):
+            return True
+    return False
+
+
+def affirmative_success(text):
+    clauses = outcome_clauses(text)
+    for clause in clauses:
+        if outcome_negative(clause):
             continue
-        for phrase in SUCCESS_PHRASES:
-            for match in re.finditer(re.escape(phrase), clause):
-                if match.start() and clause[match.start() - 1].isalnum():
-                    continue
-                if re.search(r"\b(?:no|not|never)\b", clause[:match.start()]):
-                    continue
-                return phrase
+        for pattern in AFFIRMATIVE_OUTCOME_PATTERNS:
+            match = re.search(pattern, clause)
+            if match is None:
+                continue
+            if re.search(r"\b(?:if|unless|when|whenever|once|after|before|until|should|would|could|may|"
+                         r"might|will|shall|can)\b", clause[:match.start()]):
+                continue
+            return match.group(0)
     return None
 
 
@@ -2039,7 +2082,8 @@ class Session:
         if page.fresh and page.name not in self.static:
             verdicts = (PHONE_USED_PHRASES + FULL_PHRASES + CLOSED_PHRASES + SUCCESS_PHRASES
                         + OUTCOME_NEGATIVE_PHRASES)
-            self.static[page.name] = {m for m in found if not has_any(m.lower(), verdicts)}
+            self.static[page.name] = {m for m in found
+                                      if not has_any(m.lower(), verdicts) and not outcome_negative(m)}
         return [m for m in found if m not in self.static.get(page.name, ())]
 
     def verdict(self, page, deep=False, full_ok=True):
@@ -2379,7 +2423,7 @@ class Session:
         hidden_id = resp.value("hdfAdmissionFormId") or ""
         payment_receipt = (actual_page == "admission_formpayment.aspx" and query.get("rid")
                            and hidden_id == query["rid"] and hidden_id != "0")
-        negative = has_any(said + " | " + text, OUTCOME_NEGATIVE_PHRASES)
+        negative = outcome_negative(said + " | " + text)
         message_success = next((affirmative_success(message.lower()) for message in msgs
                                 if affirmative_success(message.lower())), None)
         page_success = affirmative_success(text) if actual_page == "admissionformsuccess.aspx" else None
