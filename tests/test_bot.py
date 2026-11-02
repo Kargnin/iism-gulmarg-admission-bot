@@ -17,6 +17,7 @@ import time
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -184,6 +185,117 @@ class Matching(unittest.TestCase):
         self.assertEqual(bot.parse_phone("+91 98765 43210"), "9876543210")
         self.assertEqual(bot.parse_phone("098765-43210"), "9876543210")
         self.assertIsNone(bot.parse_phone("12345"))
+
+
+class ConfigurationAndDocuments(unittest.TestCase):
+    def errors_for(self, path, value):
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = make_config(Path(folder), PHONES[:1], ["G2 Basic"])
+            if path.startswith("bot."):
+                cfg["bot"][path[4:]] = value
+            else:
+                cfg[path] = value
+            return bot.parse_settings(cfg, None)[1]
+
+    def test_rejects_malformed_tuning_types_and_unknown_options(self):
+        cases = [
+            ("maxBookings", "1"),
+            ("bot.parallel", "false"),
+            ("bot.notify", 1),
+            ("bot.preventSleep", 0),
+            ("bot.parentSignatureFallback", None),
+            ("bot.startEarlySec", "0"),
+            ("bot.pollSec", "1"),
+            ("bot.requestTimeoutSec", "1"),
+            ("bot.submitTimeoutSec", "1"),
+            ("bot.retryDelaySec", "1"),
+            ("bot.maxRetryDelaySec", "1"),
+            ("bot.fullConfirmations", 1.5),
+            ("bot.unlistedGraceSec", "1"),
+            ("bot.seatGraceSec", "1"),
+            ("bot.recheckBlockedSec", "1"),
+            ("bot.missingAlertSec", "1"),
+            ("bot.maxRejections", 1.5),
+            ("bot.rejectedRetrySec", "1"),
+            ("bot.statusEverySec", "1"),
+            ("bot.typoOption", 1),
+        ]
+        for path, value in cases:
+            with self.subTest(path=path, value=value):
+                errors = self.errors_for(path, value)
+                self.assertTrue(any(path.split(".")[-1] in error for error in errors), errors)
+
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = make_config(Path(folder), PHONES[:1], ["G2 Basic"])
+            cfg["bot"] = "parallel"
+            errors = bot.parse_settings(cfg, None)[1]
+            self.assertTrue(any("bot must be an object" in error for error in errors), errors)
+
+    def test_rejects_non_finite_and_out_of_range_tuning(self):
+        cases = [
+            ("maxBookings", -1),
+            ("bot.startEarlySec", -1),
+            ("bot.pollSec", 0),
+            ("bot.requestTimeoutSec", float("nan")),
+            ("bot.submitTimeoutSec", float("inf")),
+            ("bot.retryDelaySec", 0),
+            ("bot.maxRetryDelaySec", 0),
+            ("bot.fullConfirmations", 0),
+            ("bot.unlistedGraceSec", -1),
+            ("bot.seatGraceSec", -1),
+            ("bot.recheckBlockedSec", 0),
+            ("bot.missingAlertSec", -1),
+            ("bot.maxRejections", 0),
+            ("bot.rejectedRetrySec", -1),
+            ("bot.statusEverySec", 0),
+        ]
+        for path, value in cases:
+            with self.subTest(path=path, value=value):
+                errors = self.errors_for(path, value)
+                self.assertTrue(any(path.split(".")[-1] in error for error in errors), errors)
+
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = make_config(Path(folder), PHONES[:1], ["G2 Basic"],
+                              bot={"retryDelaySec": 2, "maxRetryDelaySec": 1})
+            errors = bot.parse_settings(cfg, None)[1]
+            self.assertTrue(any("maxRetryDelaySec" in error for error in errors), errors)
+
+    def test_changed_document_source_is_always_reconverted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"])
+            first = tmp / "docs" / "photo-a.pdf"
+            second = tmp / "docs" / "photo-b.pdf"
+            first.write_bytes(b"first applicant")
+            second.write_bytes(b"second applicant")
+            os.utime(second, (1, 1))
+            cfg["documents"]["photo"] = first.name
+            settings, errors, _ = bot.parse_settings(cfg, None)
+            self.assertEqual(errors, [])
+
+            def convert(src, dst):
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+                return dst
+
+            out = tmp / "run"
+            with mock.patch.object(bot, "can_convert", return_value=True), \
+                    mock.patch.object(bot, "convert_to_jpeg", side_effect=convert) as converter:
+                problems, _ = bot.prepare_documents(settings, out)
+                self.assertEqual(problems, [])
+                settings.doc_sources["photo"] = second
+                problems, _ = bot.prepare_documents(settings, out)
+
+            converted = out / "upload-ready" / "photo.jpg"
+            self.assertEqual(problems, [])
+            self.assertEqual(converted.read_bytes(), second.read_bytes())
+            self.assertEqual(converter.call_count, 2)
+
+    def test_long_outage_backoff_stays_capped(self):
+        instance = object.__new__(bot.Bot)
+        instance.opt = {"retryDelaySec": 1.0, "maxRetryDelaySec": 10.0}
+        with mock.patch.object(bot.random, "uniform", return_value=1.3):
+            self.assertEqual(instance.backoff(2000), 10.0)
 
 
 class OpenAndFullRules(unittest.TestCase):

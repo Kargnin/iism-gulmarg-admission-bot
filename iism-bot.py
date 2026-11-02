@@ -31,6 +31,7 @@ import html
 import http.client
 import http.cookiejar
 import json
+import math
 import os
 import random
 import re
@@ -89,6 +90,23 @@ BOT_DEFAULTS = {
     # refuses an adult's form for that reason, resend with the applicant's signature in that slot.
     "parentSignatureFallback": True,
     "statusEverySec": 30,
+}
+
+BOT_BOOLEAN_OPTIONS = {"parallel", "notify", "preventSleep", "parentSignatureFallback"}
+BOT_INTEGER_MINIMUMS = {"fullConfirmations": 1, "maxRejections": 1}
+BOT_NUMBER_MINIMUMS = {
+    "startEarlySec": (0, True),
+    "pollSec": (0, False),
+    "requestTimeoutSec": (0, False),
+    "submitTimeoutSec": (0, False),
+    "retryDelaySec": (0, False),
+    "maxRetryDelaySec": (0, False),
+    "unlistedGraceSec": (0, True),
+    "seatGraceSec": (0, True),
+    "recheckBlockedSec": (0, False),
+    "missingAlertSec": (0, True),
+    "rejectedRetrySec": (0, True),
+    "statusEverySec": (0, False),
 }
 
 # config value -> text box on admission_form.aspx
@@ -782,6 +800,53 @@ class Settings:
     """Everything the bot needs from one person's config, checked."""
 
 
+def validate_tuning(cfg, errors):
+    raw_wanted = cfg["maxBookings"] if "maxBookings" in cfg else 0
+    if type(raw_wanted) is not int or raw_wanted < 0:
+        errors.append("maxBookings must be an integer of 0 or greater")
+        wanted = 0
+    else:
+        wanted = raw_wanted
+
+    opt = dict(BOT_DEFAULTS)
+    raw_opt = cfg.get("bot", {})
+    if not isinstance(raw_opt, dict):
+        errors.append("bot must be an object")
+        return wanted, opt
+
+    unknown = sorted((key for key in raw_opt if key not in BOT_DEFAULTS), key=str)
+    if unknown:
+        errors.append("bot has unknown option(s): " + ", ".join(map(str, unknown)))
+
+    for key, value in raw_opt.items():
+        if key not in BOT_DEFAULTS:
+            continue
+        if key in BOT_BOOLEAN_OPTIONS:
+            if type(value) is not bool:
+                errors.append(f"bot.{key} must be true or false")
+                continue
+        elif key in BOT_INTEGER_MINIMUMS:
+            minimum = BOT_INTEGER_MINIMUMS[key]
+            if type(value) is not int or value < minimum:
+                errors.append(f"bot.{key} must be an integer of {minimum} or greater")
+                continue
+        else:
+            minimum, inclusive = BOT_NUMBER_MINIMUMS[key]
+            is_number = not isinstance(value, bool) and isinstance(value, (int, float))
+            is_finite = is_number and (not isinstance(value, float) or math.isfinite(value))
+            in_range = is_finite and (value >= minimum if inclusive else value > minimum)
+            if not in_range or value > threading.TIMEOUT_MAX:
+                comparison = "at least" if inclusive else "greater than"
+                errors.append(f"bot.{key} must be a finite number {comparison} {minimum} "
+                              f"and no greater than {threading.TIMEOUT_MAX}")
+                continue
+        opt[key] = value
+
+    if opt["maxRetryDelaySec"] < opt["retryDelaySec"]:
+        errors.append("bot.maxRetryDelaySec must be at least bot.retryDelaySec")
+    return wanted, opt
+
+
 def parse_settings(cfg, config_path):
     errors, warnings = [], []
     s = Settings()
@@ -864,10 +929,8 @@ def parse_settings(cfg, config_path):
     # the parent/guardian signature is only for participants under 18 (by the first chosen batch)
     s.minor = bool(s.dob and s.targets and age_on(s.dob, min(t.start for t in s.targets)) < 18)
 
-    wanted = int(cfg.get("maxBookings") or 0)
+    wanted, s.opt = validate_tuning(cfg, errors)
     s.max_bookings = min(wanted or len(s.phones), len(s.phones) or 1, len(s.targets) or 1)
-    s.opt = dict(BOT_DEFAULTS)
-    s.opt.update({k: v for k, v in (cfg.get("bot") or {}).items() if not str(k).startswith("_")})
     if s.opens_at is None:
         warnings.append("no booking opening time configured (bookingOpensAt) - the bot starts right away")
 
@@ -953,10 +1016,8 @@ def prepare_documents(settings, out_dir):
                             "convert it (e.g. export as JPG) and point the config at the new file")
             continue
         dst = out_dir / "upload-ready" / f"{key}.jpg"
-        fresh = dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime and dst.stat().st_size <= MAX_UPLOAD_BYTES
         try:
-            if not fresh:
-                convert_to_jpeg(src, dst)
+            convert_to_jpeg(src, dst)
         except ConfigError as e:
             problems.append(f"documents.{key}: {e}")
             continue
@@ -1720,8 +1781,19 @@ class Bot:
         self.stop.wait(max(0.0, seconds))
 
     def backoff(self, failures):
-        delay = min(self.opt["maxRetryDelaySec"], self.opt["retryDelaySec"] * (1.6 ** max(0, failures - 1)))
-        return delay * random.uniform(0.7, 1.3)
+        retry_delay = self.opt["retryDelaySec"]
+        max_delay = self.opt["maxRetryDelaySec"]
+        exponent = max(0, failures - 1)
+        log_retry = math.log(retry_delay)
+        log_growth = math.log(1.6)
+        cap_exponent = (math.log(max_delay) - log_retry) / log_growth
+        if exponent == 0:
+            delay = retry_delay
+        elif exponent >= cap_exponent:
+            delay = max_delay
+        else:
+            delay = math.exp(log_retry + exponent * log_growth)
+        return min(max_delay, delay * random.uniform(0.7, 1.3))
 
     def poll_delay(self):
         """Wait before looking again while nothing is bookable: every pollSec - whatever the clock
@@ -2312,7 +2384,7 @@ def with_retries(bot, action, tries=15):
             if n == tries:
                 raise
             bot.log.info(f"  ({e} - retrying)")
-            time.sleep(bot.backoff(n))
+            bot.sleep(bot.backoff(n))
 
 
 def run_discover(bot, phone):
