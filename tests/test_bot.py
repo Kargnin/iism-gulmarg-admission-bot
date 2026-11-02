@@ -146,6 +146,22 @@ class Matching(unittest.TestCase):
         none_only = [("0", "Select Course Level"), ("16", "None")]
         self.assertEqual(bot.match_level(none_only, target("G2 Basic"), loose=True)[0], "16")
 
+    def test_hints_cannot_override_semantic_target_evidence(self):
+        batches = bot.load_season({}, Path("."))[0]
+        advanced = bot.parse_priority({"batch": "G2", "course": "Snow Skiing", "level": "Advance",
+                                       "levelText": "Basic SSC", "batchText": "Course"}, 0, batches)
+        self.assertIsNone(bot.match_level([("13", "Basic SSC"), ("15", "Advance SSC")], advanced, loose=True))
+        options = [("71", "Course from 20 Dec 2026 to 02 Jan 2027"),
+                   ("72", "Course from 03 Jan 2027 to 16 Jan 2027")]
+        self.assertEqual(bot.match_batch(options, advanced)[0], "72")
+        self.assertIsNone(bot.match_batch([("1", "Course A"), ("2", "Course B")], advanced))
+
+        wrong_course = bot.parse_priority({"batch": "G2", "course": "Snow Skiing", "level": "Advance",
+                                           "courseText": "Basic Course"}, 0, batches)
+        courses = [("1", "Snow Skiing Basic Course at Gulmarg"),
+                   ("2", "Snow Skiing Advance Course at Kargil")]
+        self.assertEqual(bot.course_candidates(courses, wrong_course), [])
+
     def test_choices(self):
         states = mock_site.STATES
         self.assertEqual(bot.match_choice(states, "Maharashtra")[0], "27")
@@ -260,6 +276,23 @@ class ConfigurationAndDocuments(unittest.TestCase):
                     bot.parse_settings(cfg, None)
         with self.assertRaises(bot.ConfigError):
             bot.parse_settings([], None)
+
+    def test_rejects_unreadable_configured_dates_and_missing_schedule(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            for field in ("from", "to"):
+                cfg = make_config(tmp, PHONES[:1], [{"batch": "G2", field: "not-a-date"}])
+                errors = bot.parse_settings(cfg, None)[1]
+                self.assertTrue(any(f"coursePriorities[0].{field}" in error for error in errors), errors)
+
+            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"],
+                              batches={"G2": {"from": "2027-01-03", "to": "not-a-date"}})
+            with self.assertRaisesRegex(bot.ConfigError, "batches.G2.to"):
+                bot.parse_settings(cfg, None)
+
+            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(tmp / "missing.json"))
+            with self.assertRaisesRegex(bot.ConfigError, "scheduleFile not found"):
+                bot.parse_settings(cfg, None)
 
     def test_rejects_non_finite_and_out_of_range_tuning(self):
         cases = [
@@ -454,6 +487,48 @@ class EndToEnd(unittest.TestCase):
                          {"G2 Basic": PHONES[0], "G3 Basic": PHONES[1]})
         self.assertNotIn(PHONES[2], self.site.used)
 
+    def test_disappearing_slot_returns_with_its_primary_while_sibling_books(self):
+        g2 = self.key("G2")
+        self.site.seats[g2] = 0
+        self.site.shown_seats[g2] = 4
+        original = mock_site.Handler.submit
+        g2_attempts = []
+        sibling_finished_before_return = []
+        timer = None
+
+        def submit_then_hide(handler, mobile, values, files, listed, course, level, batch):
+            nonlocal timer
+            if batch and batch[0] == g2[2]:
+                g2_attempts.append(mobile)
+                result = original(handler, mobile, values, files, listed, course, level, batch)
+                if len(g2_attempts) == 1:
+                    self.site.hide_full = True
+                    for level_value, _ in self.site.courses[g2[0]]["levels"]:
+                        self.site.seats[(g2[0], level_value, g2[2])] = 0
+
+                    def restore():
+                        sibling_finished_before_return.append(any(a["mobile"] == PHONES[1]
+                                                                  for a in self.site.snapshot()["applications"]))
+                        self.site.seats[g2] = 2
+                        self.site.shown_seats.pop(g2, None)
+
+                    timer = threading.Timer(0.8, restore)
+                    timer.start()
+                return result
+            return original(handler, mobile, values, files, listed, course, level, batch)
+
+        try:
+            with mock.patch.object(mock_site.Handler, "submit", submit_then_hide):
+                instance = self.run_with(PHONES, ["G2 Basic", "G3 Basic"])
+        finally:
+            if timer:
+                timer.cancel()
+        self.assertEqual({x["target"]: x["phone"] for x in instance.bookings},
+                         {"G2 Basic": PHONES[0], "G3 Basic": PHONES[1]})
+        self.assertEqual(g2_attempts, [PHONES[0], PHONES[0]])
+        self.assertEqual(sibling_finished_before_return, [True])
+        self.assertNotIn(PHONES[2], self.site.used)
+
     def test_seat_race_at_submit_keeps_retrying_same_number(self):
         key = self.key("G2")
         self.site.seats[key] = 0
@@ -466,6 +541,25 @@ class EndToEnd(unittest.TestCase):
             timer.cancel()
         self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
         self.assertEqual(len(self.site.applications), 1)
+
+    def test_final_submit_429_retries_same_phone_without_confirmation(self):
+        original = mock_site.Handler.submit
+        attempts = []
+
+        def throttle_once(handler, *args, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                return handler.send(429, "too many requests", {"Retry-After": "1"})
+            return original(handler, *args, **kwargs)
+
+        def no_confirmation(*args):
+            self.fail("an explicit 429 must not request ambiguous-outcome feedback")
+
+        with mock.patch.object(mock_site.Handler, "submit", throttle_once):
+            instance = self.run_with(PHONES[:2], ["G2 Basic"], confirmation_handler=no_confirmation)
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(attempts), 2)
+        self.assertNotIn(PHONES[1], self.site.used)
 
     def test_used_primary_is_replaced_by_a_reserve(self):
         for style in ("label", "alert"):
@@ -488,6 +582,22 @@ class EndToEnd(unittest.TestCase):
         self.site.refuse_numbers[PHONES[0]] = "Please Enter Valid Mobile No."
         instance = self.run_with(PHONES[:2], ["G2 Basic"])
         self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[1], "confirmed")])
+
+    def test_temporary_mobile_messages_never_consume_the_primary(self):
+        original = mock_site.Handler.post_instructions
+        refusals = []
+
+        def temporarily_unavailable(handler, session, values):
+            if values.get("txtMobileNo") == PHONES[0] and len(refusals) < 4:
+                refusals.append(1)
+                return handler.send(200, handler.instructions("Service temporarily unavailable. Please try again."))
+            return original(handler, session, values)
+
+        with mock.patch.object(mock_site.Handler, "post_instructions", temporarily_unavailable):
+            instance = self.run_with(PHONES[:2], ["G2 Basic"])
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(refusals), 4)
+        self.assertNotIn(PHONES[1], self.site.used)
 
     def test_exhausted_numbers_do_not_stop_other_preferences(self):
         self.site.used = {PHONES[0]}
@@ -541,6 +651,42 @@ class EndToEnd(unittest.TestCase):
                                      confirmation_handler=lambda *args: "not-booked")
         self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
         self.assertEqual(len(attempts), 2)
+        self.assertNotIn(PHONES[1], self.site.used)
+
+    def test_known_validation_rejection_parks_once_while_sibling_finishes(self):
+        original = mock_site.Handler.submit
+        rejected_batch = self.key("G2")[2]
+        rejections = []
+
+        def reject_local_data(handler, mobile, values, files, listed, course, level, batch):
+            if batch and batch[0] == rejected_batch:
+                rejections.append(mobile)
+                values["lblMsg"] = ("Please Enter Name.", "Red")
+                return handler.send(200, handler.form(mobile, values, listed))
+            return original(handler, mobile, values, files, listed, course, level, batch)
+
+        with mock.patch.object(mock_site.Handler, "submit", reject_local_data):
+            instance = self.run_with(PHONES, ["G2 Basic", "G3 Basic"])
+        self.assertEqual(self.booked(instance), [("G3 Basic", PHONES[1], "confirmed")])
+        self.assertEqual(rejections, [PHONES[0]])
+        self.assertEqual(instance.blocked[0]["kind"], "rejected")
+        self.assertNotIn(PHONES[2], self.site.used)
+
+    def test_explicit_temporary_submit_message_retries_without_parking(self):
+        original = mock_site.Handler.submit
+        temporary = []
+
+        def retry_later(handler, mobile, values, files, listed, course, level, batch):
+            if len(temporary) < 3:
+                temporary.append(1)
+                values["lblMsg"] = ("Service temporarily unavailable. Please try again.", "Red")
+                return handler.send(200, handler.form(mobile, values, listed))
+            return original(handler, mobile, values, files, listed, course, level, batch)
+
+        with mock.patch.object(mock_site.Handler, "submit", retry_later):
+            instance = self.run_with(PHONES[:2], ["G2 Basic"])
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(temporary), 3)
         self.assertNotIn(PHONES[1], self.site.used)
 
     def test_survives_crashes_sessions_and_application_restarts(self):
@@ -620,6 +766,16 @@ class EndToEnd(unittest.TestCase):
             settings, _, _ = bot.parse_settings(cfg, None)
             problems, _ = bot.prepare_documents(settings, self.out)
             self.assertEqual(any("parentSignature" in p for p in problems), required)
+
+    def test_server_classified_minor_without_guardian_is_parked_before_submit(self):
+        course_id = self.key("G2")[0]
+        self.site.courses[course_id] = dict(self.site.courses[course_id])
+        self.site.courses[course_id]["count_date"] = date(2026, 12, 1)
+        instance = self.run_with(PHONES[:1], ["G2 Basic"], applicant={"dateOfBirth": "15/12/2008"})
+        self.assertEqual(instance.bookings, [])
+        self.assertEqual(self.site.applications, [])
+        self.assertIn("real guardian signature", instance.blocked[0]["why"])
+        self.assertFalse(instance.parent_fallback)
 
     def test_accepted_adult_signature_substitution_only_if_site_insists(self):
         self.site.parent_signature_required = True

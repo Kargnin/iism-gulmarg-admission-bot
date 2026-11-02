@@ -2,11 +2,11 @@
 
 Each preference has a primary number and its own worker. Extra numbers are exclusively leased reserves for explicitly used/persistently refused primaries. Every preference is attempted. Missing/full/disappeared schedules remain pending until booked or cancelled.
 
-Course names remain flexible. The cascade is course → level → schedule → state → DOB, carrying each response's hidden fields forward. A visible course does not prove that its schedules are open. Booking retries are indefinite, cancellation-aware and capped at 10 seconds. Unknown final outcomes require user feedback for that batch while other workers continue.
+Course names remain flexible. The cascade is course → level → schedule → state → DOB, carrying each response's hidden fields forward. Optional text hints narrow candidates but cannot override contradictory kind, level, location or date evidence. A visible course does not prove that its schedules are open. Booking retries are indefinite, cancellation-aware and capped at 10 seconds. Final-submit 429 responses retry the same phone; unknown final outcomes require user feedback for that batch while other workers continue. Deterministic validation failures park only the affected preference until corrected and restarted.
 
 Inputs and files are prepared once before workers start; uploads are shared immutable snapshots. Progress uses process locking and durable atomic writes and binds applications to their concrete date/course identity. Existing and unresolved applications are never silently discarded.
 
-Certificate-verification fallback and optional adult applicant-signature reuse when the site insists on a guardian upload are intentional retained behaviors. Minors require a real guardian signature. Intermediate/Advance entries receive an unsupported-path warning; no full live support is claimed.
+Certificate-verification fallback and optional adult applicant-signature reuse when the site insists on a guardian upload are intentional retained behaviors. Runtime guardian classification uses the server-reported age or age-count date; minors require a real guardian signature and are held before final submission when it is missing. Intermediate/Advance entries receive an unsupported-path warning; no full live support is claimed.
 
 ## Observed on 2 November 2026
 

@@ -22,7 +22,7 @@ The current schema uses `applicant.diet`, top-level `phoneNumbers`, and `courseP
 
 ```jsonc
 "coursePriorities": ["G2 Basic", "G3 Basic"],
-"phoneNumbers": ["9876543210", "9876543211", "9876543212"]
+"phoneNumbers": ["9000000011", "9000000012", "9000000013"]
 ```
 
 The first preference owns the first number, the second owns the second number, and both run in parallel. The third number is a reserve. Provide one unique primary per preference; extra numbers are reserves.
@@ -44,7 +44,9 @@ Basic skiing is supported. Intermediate/Advance entries generate an unsupported-
 | K1 | Kargil | 8–21 Feb 2027 |
 | K2 | Kargil | 22 Feb–7 Mar 2027 |
 
-Dates come from `schedule.json`. Matching accommodates different wording and date formats, explores actual dropdowns, prefers the configured location/level, and uses the configured dates. Live IDs are not hardcoded. Preference objects may provide `courseText`, `levelText`, and `batchText` hints.
+Dates come from `schedule.json`. Matching accommodates different wording and date formats, explores actual dropdowns, prefers the configured location/level, and uses the configured dates. Live IDs are not hardcoded. Preference objects may provide `courseText`, `levelText`, and `batchText` hints; hints only narrow candidates and cannot contradict the configured kind, level, location or dates.
+
+The repository `schedule.json` is the default. An explicit `scheduleFile` selects another complete schedule and must exist. Top-level `batches` override matching batch codes from that schedule, while top-level `bookingOpensAt` overrides its opening time. These are explicit current-schema inputs; no alias or implicit migration is applied.
 
 ## Documents
 
@@ -54,7 +56,7 @@ Preflight checks existence, byte type and size. It cannot verify identity or leg
 
 Preparation happens once at startup. Workers share in-memory upload snapshots, so later edits, stale conversions or concurrent requests cannot swap files. Original files are not overwritten.
 
-If the site insists on a guardian upload for an adult who has none configured, the applicant signature can be resent in that slot. `bot.parentSignatureFallback` controls this retained behavior. Minors must have an actual guardian signature.
+If the site insists on a guardian upload for an adult who has none configured, the applicant signature can be resent in that slot. `bot.parentSignatureFallback` controls this retained behavior. Runtime classification uses the site's reported age or age-count date; a server-classified minor without a real guardian signature is parked before final submission.
 
 ## Running and uncertain outcomes
 
@@ -67,6 +69,8 @@ python3 iism-bot.py --config configs/friend.jsonc --check
 ```
 
 Backoff grows exponentially and is capped at **10 seconds**, including 429 responses. `Retry-After` is logged; waits remain capped. There is no cumulative booking retry limit. Ctrl+C prevents new requests/submissions and lets in-flight workers unwind.
+
+An explicit final-submit 429 retries the same phone and does not ask for booking confirmation. A deterministic validation rejection caused by immutable startup data parks that preference once with an actionable error while other workers continue; temporary server messages, missing/full slots and availability changes keep retrying.
 
 If a final reply is unclear, **only that preference is held**. Check the actual application/email and answer `booked` to finish that preference or `not booked` to resume attempts. Other workers continue. A used-number message or a URL containing payment/success is not automatic confirmation. Without interactive stdin, pending progress is retained; restart interactively to answer.
 

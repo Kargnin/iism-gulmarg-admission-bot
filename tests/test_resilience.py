@@ -102,6 +102,63 @@ class Resilience(unittest.TestCase):
             bot.State(path, True)
         self.assertEqual(path.read_text(), "{broken")
 
+    def test_target_identity_is_canonical_for_harmless_casing(self):
+        batches = bot.load_season({}, self.root)[0]
+        normal = bot.parse_priority({"batch": "G2", "course": "Snow Skiing", "level": "Basic",
+                                     "location": "Gulmarg"}, 0, batches)
+        changed_case = bot.parse_priority({"batch": "g2", "course": "snow skiing", "level": "basic",
+                                           "location": "  gULMARG  "}, 0, batches)
+        self.assertEqual(bot.target_key(normal), bot.target_key(changed_case))
+
+    def test_safe_assignments_follow_current_order_and_stale_ones_are_pruned(self):
+        out = self.root / "reordered-state"
+        first_settings = bot.parse_settings(
+            make_config(self.root, PHONES, ["G2 Basic", "G3 Basic"]), None)[0]
+        first = bot.Bot(first_settings, out, base_url="http://127.0.0.1:9", log=bot.Log(echo=False))
+        first.state.acquire()
+        try:
+            first._restore()
+            first.state.data["assignments"]["removed-target"] = PHONES[2]
+            first.state.save()
+        finally:
+            first.state.release()
+
+        reordered_settings = bot.parse_settings(
+            make_config(self.root, PHONES, ["G3 Basic", "G2 Basic"]), None)[0]
+        reordered = bot.Bot(reordered_settings, out, base_url="http://127.0.0.1:9", log=bot.Log(echo=False))
+        reordered.state.acquire()
+        try:
+            reordered._restore()
+            expected = {bot.target_key(reordered.targets[0]): PHONES[0],
+                        bot.target_key(reordered.targets[1]): PHONES[1]}
+            self.assertEqual(reordered.assignments, expected)
+            self.assertEqual(reordered.state.data["assignments"], expected)
+        finally:
+            reordered.state.release()
+
+    def test_duplicate_assignment_owners_and_reordered_pending_state_fail_closed(self):
+        duplicate = self.root / "duplicate-state.json"
+        duplicate.write_text(json.dumps({"version": 1, "identity": "test", "bookings": [], "phones": {},
+                                         "assignments": {"first": PHONES[0], "second": PHONES[0]}}))
+        with self.assertRaisesRegex(bot.ConfigError, "assigned to multiple"):
+            bot.State(duplicate, True)
+
+        out = self.root / "pending-state"
+        settings = bot.parse_settings(make_config(self.root, PHONES[:2], ["G2 Basic", "G3 Basic"]), None)[0]
+        first = bot.Bot(settings, out, base_url="http://127.0.0.1:9", log=bot.Log(echo=False))
+        first.state.acquire()
+        try:
+            first._restore()
+            phone = first.assign_phone(first.targets[0])
+            first.mark_submitting(phone, first.targets[0])
+        finally:
+            first.state.release()
+
+        reordered_settings = bot.parse_settings(
+            make_config(self.root, PHONES[:2], ["G3 Basic", "G2 Basic"]), None)[0]
+        with self.assertRaisesRegex(bot.ConfigError, "current preference/phone order"):
+            bot.Bot(reordered_settings, out, base_url="http://127.0.0.1:9", log=bot.Log(echo=False))
+
     def test_explicit_guardian_file_is_used_for_minor_and_adult(self):
         site, url = self.local_site()
         for index, born in enumerate(("15/05/2010", "15/05/1998")):

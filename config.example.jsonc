@@ -44,6 +44,11 @@
   // Intermediate/Advance are not supported yet and produce a warning.
   "coursePriorities": ["G2 Basic", "G3 Basic", "G6 Basic"],
 
+  // Optional explicit schedule sources. scheduleFile replaces the default schedule.json;
+  // top-level batches override matching codes, and bookingOpensAt overrides the schedule time.
+  // "scheduleFile": "schedule.custom.json",
+  // "bookingOpensAt": "2026-11-12T10:00:00+05:30",
+
   // Folder with your documents. "~" is your home folder; names below are inside it.
   // The site wants JPG/PNG under 500 KB - on a Mac, PDFs and big images are
   // converted automatically (your originals are not touched).

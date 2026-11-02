@@ -160,10 +160,18 @@ PHONE_USED_PHRASES = [
     "already been submitted", "already applied", "already been used", "already in use", "already used",
     "already taken", "duplicate mobile", "number already",
 ]
+PERMANENT_MOBILE_REFUSAL_PHRASES = [
+    "enter valid mobile", "invalid mobile", "mobile no is invalid", "mobile number is invalid",
+    "mobile no not valid", "mobile number not valid", "not a valid mobile",
+]
 SUCCESS_PHRASES = [
     "submitted successfully", "successfully submitted", "has been submitted", "application submitted",
     "form submitted", "registered successfully", "successfully registered", "saved successfully",
     "successfully saved", "application received",
+]
+TEMPORARY_PHRASES = [
+    "temporarily", "temporary", "try again", "service unavailable", "server busy", "server error",
+    "timed out", "timeout", "please retry", "try later",
 ]
 AGE_PHRASES = ["age allow", "not eligible", "age should", "age must", "age limit", "invalid date"]
 
@@ -245,6 +253,14 @@ class Transient(Exception):
         self.retry_after = retry_after
 
 
+class RetryableSubmit(Transient):
+    """The final response explicitly says no application was accepted and can be retried."""
+
+
+class RateLimited(RetryableSubmit):
+    """The final request was explicitly refused with HTTP 429 and is safe to retry."""
+
+
 class Cancelled(Exception):
     """Stop requested; do not start another network operation."""
 
@@ -285,20 +301,9 @@ class NotOpen(Exception):
 class TargetFull(Exception):
     """This choice shows no seats, or is not on the list."""
 
-    def __init__(self, message, kind="shown", site_lists=None):
-        super().__init__(message)
-        # "shown": 0 seats shown; "gone": was listed, now isn't; "unlisted": not listed yet;
-        # "submit": the site refused the submit itself, whatever the seat count says
-        self.kind = kind
-        self.site_lists = site_lists or []  # what the site showed instead, for the "can't find it" alert
-
 
 class Rejected(Exception):
-    """The site refused the filled-in form."""
-
-    def __init__(self, message, final=False):
-        super().__init__(message)
-        self.final = final  # retrying this choice cannot help (e.g. outside its age limit)
+    """The site refused immutable local data; this preference needs a restart after correction."""
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +335,20 @@ def now_ist():
 
 def age_on(born, day):
     return day.year - born.year - ((day.month, day.day) < (born.month, born.day))
+
+
+def observed_server_age(page, born):
+    for message in page.messages():
+        match = re.search(r"\byour\s+age\s+(\d+)\s+years?\b", message, re.I)
+        if match:
+            return int(match.group(1))
+    raw = (page.value("hdfAgeCountDate") or "").strip()
+    for pattern in ("%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return age_on(born, datetime.strptime(raw, pattern).date())
+        except ValueError:
+            pass
+    return None
 
 
 def document_applies(key, target, dob):
@@ -513,6 +532,17 @@ def parse_day(value):
     return None
 
 
+def configured_day(value, where, required=False):
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if required:
+            raise ConfigError(f"{where} is missing")
+        return None
+    parsed = parse_day(value)
+    if parsed is None:
+        raise ConfigError(f"{where} date {value!r} is unreadable")
+    return parsed
+
+
 def location_score(text, location):
     if not location:
         return 0
@@ -535,7 +565,7 @@ def kind_score(text, kind):
 def level_score(text, target):
     """+6 if the text names the wanted skiing level, -100 if it names only other levels
     (in case the site lists "Snow Skiing Basic", "... Intermediate" as separate courses)."""
-    if target.kind != "Snow Skiing" or not target.level or target.level_text:
+    if target.kind != "Snow Skiing" or not target.level:
         return 0
     named = [level for level, pattern in LEVEL_PATTERNS.items() if re.search(pattern, norm(text))]
     if not named:
@@ -543,13 +573,18 @@ def level_score(text, target):
     return 6 if target.level in named else -100
 
 
+def course_conflicts(text, target):
+    return (location_score(text, target.location) < 0 or level_score(text, target) < 0
+            or bool(re.search(KIND_PATTERNS[target.kind][1], norm(text))))
+
+
 def course_candidates(options, target, hint=None):
     """Course dropdown entries that could hold this choice, most likely first."""
     real = real_options(options)
     if target.course_text:
-        picks = [o for o in real if norm(target.course_text) in norm(o[1])]
+        picks = [o for o in real if norm(target.course_text) in norm(o[1]) and not course_conflicts(o[1], target)]
     else:
-        fits = lambda text: location_score(text, target.location) >= 0 and level_score(text, target) >= 0
+        fits = lambda text: not course_conflicts(text, target)
         scored = []
         for n, (value, text) in enumerate(real):
             s = kind_score(text, target.kind)
@@ -576,7 +611,8 @@ def course_candidates(options, target, hint=None):
 def match_level(options, target, loose):
     real = real_options(options)
     if target.level_text:
-        pick = next((o for o in real if norm(target.level_text) in norm(o[1])), None)
+        hinted = [o for o in real if norm(target.level_text) in norm(o[1]) and level_score(o[1], target) >= 0]
+        pick = hinted[0] if len(hinted) == 1 else None
     elif target.level:
         pick = next((o for o in real if re.search(LEVEL_PATTERNS[target.level], norm(o[1]))), None)
     else:
@@ -594,20 +630,33 @@ def state_aliases(name):
 
 
 def match_batch(options, target):
-    best, best_score = None, 0
-    for value, text in real_options(options):
-        if target.batch_text:
-            score = 100 if norm(target.batch_text) in norm(text) else 0
-        else:
-            found = dates_in(text)
-            start = date_match(found, target.start)
-            if not start:
+    if target.batch_text:
+        hinted = []
+        for value, text in real_options(options):
+            if norm(target.batch_text) not in norm(text):
                 continue
-            written_dates = re.findall(r"\d{1,4}[/.\-]\d{1,2}[/.\-]\d{2,4}|\b\d{1,2}(?:st|nd|rd|th)?[\s\-/.]*[A-Za-z]{3,9}", text)
+            found = dates_in(text)
+            if found and not date_match(found, target.start):
+                continue
+            written_dates = re.findall(r"\d{1,4}[/\.\-]\d{1,2}[/\.\-]\d{2,4}|\b\d{1,2}(?:st|nd|rd|th)?[\s\-/.]*[A-Za-z]{3,9}", text)
             if target.end and len(written_dates) >= 2 and not date_match(found, target.end):
                 continue
-            score = (10 * start + 5 * date_match(found, target.end) + location_score(text, target.location)
-                     + level_score(text, target))
+            if location_score(text, target.location) < 0 or level_score(text, target) < 0:
+                continue
+            hinted.append((value, text))
+        return hinted[0] if len(hinted) == 1 else None
+
+    best, best_score = None, 0
+    for value, text in real_options(options):
+        found = dates_in(text)
+        start = date_match(found, target.start)
+        if not start:
+            continue
+        written_dates = re.findall(r"\d{1,4}[/.\-]\d{1,2}[/.\-]\d{2,4}|\b\d{1,2}(?:st|nd|rd|th)?[\s\-/.]*[A-Za-z]{3,9}", text)
+        if target.end and len(written_dates) >= 2 and not date_match(found, target.end):
+            continue
+        score = (10 * start + 5 * date_match(found, target.end) + location_score(text, target.location)
+                 + level_score(text, target))
         if score > best_score:
             best, best_score = (value, text), score
     return best
@@ -767,7 +816,7 @@ def parse_priority(item, index, batches):
         raise ConfigError(f"coursePriorities: unknown batch \"{bid}\" in {item!r} "
                           f"(batches: {', '.join(batches)})")
     batch = batch or {}
-    start = parse_day(spec.get("from")) or batch.get("from")
+    start = configured_day(spec.get("from"), f"coursePriorities[{index}].from") or batch.get("from")
     if start is None:
         raise ConfigError(f"coursePriorities: {item!r} needs a batch code (G1..G6, K1, K2) or a \"from\" date")
     kind = course_kind(spec.get("course", ""))
@@ -776,8 +825,9 @@ def parse_priority(item, index, batches):
         level = "Basic"
     name = bid or start.strftime("%d%b")
     label = spec.get("label") or f"{name} {level if kind == 'Snow Skiing' else kind}"
+    end = configured_day(spec.get("to"), f"coursePriorities[{index}].to") or batch.get("to")
     return Target(index, label, bid, spec.get("location") or batch.get("location", ""), start,
-                  parse_day(spec.get("to")) or batch.get("to"), kind, level,
+                  end, kind, level,
                   spec.get("courseText", ""), spec.get("levelText", ""), spec.get("batchText", ""))
 
 
@@ -866,6 +916,8 @@ def validate_config_structure(cfg):
 
 def load_season(cfg, config_dir):
     path = resolve_path(cfg["scheduleFile"], config_dir) if cfg.get("scheduleFile") else SCRIPT_DIR / "schedule.json"
+    if cfg.get("scheduleFile") and not path.is_file():
+        raise ConfigError(f"scheduleFile not found: {path}")
     data = load_jsonc(path) if path.exists() else {}
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: schedule root must be an object")
@@ -875,11 +927,11 @@ def load_season(cfg, config_dir):
     merged = dict(validate_batch_records(scheduled, f"{path}: batches"))
     merged.update(validate_batch_records(configured, "batches"))
     for bid, b in merged.items():
-        start = parse_day(b.get("from"))
-        if start is None:
-            raise ConfigError(f"batch {bid}: \"from\" date is missing or unreadable")
+        source = "batches" if bid in configured else f"{path}: batches"
+        start = configured_day(b.get("from"), f"{source}.{bid}.from", required=True)
+        end = configured_day(b.get("to"), f"{source}.{bid}.to")
         batches[bid.upper()] = {"location": b.get("location", ""), "from": start,
-                                "to": parse_day(b.get("to")), "offers": b.get("offers") or [],
+                                "to": end, "offers": b.get("offers") or [],
                                 "seats": b.get("seats", "")}
     opens = cfg.get("bookingOpensAt") or data.get("bookingOpensAt")
     opens_at = None
@@ -1510,9 +1562,10 @@ class Http:
 # ---------------------------------------------------------------------------
 
 class Selection:
-    def __init__(self, course, level, batch, state, seats, fee, page):
+    def __init__(self, course, level, batch, state, seats, fee, page, server_age):
         self.course, self.level, self.batch, self.state = course, level, batch, state
         self.seats, self.fee, self.page = seats, fee, page
+        self.server_age = server_age
 
     def __str__(self):
         parts = [f"course '{self.course[1]}'"]
@@ -1528,9 +1581,7 @@ class Selection:
 class Session:
     def __init__(self, bot, phone, who):
         self.bot, self.phone, self.who = bot, phone, who
-        self.unconfirmed = None  # Target of a final submit whose answer never arrived
         self.progress = 0       # successful requests so far (resets the failure backoff)
-        self.blank_returns = 0
         self.static = {}        # page name -> messages that are part of the page itself
         self.http = None
         self.fresh_needed = True  # the next attempt starts from scratch (see cascade)
@@ -1630,7 +1681,10 @@ class Session:
                 said = self.verdict(nxt, deep=nxt.name == INSTRUCTIONS_PAGE, full_ok=False)
                 if nxt.name == INSTRUCTIONS_PAGE:
                     if said:
-                        raise Refused(f"the site refused mobile number {mask(self.phone)}: {'; '.join(said)}", "number")
+                        reason = "; ".join(said)
+                        if has_any(reason.lower(), PERMANENT_MOBILE_REFUSAL_PHRASES):
+                            raise Refused(f"the site refused mobile number {mask(self.phone)}: {reason}", "number")
+                        raise Transient(f"mobile verification did not go through: {reason}")
                     raise Transient("mobile verification did not go through")
             elif page.name == CRITERIA_PAGE:
                 nxt = self.checked(self.postback(page, "lnkbtnNext", {"chkAccept": "on"}))
@@ -1685,8 +1739,7 @@ class Session:
         self.cursor = 0
         page = self.step(("form",), lambda p: self.open_form())
         course_options = page.options("ddlCourse")
-        bot.saw_courses(course_options)
-        found, seen = None, {}  # seen: course -> its batches, to show if the choice can't be found
+        found = None
         for value, text in course_candidates(course_options, target, bot.course_hint.get(target.index)):
             self.cursor = 1
             page = self.step(("course", value), lambda p, v=value: self.select(
@@ -1694,13 +1747,11 @@ class Session:
             level_options = page.options("ddlCourseLevel")
             level = match_level(level_options, target, loose=kind_score(text, target.kind) > 0)
             if real_options(level_options) and level is None:
-                seen[text] = ["levels: " + " | ".join(t for _, t in real_options(level_options))]
                 continue
             if level:
                 page = self.step(("level", value, level[0]), lambda p, v=level[0]: self.select(
                     p, "ddlCourseLevel", dict(first_values(p, "ddlScheduleCourse"), ddlCourseLevel=v)))
             batches = page.options("ddlScheduleCourse")
-            seen[text] = [t for _, t in real_options(batches)]
             if any(is_season_batch(t, bot.s.batches) for _, t in real_options(batches)):
                 bot.saw_season()
             batch = match_batch(batches, target)
@@ -1710,15 +1761,9 @@ class Session:
         if not found:
             if bot.season_seen is None:
                 raise NotOpen("the snow courses are not listed yet" + listing(page, "ddlCourse"))
-            lists = [f"{course}: {' | '.join(found_batches) or '(no batches)'}" for course, found_batches in seen.items()]
-            others = [t for _, t in real_options(course_options) if t not in seen]
-            if others:
-                lists.append("not opened (another kind of course): " + " | ".join(others))
-            raise TargetFull(f"{target.when()} is not listed" + listing(page, "ddlScheduleCourse"),
-                             kind=bot.unlisted_kind(target), site_lists=lists)
+            raise TargetFull(f"{target.when()} is not listed" + listing(page, "ddlScheduleCourse"))
         course, level, batch = found
         bot.course_hint[target.index] = course[0]
-        bot.saw_listed(target)
         values = {"ddlScheduleCourse": batch[0]}
         if level:
             values["ddlCourseLevel"] = level[0]
@@ -1726,7 +1771,7 @@ class Session:
                          lambda p: self.select(p, "ddlScheduleCourse", values))
         seats = to_int(page.value("txtAvailableSeat"))
         if seats == 0:
-            raise TargetFull("0 seats left", kind="shown")
+            raise TargetFull("0 seats left")
         if seats:
             bot.saw_seats(target)
 
@@ -1743,13 +1788,16 @@ class Session:
         said = self.msgs(page)
         echoed = page.value("txtDateOfBirth")
         if has_any(" | ".join(said).lower(), AGE_PHRASES) or (echoed is not None and not echoed.strip()):
-            raise Rejected(f"date of birth not accepted for {target.label}: {'; '.join(said) or 'date cleared'}",
-                           final=True)
-        return Selection(course, level, batch, state, seats, page.value("txtCourseFee"), page)
+            raise Rejected(f"date of birth not accepted for {target.label}: {'; '.join(said) or 'date cleared'}")
+        server_age = observed_server_age(page, bot.s.dob) if bot.s.dob else None
+        return Selection(course, level, batch, state, seats, page.value("txtCourseFee"), page, server_age)
 
     def submit(self, target, sel):
         bot = self.bot
         page = sel.page
+        if sel.server_age is not None and sel.server_age < 18 and not bot.s.docs.get("parentSignature"):
+            raise Rejected(f"the site classifies the applicant as age {sel.server_age} for {target.label}; "
+                           "documents.parentSignature must contain the real guardian signature")
         self.http.check_destination(page.post_url)
         values = dict(bot.s.form_values)
         values.update({"ddlCourse": sel.course[0], "ddlScheduleCourse": sel.batch[0],
@@ -1773,7 +1821,8 @@ class Session:
             path = bot.s.docs.get(key)
             if not document_applies(key, target, bot.s.dob):
                 path = None
-            if key == "parentSignature" and path is None and bot.parent_fallback:
+            if (key == "parentSignature" and path is None and bot.parent_fallback
+                    and sel.server_age is not None and sel.server_age >= 18):
                 path = bot.s.docs.get("signature")
             files[input_name] = path
             values[flag] = "Yes" if path else "No"
@@ -1794,15 +1843,13 @@ class Session:
             resp = self.postback(page, event, values, files=files, timeout=bot.opt["submitTimeoutSec"])
             saved = bot.save_page(self.who, f"submit-{target.label}", resp)
             result = self.judge_submit(resp, target, sel, saved)
-        except (Resend, Rejected, TargetFull, NotOpen, PhoneUsed, SessionLost):
+        except (RetryableSubmit, Resend, Rejected, TargetFull, NotOpen, PhoneUsed, SessionLost):
             bot.clear_submitting(self.phone)
             raise
         except (Cancelled, ConfigError):
             raise
         except Exception as exc:
-            self.unconfirmed = target  # the site may have taken it; we never saw the answer
             raise Uncertain(str(exc)) from exc
-        self.unconfirmed = None
         return result
 
     def judge_submit(self, resp, target, sel, saved):
@@ -1822,7 +1869,6 @@ class Session:
         explicit_success = has_any(said, SUCCESS_PHRASES) or (
             actual_page == "admissionformsuccess.aspx" and has_any(text, SUCCESS_PHRASES))
         if 200 <= resp.status < 300 and not negative and (explicit_success or payment_receipt):
-            self.blank_returns = 0
             message = next((m for m in msgs if has_any(m.lower(), SUCCESS_PHRASES)), "") or query.get("resp", "")
             if not message:
                 hit = next((p for p in SUCCESS_PHRASES if p in text), None)
@@ -1836,10 +1882,12 @@ class Session:
                 app_id = hidden if hidden not in ("", "0") else ""
             return {"message": message.strip(), "applicationId": app_id, "url": resp.url, "response": str(saved or "")}
         reason = "; ".join(msgs[:4])
+        if resp.status == 429:
+            raise RateLimited("submit was rate limited: HTTP 429", response_retry_after(resp))
         if has_any(said, PHONE_USED_PHRASES):
             raise PhoneUsed(reason)
         if has_any(said, FULL_PHRASES):
-            raise TargetFull(f"site says: {reason}", kind="submit")
+            raise TargetFull(f"site says: {reason}")
         if has_any(said, CLOSED_PHRASES):
             raise NotOpen(f"site says: {reason}")
         if resp.status >= 400 or not resp.is_aspx:
@@ -1851,19 +1899,20 @@ class Session:
             raise Transient("the site sent us back to the start after submitting; outcome unknown")
         if resp.name == FORM_PAGE:
             bot = self.bot
-            if (has_any(" ".join(msgs).lower(), ("parent", "guardian")) and not bot.parent_fallback
-                    and not bot.s.docs.get("parentSignature") and bot.s.docs.get("signature")
-                    and bot.s.dob and age_on(bot.s.dob, target.start) >= 18
-                    and bot.opt.get("parentSignatureFallback")):
-                bot.use_parent_fallback(reason)
-                raise Resend("the site wants a parent/guardian signature - resending with the applicant's signature")
             meaningful = [m for m in msgs if not re.fullmatch(r"Your Age \d+ Years\.?", m, re.I)]
             if meaningful:
+                if has_any(" ".join(meaningful).lower(), TEMPORARY_PHRASES):
+                    raise RetryableSubmit(f"site temporarily refused the form: {reason}")
+                wants_parent = has_any(" ".join(meaningful).lower(), ("parent", "guardian"))
+                if wants_parent and not bot.s.docs.get("parentSignature"):
+                    if sel.server_age is None:
+                        raise Rejected("the site requested a guardian signature, but its age response did not "
+                                       "establish that the applicant is an adult")
+                    if (not bot.parent_fallback and sel.server_age >= 18 and bot.s.docs.get("signature")
+                            and bot.opt.get("parentSignatureFallback")):
+                        bot.use_parent_fallback(reason)
+                        raise Resend("the site wants a parent/guardian signature - resending with the applicant's signature")
                 raise Rejected(f"{reason} (page saved: {saved})")
-            self.blank_returns += 1
-            if self.blank_returns >= 4:
-                self.blank_returns = 0
-                raise Rejected(f"the form keeps coming back without any message (page saved: {saved})")
             raise Transient("the form came back without any message")
         raise Transient(f"unexpected page '{resp.name}' after submitting (saved: {saved})")
 
@@ -1924,6 +1973,19 @@ class State:
                     raise ValueError("booked phone has no booking record")
             if any(not isinstance(k, str) or not parse_phone(v) for k, v in value["assignments"].items()):
                 raise ValueError("invalid phone assignments")
+            assigned_phones = list(value["assignments"].values())
+            if len(assigned_phones) != len(set(assigned_phones)):
+                raise ValueError("one phone is assigned to multiple preferences")
+            for target_key_value, phone in value["assignments"].items():
+                record = value["phones"].get(phone)
+                if record and record["status"] == "used":
+                    raise ValueError("used phone still has a preference assignment")
+                if (record and record["status"] in ("submitting", "booked")
+                        and record.get("targetKey") != target_key_value):
+                    raise ValueError("phone assignment conflicts with its application record")
+            for phone, item in value["phones"].items():
+                if item["status"] == "submitting" and value["assignments"].get(item["targetKey"]) != phone:
+                    raise ValueError("pending submission conflicts with its phone assignment")
             if self.identity is not None and value.get("identity") != self.identity:
                 raise ValueError("progress belongs to a different applicant, season or site")
             self.data = value
@@ -1997,8 +2059,8 @@ class State:
 
 
 def target_key(target):
-    value = [target.location, target.start.isoformat(), target.end.isoformat() if target.end else "",
-             target.kind, target.level or target.level_text]
+    value = [norm(target.location).title(), target.start.isoformat(), target.end.isoformat() if target.end else "",
+             target.kind, norm(target.level or target.level_text).title()]
     return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -2023,9 +2085,6 @@ class Bot:
         self.pending_questions = {}
         self.failures = []
         self.season_seen = None
-        self.known_courses = set()
-        self.listed_once = set()
-        self.alerted = set()
         self.attention_seen = {}
         self.refusals = {}
         self.parent_fallback = False
@@ -2048,7 +2107,7 @@ class Bot:
                 self.bookings.append(booking)
         for phone, item in self.state.data["phones"].items():
             if phone in self.phone_state:
-                self.phone_state[phone] = "free" if item["status"] == "submitting" else item["status"]
+                self.phone_state[phone] = item["status"]
             if item["status"] == "submitting":
                 if item["targetKey"] not in lookup:
                     raise ConfigError("An unresolved submission belongs to a removed/changed preference. "
@@ -2056,12 +2115,37 @@ class Bot:
                 if phone not in self.phone_state:
                     raise ConfigError("An unresolved submission's phone was removed. Restore it before continuing.")
                 self.pending[phone] = item["targetKey"]
-        for key, phone in self.state.data["assignments"].items():
-            if key in lookup and phone in self.phone_state and self.phone_state[phone] == "free":
-                if phone in self.owners:
-                    raise ConfigError("Saved progress assigns one phone to multiple preferences.")
-                self.assignments[key] = phone
-                self.owners[phone] = key
+        previous = dict(self.state.data["assignments"])
+        reserve_phones = set(self.phones[len(self.targets):])
+        for phone, key in self.pending.items():
+            target = lookup[key]
+            primary = self.phones[target.index]
+            if previous.get(key) != phone:
+                raise ConfigError("An unresolved submission conflicts with its saved phone assignment.")
+            if phone != primary and phone not in reserve_phones:
+                raise ConfigError("An unresolved submission conflicts with the current preference/phone order. "
+                                  "Restore the prior ordering and reconcile it before booking.")
+            self.assignments[key] = phone
+            self.owners[phone] = key
+        pending_targets = set(self.pending.values())
+        for target in self.targets:
+            key = target_key(target)
+            if target.index in self.booked or key in pending_targets:
+                continue
+            primary = self.phones[target.index]
+            if self.phone_state[primary] == "free" and primary not in self.owners:
+                self.assignments[key] = primary
+                self.owners[primary] = key
+                continue
+            prior_phone = previous.get(key)
+            if (prior_phone in reserve_phones and self.phone_state[prior_phone] == "free"
+                    and prior_phone not in self.owners):
+                self.assignments[key] = prior_phone
+                self.owners[prior_phone] = key
+        if previous != self.assignments:
+            self.state.data["assignments"] = dict(self.assignments)
+            if self.state.lease is not None:
+                self.state.save()
 
     def sleep(self, seconds):
         self.stop.wait(max(0.0, seconds))
@@ -2154,6 +2238,8 @@ class Bot:
             if self.stop.is_set():
                 raise Cancelled()
             key = target_key(target)
+            if self.assignments.get(key) != phone or self.owners.get(phone) != key:
+                raise ConfigError("Cannot submit without an exclusive saved phone assignment.")
             self.pending[phone] = key
             self.state.data["phones"][phone] = {"status": "submitting", "targetKey": key,
                                                  "target": target.label, "at": now_ist().isoformat()}
@@ -2164,6 +2250,7 @@ class Bot:
             self.pending.pop(phone, None)
             if self.state.data["phones"].get(phone, {}).get("status") == "submitting":
                 del self.state.data["phones"][phone]
+                self.phone_state[phone] = "free"
                 self.state.save()
 
     def phone_used(self, phone, target, why):
@@ -2185,10 +2272,12 @@ class Bot:
         with self.lock:
             self.refusals.pop(phone, None)
 
-    def number_refused(self, phone, what, why):
+    def number_refused(self, phone, what):
         with self.lock:
+            if what != "number":
+                return False
             self.refusals[phone] = self.refusals.get(phone, 0) + 1
-            return what == "number" and self.refusals[phone] >= self.opt["maxRejections"]
+            return self.refusals[phone] >= self.opt["maxRejections"]
 
     def use_parent_fallback(self, why):
         with self.lock:
@@ -2196,30 +2285,14 @@ class Bot:
         self.log.warn("The site insists on an adult's guardian-signature upload; using the applicant's "
                       f"configured signature as authorized. Site says: {why}")
 
-    def saw_courses(self, options):
-        with self.lock:
-            self.known_courses.update(text for _, text in real_options(options))
-
     def saw_season(self):
         with self.lock:
             if self.season_seen is None:
                 self.season_seen = time.monotonic()
 
-    def saw_listed(self, target):
-        with self.lock:
-            self.listed_once.add(target.index)
-
-    def unlisted_kind(self, target):
-        return "gone" if target.index in self.listed_once else "unlisted"
-
     def saw_seats(self, target):
         with self.lock:
             self.blocked.pop(target.index, None)
-
-    def check_missing(self, target, kind, site_lists):
-        if kind != "unlisted":
-            return
-        self.note("", f"{target.label}: waiting for the date slot; course names alone do not mean it has opened.")
 
     def prompt_confirmation(self, phone, target, reason):
         while not self.stop.is_set():
@@ -2267,10 +2340,13 @@ class Bot:
             if not self.dry_run:
                 self.state.data["bookings"].append(booking)
                 self.state.data["phones"][phone] = {"status": "booked", "targetKey": key, "target": target.label}
+                self.state.data["assignments"].pop(key, None)
                 self.state.save()
             self.bookings.append(booking)
             self.booked[target.index] = booking
             self.phone_state[phone] = "booked"
+            self.assignments.pop(key, None)
+            self.owners.pop(phone, None)
             self.pending.pop(phone, None)
             self.blocked.pop(target.index, None)
         headline = "DRY RUN OK" if self.dry_run else ("BOOKED (confirmed by user)" if status == "user-confirmed" else "BOOKED")
@@ -2361,7 +2437,6 @@ class Worker(threading.Thread):
                     bot.clear_submitting(phone)
                     session.restart()
                     session.fresh_needed = True
-                    session.unconfirmed = None
                 bot.set_status(self.name, f"{target.label} with {mask(phone)}")
                 progress = session.progress
                 try:
@@ -2384,7 +2459,7 @@ class Worker(threading.Thread):
                     bot.sleep(bot.backoff(1))
                 except Refused as exc:
                     session.fresh_needed = True
-                    if bot.number_refused(phone, exc.what, str(exc)):
+                    if bot.number_refused(phone, exc.what):
                         bot.phone_used(phone, target, str(exc))
                         phone, session = None, None
                     else:
@@ -2395,7 +2470,7 @@ class Worker(threading.Thread):
                         bot.blocked[target.index] = {"why": str(exc), "kind": "rejected"}
                     bot.attention(("rejected", target.index, str(exc)), f"the site refused {target.label}",
                                   [str(exc)], fix_hint(str(exc)))
-                    bot.sleep(min(10, bot.opt["rejectedRetrySec"]))
+                    return
                 except Transient as exc:
                     failures = 1 if session.progress > progress else failures + 1
                     session.fresh_needed = session.fresh_needed or failures >= 6
