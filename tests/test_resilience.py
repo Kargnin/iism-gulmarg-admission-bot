@@ -733,6 +733,96 @@ class Resilience(unittest.TestCase):
     def test_early_eof_429_after_commit_requires_feedback_without_reserve(self):
         self.assert_early_eof_final_reply_requires_feedback(429)
 
+    def test_trickled_redirect_bodies_obey_one_absolute_deadline(self):
+        class TrickledRedirect(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/done":
+                    self.send_response(200)
+                    self.send_header("Content-Length", "2")
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+                    return
+                self.send_response(int(self.path.strip("/")))
+                self.send_header("Location", "/done")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                try:
+                    for value in b"x" * 100:
+                        self.wfile.write(bytes([value]))
+                        self.wfile.flush()
+                        time.sleep(0.03)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TrickledRedirect)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}"
+        client = bot.Http(url, 0.15, bot.Log(echo=False))
+        for status in (301, 302, 303, 307, 308):
+            with self.subTest(status=status):
+                started = time.monotonic()
+                with self.assertRaises(bot.Transient):
+                    client.get(f"/{status}")
+                self.assertLess(time.monotonic() - started, 0.7)
+
+    def test_trickled_final_redirect_body_requires_feedback_without_reserve(self):
+        class TrickledReceipt(mock_site.Handler):
+            def redirect(self, location):
+                if location.lower().startswith("/admissionformsuccess.aspx"):
+                    self.send_response(302)
+                    self.send_header("Location", location)
+                    self.send_header("Content-Length", "100")
+                    self.end_headers()
+                    try:
+                        for value in b"x" * 100:
+                            self.wfile.write(bytes([value]))
+                            self.wfile.flush()
+                            time.sleep(0.03)
+                    except OSError:
+                        pass
+                    return
+                return super().redirect(location)
+
+        site, url = self.local_site(TrickledReceipt)
+        answers = []
+        cfg = make_config(self.root, PHONES[:2], ["G2 Basic"], bot={"submitTimeoutSec": 0.15})
+        instance = run_bot(cfg, url, self.root / "trickled-redirect", timeout=3,
+                           confirmation_handler=lambda *args: answers.append("booked") or "booked")
+        self.assertTrue(instance.finished())
+        self.assertEqual(answers, ["booked"])
+        self.assertEqual(len(site.applications), 1)
+        self.assertEqual(site.applications[0]["mobile"], PHONES[0])
+        self.assertNotIn(PHONES[1], site.used)
+
+    def test_criteria_refusal_is_reported_without_retiring_phone(self):
+        site, url = self.local_site()
+        reason = "The revised declaration must be reviewed before continuing."
+
+        def refuse_criteria(handler, session, query, values):
+            return handler.send(200, handler.criteria(session["mobile"], reason))
+
+        out = self.root / "criteria-refusal"
+        with mock.patch.object(mock_site.Handler, "post_criteria", refuse_criteria):
+            instance = run_bot(make_config(self.root, PHONES[:2], ["G2 Basic"]), url, out, timeout=0.5)
+        log = (out / "bot.log").read_text()
+        criteria_sessions = {item["sid"] for item in site.request_log
+                             if item["page"] == "admission_criteria.aspx" and item["method"] == "POST"}
+        self.assertFalse(instance.finished())
+        self.assertEqual(site.applications, [])
+        self.assertEqual(instance.assignments[bot.target_key(instance.targets[0])], PHONES[0])
+        self.assertEqual(instance.refusals, {})
+        self.assertNotIn(PHONES[0], site.used)
+        self.assertNotIn(PHONES[1], site.used)
+        self.assertGreaterEqual(len(criteria_sessions), 2)
+        self.assertIn(reason, log)
+        self.assertIn("NEEDS YOUR ATTENTION", log)
+
     def test_foreign_form_destination_is_blocked_before_sending(self):
         instance = offline_bot()
         session = bot.Session(instance, PHONES[0], "")
@@ -957,7 +1047,11 @@ class Resilience(unittest.TestCase):
                 ("Unsuccessful.aspx", 200, "application failed"),
                 ("AdmissionFormSuccess.aspx", 200, "Application not successfully submitted"),
                 ("AdmissionFormSuccess.aspx", 200, "Application not submitted successfully"),
-                ("AdmissionFormSuccess.aspx", 200, "Application unsuccessfully submitted")):
+                ("AdmissionFormSuccess.aspx", 200, "Application unsuccessfully submitted"),
+                ("AdmissionFormSuccess.aspx", 200,
+                 "Application was not in fact yet been submitted successfully"),
+                ("AdmissionFormSuccess.aspx", 200, "Application received invalid data"),
+                ("AdmissionFormSuccess.aspx", 200, "AdmissionFormSuccess")):
             with self.subTest(path=path):
                 page = bot.Page(f"http://127.0.0.1:9/{path}", status, body)
                 with self.assertRaises(bot.Transient):
@@ -977,6 +1071,9 @@ class Resilience(unittest.TestCase):
             "http-429-validator": (429, '<script>rfvtxtName.errormessage = "Please Enter Name.";'
                                          'rfvtxtName.isvalid = "False";</script>'),
             "http-429": (429, ""),
+            "rejected-clause": (200, '<span id="lblerrorMsg">The application was rejected.</span>'),
+            "invalid-clause": (200, '<span id="lblerrorMsg">The application contains invalid data.</span>'),
+            "not-accepted-clause": (200, '<span id="lblerrorMsg">The application was not accepted.</span>'),
         }
         for name, (status, evidence) in cases.items():
             with self.subTest(name=name):
@@ -986,6 +1083,13 @@ class Resilience(unittest.TestCase):
                 page = bot.Page("http://127.0.0.1:9/admission_form.aspx", status, body)
                 with self.assertRaises(bot.Uncertain):
                     session.judge_submit(page, instance.targets[0], None, None, set())
+
+        same_clause = bot.Page(
+            "http://127.0.0.1:9/admission_form.aspx", 200,
+            '<form action="admission_form.aspx"><input name="__VIEWSTATE" value="a">'
+            '<span id="lblMsg">Application submitted successfully but the request was rejected.</span></form>')
+        with self.assertRaises(bot.Uncertain):
+            session.judge_submit(same_clause, instance.targets[0], None, None, set())
 
         page = bot.Page("http://127.0.0.1:9/admission_form.aspx", 429,
                         '<form action="admission_form.aspx"><input name="__VIEWSTATE" value="a"></form>')

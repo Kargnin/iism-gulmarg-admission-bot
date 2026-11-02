@@ -192,7 +192,11 @@ PERMANENT_MOBILE_REFUSAL_PHRASES = [
 SUCCESS_PHRASES = [
     "submitted successfully", "successfully submitted", "has been submitted", "application submitted",
     "form submitted", "registered successfully", "successfully registered", "saved successfully",
-    "successfully saved", "application received",
+    "successfully saved",
+]
+OUTCOME_NEGATIVE_PHRASES = [
+    "not successfully", "unsuccessful", "not submitted", "failed", "failure", "could not", "error",
+    "invalid", "reject", "not accepted", "declined", "unable",
 ]
 AGE_PHRASES = ["age allow", "not eligible", "age should", "age must", "age limit", "invalid date"]
 
@@ -1663,8 +1667,8 @@ def origin(url):
 
 
 class OriginRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def __init__(self, expected, stop):
-        self.expected, self.stop = expected, stop
+    def __init__(self, expected, stop, drain):
+        self.expected, self.stop, self.drain = expected, stop, drain
         self.history = []
 
     def redirect_request(self, request, response, code, message, headers, new_url):
@@ -1674,6 +1678,35 @@ class OriginRedirectHandler(urllib.request.HTTPRedirectHandler):
         if origin(new_url) != self.expected:
             raise RedirectBlocked("Blocked a redirect outside the configured admission site.")
         return super().redirect_request(request, response, code, message, headers, new_url)
+
+    def http_error_302(self, request, response, code, message, headers):
+        wrapped = RedirectResponse(response, self.drain)
+        return super().http_error_302(request, wrapped, code, message, headers)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+class RedirectResponse:
+    def __init__(self, response, drain):
+        self.response, self.drain = response, drain
+        self.body = None
+
+    def read(self, *args, **kwargs):
+        if args or kwargs:
+            return self.response.read(*args, **kwargs)
+        if self.body is None:
+            try:
+                self.body = self.drain(self.response)
+            except BaseException:
+                self.response.close()
+                raise
+        return self.body
+
+    def close(self):
+        return self.response.close()
+
+    def __getattr__(self, name):
+        return getattr(self.response, name)
 
 
 class TransportStartMixin:
@@ -1776,14 +1809,17 @@ def response_retry_after(page):
 
 
 def affirmative_success(text):
-    for phrase in SUCCESS_PHRASES:
-        for match in re.finditer(re.escape(phrase), text):
-            if match.start() and text[match.start() - 1].isalnum():
-                continue
-            prefix = text[max(0, match.start() - 48):match.start()]
-            if re.search(r"\b(?:not|never|unsuccessful|unsuccessfully)\b(?:\W+\w+){0,3}\W*$", prefix):
-                continue
-            return phrase
+    clauses = re.split(r"(?:[.!?;]+|\s+\|\s+|\r?\n+)", text)
+    for clause in clauses:
+        if has_any(clause, OUTCOME_NEGATIVE_PHRASES):
+            continue
+        for phrase in SUCCESS_PHRASES:
+            for match in re.finditer(re.escape(phrase), clause):
+                if match.start() and clause[match.start() - 1].isalnum():
+                    continue
+                if re.search(r"\b(?:no|not|never)\b", clause[:match.start()]):
+                    continue
+                return phrase
     return None
 
 
@@ -1807,7 +1843,7 @@ class Http:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         self.verified = verify
-        self.redirect_handler = OriginRedirectHandler(self.origin, self.stop)
+        self.redirect_handler = OriginRedirectHandler(self.origin, self.stop, self._drain_redirect)
         self.opener = urllib.request.build_opener(TrackedHTTPHandler(self._before_write, self._request_deadline),
                                                   TrackedHTTPSHandler(self._before_write, self._request_deadline, ctx),
                                                   urllib.request.HTTPCookieProcessor(self.jar),
@@ -1821,6 +1857,9 @@ class Http:
         if self._deadline is None:
             raise RuntimeError("HTTP request has no active deadline")
         return self._deadline
+
+    def _drain_redirect(self, response):
+        return self._read_response(response, self._request_deadline())
 
     def check_destination(self, url):
         if self.stop is not None and self.stop.is_set():
@@ -1998,7 +2037,8 @@ class Session:
         """Server messages minus the ones that are part of the page itself."""
         found = page.messages()
         if page.fresh and page.name not in self.static:
-            verdicts = PHONE_USED_PHRASES + FULL_PHRASES + CLOSED_PHRASES + SUCCESS_PHRASES
+            verdicts = (PHONE_USED_PHRASES + FULL_PHRASES + CLOSED_PHRASES + SUCCESS_PHRASES
+                        + OUTCOME_NEGATIVE_PHRASES)
             self.static[page.name] = {m for m in found if not has_any(m.lower(), verdicts)}
         return [m for m in found if m not in self.static.get(page.name, ())]
 
@@ -2339,7 +2379,7 @@ class Session:
         hidden_id = resp.value("hdfAdmissionFormId") or ""
         payment_receipt = (actual_page == "admission_formpayment.aspx" and query.get("rid")
                            and hidden_id == query["rid"] and hidden_id != "0")
-        negative = has_any(said + " | " + text, ("not successfully", "unsuccessful", "not submitted", "failed", "could not", "error"))
+        negative = has_any(said + " | " + text, OUTCOME_NEGATIVE_PHRASES)
         message_success = next((affirmative_success(message.lower()) for message in msgs
                                 if affirmative_success(message.lower())), None)
         page_success = affirmative_success(text) if actual_page == "admissionformsuccess.aspx" else None
@@ -3099,6 +3139,13 @@ class Worker(threading.Thread):
                         phone, session = None, None
                         failures = 0
                     else:
+                        if exc.what == "criteria":
+                            bot.note(session.who, f"{target.label}: {exc}; keeping this preference and number pending",
+                                     warning=True)
+                            bot.attention(("criteria", target.index, str(exc)),
+                                          f"the site stopped {target.label} at its criteria page",
+                                          [str(exc), "The same phone and preference will keep retrying."],
+                                          "review the site's current declaration/criteria and stop the run if action is needed")
                         delay = max(min(10, bot.opt["rejectedRetrySec"]), bot.retry_delay(failures, exc))
                         bot.sleep(delay)
                 except Rejected as exc:
