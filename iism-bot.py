@@ -2789,7 +2789,8 @@ class State:
             self.data = value
         except (OSError, ValueError, TypeError) as exc:
             raise ConfigError(f"Cannot safely read progress {self.path}: {exc}. "
-                              "Keep this file and reconcile existing applications before resetting it.") from exc
+                              "Keep this file unchanged and reconcile it with the same config; do not delete, "
+                              "rename, replace or reset progress.") from exc
 
     def bind(self, identity):
         self.validate_identity(identity)
