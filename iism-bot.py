@@ -285,18 +285,25 @@ VIEWSTATE_ERRORS = [
     "invalid postback or callback argument", "the state information is invalid",
 ]
 
-KIND_PATTERNS = {  # course kind -> (words that identify it in the site's text, words that rule it out)
-    "Snow Skiing": (r"ski", r"water|board|\bmoi\b|\bm o i\b|instruct"),
-    "Snow Boarding": (r"board", r"water"),
-    "MOI": (r"\bmoi\b|\bm o i\b|method of instruction|instructor", r"water"),
+SKI_KIND_PATTERN = r"(?:\bsnow\s*ski(?:ing)?\b|\bski(?:ing)?\b)"
+BOARD_KIND_PATTERN = r"(?:\bsnow\s*board(?:ing)?\b|\bboard(?:ing)?\b)"
+MOI_KIND_PATTERN = (r"(?:\bmoi\b|\bm\s+o\s+i\b|\bmethod\s+of\s+instructions?\b|"
+                    r"\binstructors?\s+(?:course|training)\b|\b(?:ski|skiing)\s+instructors?\b)")
+KIND_PATTERNS = {
+    "Snow Skiing": (SKI_KIND_PATTERN, rf"(?:\bwater\b|{BOARD_KIND_PATTERN}|{MOI_KIND_PATTERN})"),
+    "Snow Boarding": (BOARD_KIND_PATTERN, r"\bwater\b"),
+    "MOI": (MOI_KIND_PATTERN, r"\bwater\b"),
+}
+LEVEL_PATTERNS = {
+    "Basic": r"(?:\bbasic\s*ssc\b|\b(?:basic|beginner)\b)",
+    "Intermediate": r"(?:\b(?:intermediate|intermidiate)\s*ssc\b|\b(?:inter|intermediate|intermidiate)\b)",
+    "Advance": r"(?:\b(?:advance|advanced)\s*ssc\b|\b(?:adv|advance|advanced)\b)",
 }
 CONFIG_LEVEL_PATTERNS = {
-    "Basic": r"\b(?:basic|beginner)\b",
-    "Intermediate": r"\b(?:inter|intermediate|intermidiate)\b",
-    "Advance": r"\b(?:adv|advance|advanced)\b",
+    "Basic": LEVEL_PATTERNS["Basic"],
+    "Intermediate": LEVEL_PATTERNS["Intermediate"],
+    "Advance": LEVEL_PATTERNS["Advance"],
 }
-LEVEL_PATTERNS = {"Basic": r"\bbasic|\bbeginner", "Intermediate": r"\binter",  # the site's text ("Intermidiate")
-                  "Advance": r"\badvance"}                                      # ("adv" would match "Adventure")
 GENERIC_LEVELS = ("none", "na", "n a", "nil", "general", "all", "not applicable")  # the real form has a level "None"
 LOCATION_WORDS = {"gulmarg": ("gulmarg",), "kargil": ("kargil", "ladakh")}
 STATE_ALIASES = [("odisha", "orissa"), ("puducherry", "pondicherry"), ("delhi", "nct of delhi", "new delhi"),
@@ -971,11 +978,12 @@ class Target:
 def course_kind(text):
     t = norm(text)
     found = []
-    if re.search(r"\bsnow\s*board(?:ing)?\b|\bboard(?:ing)?\b", t):
+    if re.search(BOARD_KIND_PATTERN, t):
         found.append("Snow Boarding")
-    if re.search(KIND_PATTERNS["MOI"][0], t):
+    moi = re.search(MOI_KIND_PATTERN, t) is not None
+    if moi:
         found.append("MOI")
-    if re.search(r"\bski(?:ing)?\b", t):
+    if not moi and re.search(SKI_KIND_PATTERN, t):
         found.append("Snow Skiing")
     if len(found) > 1:
         raise ConfigError(f"course {text!r} names more than one course kind")
@@ -1249,14 +1257,14 @@ def parse_settings(cfg, config_path):
     s.dob = None
     dob_text = s.applicant.get("dateOfBirth", "")
     if dob_text and "FILL_ME" not in dob_text:
-        m = re.fullmatch(r"([0-9]{2})/([0-9]{2})/([0-9]{4})", dob_text)
+        m = re.fullmatch(r"([0-9]{2})/([0-9]{2})/((?:19|20)[0-9]{2})", dob_text)
         try:
             s.dob = date(int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else None
         except ValueError:
             s.dob = None
         if s.dob is None:
-            errors.append(f"applicant.dateOfBirth \"{dob_text}\" must use ASCII digits in dd/mm/yyyy, "
-                          "e.g. 15/05/1998")
+            errors.append(f"applicant.dateOfBirth \"{dob_text}\" must use ASCII digits in dd/mm/19xx or "
+                          "dd/mm/20xx, e.g. 15/05/1998")
     rules = load_jsonc(SCRIPT_DIR / "form-rules.json")
     email = s.applicant.get("email", "")
     if email and "FILL_ME" not in email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
@@ -2219,6 +2227,8 @@ class Session:
                             raise Refused(f"the site refused mobile number {mask(self.phone)}: {reason}", "number")
                         raise Transient(f"mobile verification did not go through: {reason}")
                     raise Transient("mobile verification did not go through")
+                if nxt.name in (CRITERIA_PAGE, FORM_PAGE):
+                    self.bot.number_accepted(self.phone)
                 page = nxt
             elif page.name == CRITERIA_PAGE:
                 nxt = self.checked(self.postback(page, "lnkbtnNext", {"chkAccept": "on"}))

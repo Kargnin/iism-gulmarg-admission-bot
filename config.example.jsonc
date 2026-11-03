@@ -7,7 +7,7 @@
   "applicant": {
     "name": "FILL_ME",
     "fatherName": "FILL_ME",
-    "dateOfBirth": "FILL_ME",            // dd/mm/yyyy, e.g. 15/05/1998
+    "dateOfBirth": "FILL_ME",            // dd/mm/19xx or dd/mm/20xx, e.g. 15/05/1998
     "nationality": "Indian",
     "email": "FILL_ME",                  // the payment link is sent here
     "education": "Graduation",           // High School, Intermediate, Graduation or Post graduation

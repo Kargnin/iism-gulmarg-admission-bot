@@ -22,7 +22,7 @@ Use this field map unless the inspected current template differs. All applicant/
 | Information to obtain or confirm | Config field |
 |---|---|
 | Applicant's name, father's name | `applicant.name`, `applicant.fatherName` |
-| DOB in `dd/mm/yyyy`, nationality | `applicant.dateOfBirth`, `applicant.nationality` |
+| DOB in ASCII `dd/mm/19xx` or `dd/mm/20xx`, nationality | `applicant.dateOfBirth`, `applicant.nationality` |
 | Email that can receive the payment link | `applicant.email` |
 | Education, diet, blood group | `applicant.education`, `applicant.diet`, `applicant.bloodGroup` |
 | Emergency contact's name and 10-digit phone | `applicant.emergencyContactName`, `applicant.emergencyContactPhone` |

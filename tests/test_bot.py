@@ -163,6 +163,30 @@ class Matching(unittest.TestCase):
         self.assertEqual(bot.course_candidates([("0", "Select Course"), ("9", "Adventure Courses")],
                                                target("K2 Basic")), [("9", "Adventure Courses")])
 
+    def test_semantic_tokens_do_not_match_misleading_substrings(self):
+        ski = target("G2 Basic")
+        self.assertEqual(bot.kind_score("Gulmarg Skills Training 03 Jan 2027", "Snow Skiing"), 0)
+        self.assertEqual(bot.kind_score("Keyboarding Workshop", "Snow Boarding"), 0)
+        self.assertEqual(bot.kind_score("Instructor biography", "MOI"), 0)
+        for text in ("Ski", "Skiing", "SnowSki", "SnowSkiing", "Snow Skiing"):
+            with self.subTest(ski=text):
+                self.assertGreater(bot.kind_score(text, "Snow Skiing"), 0)
+        for text in ("SnowBoarding", "Snow Boarding", "Boarding"):
+            with self.subTest(board=text):
+                self.assertGreater(bot.kind_score(text, "Snow Boarding"), 0)
+        for text in ("MOI", "M.O.I.", "Method of Instruction", "Instructor Course"):
+            with self.subTest(moi=text):
+                self.assertGreater(bot.kind_score(text, "MOI"), 0)
+        self.assertEqual(bot.level_score("International Training", target("G2 Intermediate")), 0)
+        self.assertEqual(bot.level_score("Interview Round", target("G2 Intermediate")), 0)
+        self.assertEqual(bot.level_score("Adventure Course", target("G2 Advance")), 0)
+        self.assertGreater(bot.level_score("IntermidiateSSC", target("G2 Intermediate")), 0)
+        self.assertGreater(bot.level_score("Advanced SSC", target("G2 Advance")), 0)
+        options = [("9", "Gulmarg Skills Basic Training 03 Jan 2027"),
+                   ("10", "Snow Skiing Courses at Gulmarg")]
+        self.assertEqual(bot.course_candidates(options, ski)[0][0], "10")
+        self.assertIn(("9", options[0][1]), bot.course_candidates([options[0]], ski))
+
     def test_non_skiing_targets_reject_known_competitors_but_keep_generic_paths(self):
         moi, board = target("G5 MOI"), target("G4 Snowboarding")
         basic = ("21", "Snow Skiing Basic Course")
@@ -596,6 +620,21 @@ class ConfigurationAndDocuments(unittest.TestCase):
                     self.assertEqual(errors, [])
                     self.assertEqual(settings.opens_at.utcoffset(), offset)
                     self.assertEqual((settings.opens_at.hour, settings.opens_at.minute), clock)
+
+    def test_dob_matches_the_observed_century_syntax_without_local_age_policy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            for value in ("01/01/1899", "01/01/2100"):
+                with self.subTest(invalid=value):
+                    cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], applicant={"dateOfBirth": value})
+                    errors = bot.parse_settings(cfg, None)[1]
+                    self.assertTrue(any("dd/mm/19xx" in error for error in errors), errors)
+            for value in ("01/01/1900", "31/12/2000"):
+                with self.subTest(valid=value):
+                    cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], applicant={"dateOfBirth": value})
+                    self.assertEqual(bot.parse_settings(cfg, None)[1], [])
+            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], applicant={"dateOfBirth": "01/01/2099"})
+            self.assertTrue(any("future" in error for error in bot.parse_settings(cfg, None)[1]))
 
     def test_rejects_unreadable_configured_dates_and_missing_schedule(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1235,6 +1274,34 @@ class EndToEnd(unittest.TestCase):
         instance = self.run_with(PHONES[:2], ["G2 Basic"])
         self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[1], "confirmed")])
 
+    def test_mobile_acceptance_resets_prior_consecutive_refusals(self):
+        original_instructions = mock_site.Handler.post_instructions
+        original_criteria = mock_site.Handler.post_criteria
+        mobile_attempts = []
+        criteria_refusals = []
+
+        def staged_mobile(handler, session, values):
+            if values.get("txtMobileNo") == PHONES[0]:
+                mobile_attempts.append(PHONES[0])
+                if len(mobile_attempts) in (1, 2, 4):
+                    return handler.send(200, handler.instructions("Please Enter Valid Mobile No."))
+            return original_instructions(handler, session, values)
+
+        def refuse_first_criteria(handler, session, query, values):
+            if session["mobile"] == PHONES[0] and not criteria_refusals:
+                criteria_refusals.append(handler.sid)
+                return handler.send(200, handler.criteria(session["mobile"], "Review the revised declaration."))
+            return original_criteria(handler, session, query, values)
+
+        with mock.patch.object(mock_site.Handler, "post_instructions", staged_mobile), \
+                mock.patch.object(mock_site.Handler, "post_criteria", refuse_first_criteria):
+            instance = self.run_with(PHONES[:2], ["G2 Basic"])
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(mobile_attempts), 5)
+        self.assertEqual(len(criteria_refusals), 1)
+        self.assertEqual(instance.refusals, {})
+        self.assertNotIn(PHONES[1], self.site.used)
+
     def test_temporary_mobile_messages_never_consume_the_primary(self):
         original = mock_site.Handler.post_instructions
         refusals = []
@@ -1694,6 +1761,21 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(instance.targets[0].level, "Basic")
         self.assertEqual((self.site.applications[0]["course"], self.site.applications[0]["level"],
                           self.site.applications[0]["schedule"]), (course_id, basic_id, batch_id))
+
+    def test_misleading_skills_course_never_outranks_real_skiing(self):
+        course_id, level_id, batch_id = self.key("G2")
+        fake_id = "98"
+        fake = copy.deepcopy(self.site.courses[course_id])
+        fake["name"] = "Gulmarg Skills Basic Training 03 Jan 2027"
+        fake["always"] = True
+        self.site.courses[fake_id] = fake
+        for level, _ in fake["levels"]:
+            for batch, *_ in fake["batches"]:
+                self.site.seats[(fake_id, level, batch)] = 3
+        instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertTrue(instance.finished())
+        self.assertEqual((self.site.applications[0]["course"], self.site.applications[0]["level"],
+                          self.site.applications[0]["schedule"]), (course_id, level_id, batch_id))
 
     def test_date_only_generic_match_warns_but_still_attempts(self):
         course_id, _, batch_id = self.key("G2")
