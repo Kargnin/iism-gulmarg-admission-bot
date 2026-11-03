@@ -588,6 +588,19 @@ class ConfigurationAndDocuments(unittest.TestCase):
             self.assertEqual(seen, [PHONES[0]])
             self.assertEqual(run_discover.call_count, 1)
 
+    def test_discover_preserves_phone_per_preference_cardinality(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            path = tmp / "config.json"
+            path.write_text(json.dumps(make_config(tmp, PHONES[:1], ["G2 Basic", "G3 Basic"])))
+            with mock.patch.object(bot, "prepare_documents", return_value=([], [])), \
+                    mock.patch.object(bot, "Bot") as bot_type, \
+                    mock.patch.object(bot.Log, "open"), mock.patch.object(bot.Log, "write"):
+                result = bot.main(["--discover", "--config", str(path),
+                                   "--base-url", "http://127.0.0.1:9"])
+            self.assertEqual(result, 2)
+            bot_type.assert_not_called()
+
     def test_booking_open_requires_an_explicit_time_but_keeps_supported_timestamps(self):
         with tempfile.TemporaryDirectory() as folder:
             tmp = Path(folder)
@@ -1276,9 +1289,9 @@ class EndToEnd(unittest.TestCase):
 
     def test_mobile_acceptance_resets_prior_consecutive_refusals(self):
         original_instructions = mock_site.Handler.post_instructions
-        original_criteria = mock_site.Handler.post_criteria
+        original_criteria = mock_site.Handler.criteria
         mobile_attempts = []
-        criteria_refusals = []
+        closed_criteria = []
 
         def staged_mobile(handler, session, values):
             if values.get("txtMobileNo") == PHONES[0]:
@@ -1287,18 +1300,19 @@ class EndToEnd(unittest.TestCase):
                     return handler.send(200, handler.instructions("Please Enter Valid Mobile No."))
             return original_instructions(handler, session, values)
 
-        def refuse_first_criteria(handler, session, query, values):
-            if session["mobile"] == PHONES[0] and not criteria_refusals:
-                criteria_refusals.append(handler.sid)
-                return handler.send(200, handler.criteria(session["mobile"], "Review the revised declaration."))
-            return original_criteria(handler, session, query, values)
+        def close_first_criteria(handler, mobile, alert=None):
+            body = original_criteria(handler, mobile, alert)
+            if mobile == PHONES[0] and not closed_criteria:
+                closed_criteria.append(handler.sid)
+                body = body.replace("</form>", '<span id="lblMsg">Registration is closed.</span></form>')
+            return body
 
         with mock.patch.object(mock_site.Handler, "post_instructions", staged_mobile), \
-                mock.patch.object(mock_site.Handler, "post_criteria", refuse_first_criteria):
+                mock.patch.object(mock_site.Handler, "criteria", close_first_criteria):
             instance = self.run_with(PHONES[:2], ["G2 Basic"])
         self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
         self.assertEqual(len(mobile_attempts), 5)
-        self.assertEqual(len(criteria_refusals), 1)
+        self.assertEqual(len(closed_criteria), 1)
         self.assertEqual(instance.refusals, {})
         self.assertNotIn(PHONES[1], self.site.used)
 

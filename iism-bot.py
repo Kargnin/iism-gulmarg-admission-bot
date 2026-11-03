@@ -130,6 +130,7 @@ CONFIG_ROOT_KEYS = {
     "applicant", "address", "phoneNumbers", "coursePriorities",
     "bookingOpensAt", "scheduleFile", "batches", "documentsDir", "documents", "bot",
 }
+PHONE_CARDINALITY_ERROR = "phoneNumbers needs one primary number per course preference; additional numbers are reserves"
 
 # config value -> text box on admission_form.aspx
 TEXT_FIELDS = [
@@ -1346,7 +1347,7 @@ def parse_settings(cfg, config_path):
 
     s.opt = validate_tuning(cfg, errors)
     if len(s.phones) < len(s.targets):
-        errors.append("phoneNumbers needs one primary number per course preference; additional numbers are reserves")
+        errors.append(PHONE_CARDINALITY_ERROR)
     if s.opens_at is None:
         warnings.append("no booking opening time configured (bookingOpensAt) - the bot starts right away")
 
@@ -2219,6 +2220,8 @@ class Session:
                 return page
             if page.name == INSTRUCTIONS_PAGE:
                 nxt = self.checked(self.postback(page, "lnkbtnSubmit", {"txtMobileNo": self.phone}))
+                if nxt.name in (CRITERIA_PAGE, FORM_PAGE):
+                    self.bot.number_accepted(self.phone)
                 said = self.verdict(nxt, deep=nxt.name == INSTRUCTIONS_PAGE, full_ok=False)
                 if nxt.name == INSTRUCTIONS_PAGE:
                     if said:
@@ -2227,8 +2230,6 @@ class Session:
                             raise Refused(f"the site refused mobile number {mask(self.phone)}: {reason}", "number")
                         raise Transient(f"mobile verification did not go through: {reason}")
                     raise Transient("mobile verification did not go through")
-                if nxt.name in (CRITERIA_PAGE, FORM_PAGE):
-                    self.bot.number_accepted(self.phone)
                 page = nxt
             elif page.name == CRITERIA_PAGE:
                 nxt = self.checked(self.postback(page, "lnkbtnNext", {"chkAccept": "on"}))
@@ -3556,7 +3557,8 @@ def main(argv=None):
         for warning in warnings:
             log.warn(warning)
         if args.discover and settings.phones:
-            errors, problems = [], []
+            errors = [error for error in errors if error == PHONE_CARDINALITY_ERROR]
+            problems = []
         if errors or problems:
             for problem in errors + problems:
                 log.error(problem)
