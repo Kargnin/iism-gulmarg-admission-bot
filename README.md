@@ -1,81 +1,110 @@
 # IISM Gulmarg Admission Bot
 
-Automates submission of the [IISM Gulmarg](https://admission.iismgulmarg.in/) course admission form via direct HTTP API calls. Zero dependencies — Python 3 stdlib only. No browser automation needed.
+Prepare your details once, then run this bot locally on booking day. It uses Python 3.8+ and the standard library: no pip packages or Chrome are needed.
 
-## Quick Start
+**Easiest setup:** copy [prompt.md](prompt.md) into a new chat with an AI coding agent that can use your computer. It will clone the project, help fill your private config and prepare documents, check readiness, and leave you the booking-day command. Setup does not submit a real application or make a payment.
+
+## 1. Download the bot
+
+Install Git and Python 3.8+ first if they are not available. The commands below use a macOS/Linux shell; on Windows use the installed Python command (`py -3` or `python`) in place of `python3`. The AI setup route can handle the OS-specific commands for you.
 
 ```bash
-# 1. Set up your config
-cp config.example.json config.json
-# Edit config.json with your personal details
-
-# 2. Place your documents in documents/
-#    - photo.png          (Photo of applicant)
-#    - signature.png      (Signature of applicant)
-#    - dob_proof.png      (Date of birth proof)
-#    - domicile_proof.png  (Domicile proof)
-#    - education_proof.png (Education qualification proof)
-#    - skiing_certificate.png (Skiing certificate, if applicable)
-#    - parent_signature.png   (Parent/guardian signature)
-#    All files must be <500KB, png/jpg/jpeg format.
-
-# 3. Run
-python3 iism-bot.py
+git clone https://github.com/Kargnin/iism-gulmarg-admission-bot.git
+cd iism-gulmarg-admission-bot
+mkdir -p configs
+chmod 700 configs
+cp config.example.jsonc configs/me.jsonc
+chmod 600 configs/me.jsonc
 ```
 
-## Configuration
+Keep `iism-bot.py`, `schedule.json`, and `form-rules.json` together. `configs/`, `documents/`, and `runs/` are ignored by Git; keep personal files there or in your own local document folder. Never commit them. On macOS/Linux, keep each personal config at mode `600` and its containing directory at `700`; bot-owned run artifacts are created with the same owner-only policy.
 
-Copy `config.example.json` to `config.json` and fill in:
+## 2. Fill your details and choose batches
 
-| Section | What to set |
-|---|---|
-| `applicant` | Name, DOB (dd/MM/yyyy), email, blood group, physical stats, emergency contact |
-| `applicant.mobileNumbers` | Multiple phone numbers — tried in order, already-registered ones skipped |
-| `address` | Permanent address details |
-| `course` | Select by position (`"1"` = first non-default option) or by exact display text |
-| `documents` | Paths to your document files under `documents/` |
-| `bot` | Retry behavior, pipeline attempts, target time scheduling |
-| `serverDefaults` | Server-populated values — discovered automatically, change only if needed |
+Open `configs/me.jsonc`. Replace every `FILL_ME`, confirm the supplied defaults, and choose your own `coursePriorities`. A simple choice looks like `"G2 Basic"`; you do not need to copy the website's exact course wording. Reasonable state, education, and diet variations are resolved to website choices; review the resolved values during checks.
 
-### Course Selection
+Each preference gets the phone number at the same position in `phoneNumbers`. For two preferences, provide at least two different primary numbers. Extra numbers are reserves, used only when a primary is explicitly already used or persistently refused by mobile verification. All preferences run in parallel by default, and **every preference is attempted**. These are independent applications, not a first-choice/backup list.
 
-Use position numbers (recommended) or exact text:
+`phoneNumbers` accepts 10-digit ASCII strings or integers. String phone values, including `applicant.emergencyContactPhone`, may use a leading `+91`, `91`, or `0` plus common spaces, parentheses, and hyphens. The entire value must be a phone number—not a label such as `Home:` or an extension. Valid inputs are normalized to exactly 10 ASCII digits before they are stored or posted; saved progress remains strict canonical text.
+
+Basic skiing is the supported path. Intermediate/Advance choices produce a warning; those paths are not fully supported or validated.
+
+### Advanced preference objects
+
+Use an object only when a batch string cannot express the choice, for example when you need explicit date/location evidence or optional website-text hints. Every value is text:
+
 ```json
-"course": {
-  "name": "1",       // 1 = first non-default course
-  "level": "1",      // 1 = first non-default level
-  "schedule": "1"    // 1 = first schedule, auto-falls back to 2,3... if 0 seats
+{
+  "batch": "G2",
+  "course": "Snow Skiing",
+  "level": "Basic",
+  "from": "2027-01-03",
+  "to": "2027-01-16",
+  "location": "Gulmarg",
+  "label": "G2 Basic",
+  "courseText": "Snow Skiing",
+  "levelText": "Basic SSC",
+  "batchText": "03 Jan"
 }
 ```
 
-When `schedule` has 0 seats, the bot automatically tries the next schedule.
+- `batch` names a code from the active schedule. Without one, `from` is required.
+- `course` is `Snow Skiing`, `Snow Boarding`, or `MOI`; `level` is a skiing level such as `Basic` (Intermediate/Advance remain unsupported paths).
+- `from`, optional `to`, and `location` supply or override the schedule evidence used for matching. Each date field must contain exactly one written date, remain inside the declared financial season, and the end cannot precede the start.
+- `label` is the name shown in logs and prompts.
+- `courseText`, `levelText`, and `batchText` are optional live-label hints. They only break ties among semantically compatible choices and cannot override conflicting course, level, date, or location evidence.
 
-### Multiple Phone Numbers
+The checked-in 2026–27 schedule opens **12 November 2026 at 10:00 IST**:
 
-```json
-"applicant": {
-  "mobileNumbers": ["9876543210", "9876543211", "9826372819"]
-}
+| Batch | Location | Course dates |
+|---|---|---|
+| G1 | Gulmarg | 20 Dec 2026–2 Jan 2027 |
+| G2 | Gulmarg | 3–16 Jan 2027 |
+| G3 | Gulmarg | 17–30 Jan 2027 |
+| G4 | Gulmarg | 31 Jan–13 Feb 2027 |
+| G5 | Gulmarg | 14–27 Feb 2027 |
+| G6 | Gulmarg | 28 Feb–13 Mar 2027 |
+| K1 | Kargil | 8–21 Feb 2027 |
+| K2 | Kargil | 22 Feb–7 Mar 2027 |
+
+Dates and opening time come from `schedule.json`. Missing, full, or disappearing slots keep being checked until that preference succeeds or you stop the bot.
+
+A replacement `scheduleFile` must declare its financial season in canonical `YYYY-YY` form (for example, `2026-27`). The years must be adjacent, and all effective source or top-level override batch dates must fall from 1 April of the first year through 31 March of the second. Same-season top-level batch overrides remain supported; moving dates into another financial year requires a replacement schedule with that new season so progress stays isolated. `bookingOpensAt` is an independent timestamp and may be overridden separately.
+
+## 3. Prepare documents and check
+
+Set `documentsDir` to your local document folder and fill the filenames in `documents`. You need a photo, applicant signature, DOB proof, and education proof. The website calculates age after DOB entry. If it reports an applicant under 18 or explicitly requires guardian proof, a real guardian signature is required; adults may supply one in advance too. The bot does not infer guardian eligibility from course dates.
+
+Uploads must be nonempty JPG/JPEG/PNG files, **at most 500 KB each**. On macOS, the bot can convert PDFs and oversized images without changing originals. PDF conversion uses the first page only. Review the prepared files for readable text, the right person, and all necessary information. Windows/Linux users should supply ready images.
+
+```bash
+python3 iism-bot.py --config configs/me.jsonc --check
 ```
 
-Numbers that return "already registered" are skipped. The bot cycles through remaining numbers.
+Fix any reported config or document errors and run the check again. With valid local files, `--check` also makes one read-only site request; it sends no application data. A reachable mobile-entry page does not prove that date slots are published or that an application will succeed.
 
-## CLI Options
+For an optional supervised live rehearsal:
 
-```
-python3 iism-bot.py --dry-run         # Fill everything but don't submit
-python3 iism-bot.py --target=10:00    # Wait until ~5 min before target time
-python3 iism-bot.py --max-retries=5   # Override max retries per step
-python3 iism-bot.py --reset-cache     # Clear cached course options
+```bash
+python3 iism-bot.py --config configs/me.jsonc --dry-run --now
 ```
 
-## How It Works
+This sends your mobile number, course choices, state, and DOB to the live form and validates the latest final-form controls, selections, seats/fee presence, and applicable prepared documents. It stops before durable submission state, final application transmission, and document uploads. It can wait indefinitely for unpublished slots. Press **Ctrl+C** after readiness is demonstrated or the expected missing-slot state appears. An AI-assisted setup can also rehearse against the local mock with fictional data; see [prompt.md](prompt.md).
 
-Direct HTTP calls to the ASP.NET WebForms backend — no browser, no Selenium, no Playwright:
+## 4. Run on booking day
 
-1. **Mobile verification** — POST to `Admission_instructions.aspx`
-2. **Accept criteria** — POST to `Admission_criteria.aspx`
-3. **Cascading dropdowns** — POST each `onchange`-enabled dropdown (course → schedule → state → DOB), extracting VIEWSTATE/EVENTVALIDATION from each response
-4. **Submit** — multipart/form-data POST with all fields and file uploads
+Run this command yourself in an interactive terminal and keep the computer awake and connected:
 
-Handles ASP.NET quirks: VIEWSTATE, EVENTVALIDATION, cookie-based sessions, cascading dependent dropdowns, and position-based option selection with caching.
+```bash
+python3 iism-bot.py --config configs/me.jsonc
+```
+
+It prepares documents, waits until shortly before opening, then checks continuously. Add `--now` only when you intend to start checking immediately. Recoverable errors start a fresh session with the same phone and prepared documents; retry waits grow up to 10 seconds. Ctrl+C stops further work. Restart with the same config to preserve progress in `runs/`.
+
+If a final reply is uncertain, that preference waits for you to check the actual application/email and answer **`booked`** or **`not booked`** in the terminal. Other workers continue. Do not guess or delete saved progress to retry.
+
+There is no progress-reset mode. Restart with the same config and reconcile any saved uncertain application instead of renaming, deleting, or replacing its state.
+
+The bot does not pay fees. Watch the configured email for the payment link and follow its deadline. IISM's one-course-per-person-per-year and non-refundable-fee rules still apply; separate phone numbers do not establish eligibility. Booking is not guaranteed.
+
+The existing client may continue without certificate verification after a logged certificate error. If the site positively reports an adult and nevertheless insists on a guardian upload, the default `bot.parentSignatureFallback` permits reusing the applicant's signature. A reported minor needs a real guardian signature, and missing website age never enables substitution. See [booking behavior and evidence](docs/booking-decisions.md) for details and unverified live boundaries.

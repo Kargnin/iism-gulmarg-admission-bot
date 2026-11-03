@@ -1,0 +1,1067 @@
+{
+  "source": "https://admission.iismgulmarg.in",
+  "observedAt": "2026-11-02T20:24:09.242458+05:30",
+  "scope": "Mobile verification, terms, form and one course dropdown postback only; no final submit.",
+  "finalApplicationsSent": 0,
+  "usedOwnedNumbers": 0,
+  "controls": [
+    {
+      "name": "__EVENTTARGET",
+      "id": "__EVENTTARGET",
+      "type": "hidden"
+    },
+    {
+      "name": "__EVENTARGUMENT",
+      "id": "__EVENTARGUMENT",
+      "type": "hidden"
+    },
+    {
+      "name": "__LASTFOCUS",
+      "id": "__LASTFOCUS",
+      "type": "hidden"
+    },
+    {
+      "name": "__VIEWSTATE",
+      "id": "__VIEWSTATE",
+      "type": "hidden"
+    },
+    {
+      "name": "__VIEWSTATEGENERATOR",
+      "id": "__VIEWSTATEGENERATOR",
+      "type": "hidden"
+    },
+    {
+      "name": "__EVENTVALIDATION",
+      "id": "__EVENTVALIDATION",
+      "type": "hidden"
+    },
+    {
+      "name": "hdfAdmissionFormId",
+      "id": "hdfAdmissionFormId",
+      "type": "hidden"
+    },
+    {
+      "name": "ddlCourse",
+      "id": "ddlCourse",
+      "onchange": "javascript:setTimeout('__doPostBack(\\'ddlCourse\\',\\'\\')', 0)"
+    },
+    {
+      "name": "vcerfvddlCourse_ClientState",
+      "id": "vcerfvddlCourse_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "ddlCourseLevel",
+      "id": "ddlCourseLevel",
+      "onchange": "javascript:setTimeout('__doPostBack(\\'ddlCourseLevel\\',\\'\\')', 0)"
+    },
+    {
+      "name": "vcerfvddlCourseLevel_ClientState",
+      "id": "vcerfvddlCourseLevel_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "ddlScheduleCourse",
+      "id": "ddlScheduleCourse",
+      "onchange": "javascript:setTimeout('__doPostBack(\\'ddlScheduleCourse\\',\\'\\')', 0)"
+    },
+    {
+      "name": "vcerfvddlScheduleCourse_ClientState",
+      "id": "vcerfvddlScheduleCourse_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "hdfTypeOfCapacitySheet",
+      "id": "hdfTypeOfCapacitySheet",
+      "type": "hidden"
+    },
+    {
+      "name": "hdfCapacitySheetAllocationId",
+      "id": "hdfCapacitySheetAllocationId",
+      "type": "hidden"
+    },
+    {
+      "name": "ddlState",
+      "id": "ddlState",
+      "onchange": "javascript:setTimeout('__doPostBack(\\'ddlState\\',\\'\\')', 0)"
+    },
+    {
+      "name": "vcerfvddlState_ClientState",
+      "id": "vcerfvddlState_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtAvailableSeat",
+      "id": "txtAvailableSeat",
+      "type": "text",
+      "readonly": "readonly"
+    },
+    {
+      "name": "hdfMinimumAge",
+      "id": "hdfMinimumAge",
+      "type": "hidden"
+    },
+    {
+      "name": "hdfMaximumAge",
+      "id": "hdfMaximumAge",
+      "type": "hidden"
+    },
+    {
+      "name": "hdfAgeCountDate",
+      "id": "hdfAgeCountDate",
+      "type": "hidden"
+    },
+    {
+      "name": "txtCourseFee",
+      "id": "txtCourseFee",
+      "type": "text",
+      "readonly": "readonly"
+    },
+    {
+      "name": "vcerfvtxtCourseFee_ClientState",
+      "id": "vcerfvtxtCourseFee_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "hdfAgeCriteria",
+      "id": "hdfAgeCriteria",
+      "type": "hidden"
+    },
+    {
+      "name": "txtName",
+      "id": "txtName",
+      "type": "text",
+      "maxlength": "50"
+    },
+    {
+      "name": "vcerfvtxtName_ClientState",
+      "id": "vcerfvtxtName_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtFatherName",
+      "id": "txtFatherName",
+      "type": "text",
+      "maxlength": "50"
+    },
+    {
+      "name": "vcerfvtxtFatherName_ClientState",
+      "id": "vcerfvtxtFatherName_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtNationality",
+      "id": "txtNationality",
+      "type": "text",
+      "maxlength": "50"
+    },
+    {
+      "name": "vcerfvtxtNationality_ClientState",
+      "id": "vcerfvtxtNationality_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtDateOfBirth",
+      "id": "txtDateOfBirth",
+      "type": "text",
+      "maxlength": "10",
+      "onchange": "javascript:setTimeout('__doPostBack(\\'txtDateOfBirth\\',\\'\\')', 0)"
+    },
+    {
+      "name": "vcerfvtxtDateOfBirth_ClientState",
+      "id": "vcerfvtxtDateOfBirth_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "vceregvtxtDateOfBirth_ClientState",
+      "id": "vceregvtxtDateOfBirth_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "FupBirthCertificate",
+      "id": "FupBirthCertificate",
+      "type": "file",
+      "onchange": "checkFileSize(this)"
+    },
+    {
+      "name": "hdfFupBirthCertificate",
+      "id": "hdfFupBirthCertificate",
+      "type": "hidden"
+    },
+    {
+      "name": "vcerfvFupBirthCertificate_ClientState",
+      "id": "vcerfvFupBirthCertificate_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "vceregvFupBirthCertificate_ClientState",
+      "id": "vceregvFupBirthCertificate_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtDomicile",
+      "id": "txtDomicile",
+      "type": "text",
+      "maxlength": "50"
+    },
+    {
+      "name": "FupDomicileAttachProof",
+      "id": "FupDomicileAttachProof",
+      "type": "file",
+      "onchange": "checkFileSize(this)"
+    },
+    {
+      "name": "hdfFupDomicileAttachProof",
+      "id": "hdfFupDomicileAttachProof",
+      "type": "hidden"
+    },
+    {
+      "name": "vceregvFupDomicileAttachProof_ClientState",
+      "id": "vceregvFupDomicileAttachProof_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtHouseNoApartment",
+      "id": "txtHouseNoApartment",
+      "type": "text",
+      "maxlength": "50"
+    },
+    {
+      "name": "vcerfvtxtHouseNoApartment_ClientState",
+      "id": "vcerfvtxtHouseNoApartment_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtStreetVillageColony",
+      "id": "txtStreetVillageColony",
+      "type": "text",
+      "maxlength": "250"
+    },
+    {
+      "name": "vcerfvtxtStreetVillageColony_ClientState",
+      "id": "vcerfvtxtStreetVillageColony_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtDistrictCity",
+      "id": "txtDistrictCity",
+      "type": "text",
+      "maxlength": "50"
+    },
+    {
+      "name": "vcerfvtxtDistrictCity_ClientState",
+      "id": "vcerfvtxtDistrictCity_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtPincode",
+      "id": "txtPincode",
+      "type": "text",
+      "maxlength": "6"
+    },
+    {
+      "name": "vcerfvtxtPincode_ClientState",
+      "id": "vcerfvtxtPincode_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtMobileNo",
+      "id": "txtMobileNo",
+      "type": "text",
+      "maxlength": "10"
+    },
+    {
+      "name": "vcerfvtxtMobileNo_ClientState",
+      "id": "vcerfvtxtMobileNo_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtEmailId",
+      "id": "txtEmailId",
+      "type": "text"
+    },
+    {
+      "name": "vcerfvtxtEmailId_ClientState",
+      "id": "vcerfvtxtEmailId_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "vcerevemailid_ClientState",
+      "id": "vcerevemailid_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "ddlEduationQualification",
+      "id": "ddlEduationQualification"
+    },
+    {
+      "name": "vcerfvddlEduationQualification_ClientState",
+      "id": "vcerfvddlEduationQualification_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "FupEducationQualification",
+      "id": "FupEducationQualification",
+      "type": "file",
+      "onchange": "checkFileSize(this)"
+    },
+    {
+      "name": "hdfEducationQualification",
+      "id": "hdfEducationQualification",
+      "type": "hidden"
+    },
+    {
+      "name": "vcerfvFupEducationQualification_ClientState",
+      "id": "vcerfvFupEducationQualification_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "vceregvFupEducationQualification_ClientState",
+      "id": "vceregvFupEducationQualification_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "FupAnyAdventureCoursePhoto",
+      "id": "FupAnyAdventureCoursePhoto",
+      "type": "file",
+      "onchange": "checkFileSize(this)"
+    },
+    {
+      "name": "hdfAnyAdventureCoursePhoto",
+      "id": "hdfAnyAdventureCoursePhoto",
+      "type": "hidden"
+    },
+    {
+      "name": "vceregvFupAnyAdventureCoursePhoto_ClientState",
+      "id": "vceregvFupAnyAdventureCoursePhoto_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "FupCurrentEmployment",
+      "id": "FupCurrentEmployment",
+      "type": "file",
+      "onchange": "checkFileSize(this)"
+    },
+    {
+      "name": "hdfCurrentEmployment",
+      "id": "hdfCurrentEmployment",
+      "type": "hidden"
+    },
+    {
+      "name": "vceregvFupCurrentEmployment_ClientState",
+      "id": "vceregvFupCurrentEmployment_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "ddlVegetarianOrNon",
+      "id": "ddlVegetarianOrNon"
+    },
+    {
+      "name": "ValidatorCalloutExtender1_ClientState",
+      "id": "ValidatorCalloutExtender1_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtBloodGroup",
+      "id": "txtBloodGroup",
+      "type": "text",
+      "maxlength": "50"
+    },
+    {
+      "name": "vcerfvtxtBloodGroup_ClientState",
+      "id": "vcerfvtxtBloodGroup_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtMedicalCategory",
+      "id": "txtMedicalCategory",
+      "type": "text",
+      "maxlength": "50"
+    },
+    {
+      "name": "txtHeight",
+      "id": "txtHeight",
+      "type": "text",
+      "maxlength": "50"
+    },
+    {
+      "name": "txtWeight",
+      "id": "txtWeight",
+      "type": "text",
+      "maxlength": "50"
+    },
+    {
+      "name": "txtWaist",
+      "id": "txtWaist",
+      "type": "text",
+      "maxlength": "50"
+    },
+    {
+      "name": "txtShoeSize",
+      "id": "txtShoeSize",
+      "type": "text",
+      "maxlength": "50"
+    },
+    {
+      "name": "FupPhototOfApplicant",
+      "id": "FupPhototOfApplicant",
+      "type": "file",
+      "onchange": "checkFileSize(this)"
+    },
+    {
+      "name": "hdfPhototOfApplicant",
+      "id": "hdfPhototOfApplicant",
+      "type": "hidden"
+    },
+    {
+      "name": "vcerfvFupPhototOfApplicant_ClientState",
+      "id": "vcerfvFupPhototOfApplicant_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "vceregvFupPhototOfApplicant_ClientState",
+      "id": "vceregvFupPhototOfApplicant_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "FupSignatureOfAppicant",
+      "id": "FupSignatureOfAppicant",
+      "type": "file",
+      "onchange": "checkFileSize(this)"
+    },
+    {
+      "name": "hdfFupSignatureOfAppicant",
+      "id": "hdfFupSignatureOfAppicant",
+      "type": "hidden"
+    },
+    {
+      "name": "vcerfvFupSignatureOfAppicant_ClientState",
+      "id": "vcerfvFupSignatureOfAppicant_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "vceregvFupSignatureOfAppicant_ClientState",
+      "id": "vceregvFupSignatureOfAppicant_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtEmergencyContactName",
+      "id": "txtEmergencyContactName",
+      "type": "text",
+      "maxlength": "50"
+    },
+    {
+      "name": "vcerfvtxtEmergencyContactName_ClientState",
+      "id": "vcerfvtxtEmergencyContactName_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "txtEmergencyContactPhone",
+      "id": "txtEmergencyContactPhone",
+      "type": "text",
+      "maxlength": "10"
+    },
+    {
+      "name": "vcerfvtxtEmergencyContactPhone_ClientState",
+      "id": "vcerfvtxtEmergencyContactPhone_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "FupParentGuardianSignature",
+      "id": "FupParentGuardianSignature",
+      "type": "file",
+      "onchange": "checkFileSize(this)"
+    },
+    {
+      "name": "hdfParentGuardianSignature",
+      "id": "hdfParentGuardianSignature",
+      "type": "hidden"
+    },
+    {
+      "name": "vcerfvFupParentGuardianSignature_ClientState",
+      "id": "vcerfvFupParentGuardianSignature_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "vceregvFupParentGuardianSignature_ClientState",
+      "id": "vceregvFupParentGuardianSignature_ClientState",
+      "type": "hidden"
+    },
+    {
+      "name": "chkIAgree",
+      "id": "chkIAgree",
+      "type": "checkbox"
+    },
+    {
+      "name": "btnSubmit",
+      "id": "btnSubmit",
+      "type": "submit"
+    },
+    {
+      "name": "btnReset",
+      "id": "btnReset",
+      "type": "submit"
+    }
+  ],
+  "options": {
+    "ddlCourse": [
+      [
+        "0",
+        "Select Course"
+      ],
+      [
+        "4",
+        "Snow Skiing Courses at Gulmarg"
+      ],
+      [
+        "5",
+        "Snow Skiing Courses at Kargil"
+      ],
+      [
+        "12",
+        "MOI Courses at Gulmarg"
+      ]
+    ],
+    "ddlCourseLevel": [
+      [
+        "0",
+        "Select Course Level"
+      ]
+    ],
+    "ddlScheduleCourse": [
+      [
+        "0",
+        "Select Schedule Course"
+      ]
+    ],
+    "ddlState": [
+      [
+        "0",
+        "Select State"
+      ],
+      [
+        "35",
+        "ANDAMAN AND NICOBAR ISLANDS"
+      ],
+      [
+        "2",
+        "Andhra Pradesh"
+      ],
+      [
+        "37",
+        "ANDHRA PRADESH (NEW)"
+      ],
+      [
+        "28",
+        "ANDHRA PRADESH(BEFORE DIVISION)"
+      ],
+      [
+        "12",
+        "ARUNACHAL PRADESH"
+      ],
+      [
+        "18",
+        "ASSAM"
+      ],
+      [
+        "10",
+        "BIHAR"
+      ],
+      [
+        "4",
+        "CHANDIGARH"
+      ],
+      [
+        "22",
+        "CHATTISGARH"
+      ],
+      [
+        "26",
+        "DADRA AND NAGAR HAVELI"
+      ],
+      [
+        "25",
+        "DAMAN AND DIU"
+      ],
+      [
+        "7",
+        "DELHI"
+      ],
+      [
+        "30",
+        "GOA"
+      ],
+      [
+        "24",
+        "GUJARAT"
+      ],
+      [
+        "6",
+        "HARYANA"
+      ],
+      [
+        "38",
+        "HIMACHAL PRADESH"
+      ],
+      [
+        "1",
+        "JAMMU AND KASHMIR"
+      ],
+      [
+        "20",
+        "JHARKHAND"
+      ],
+      [
+        "29",
+        "KARNATAKA"
+      ],
+      [
+        "32",
+        "KERALA"
+      ],
+      [
+        "39",
+        "LADAKH"
+      ],
+      [
+        "31",
+        "LAKSHWADEEP"
+      ],
+      [
+        "23",
+        "MADHYA PRADESH"
+      ],
+      [
+        "27",
+        "MAHARASHTRA"
+      ],
+      [
+        "14",
+        "MANIPUR"
+      ],
+      [
+        "17",
+        "MEGHLAYA"
+      ],
+      [
+        "15",
+        "MIZORAM"
+      ],
+      [
+        "13",
+        "NAGALAND"
+      ],
+      [
+        "21",
+        "ODISHA"
+      ],
+      [
+        "34",
+        "PUDUCHERRY"
+      ],
+      [
+        "3",
+        "PUNJAB"
+      ],
+      [
+        "8",
+        "RAJASTHAN"
+      ],
+      [
+        "11",
+        "SIKKIM"
+      ],
+      [
+        "33",
+        "TAMIL NADU"
+      ],
+      [
+        "36",
+        "TELANGANA"
+      ],
+      [
+        "16",
+        "TRIPURA"
+      ],
+      [
+        "9",
+        "UTTAR PRADESH"
+      ],
+      [
+        "5",
+        "UTTARAKHAND"
+      ],
+      [
+        "19",
+        "WEST BENGAL"
+      ]
+    ],
+    "ddlEduationQualification": [
+      [
+        "0",
+        "Select"
+      ],
+      [
+        "High School",
+        "High School"
+      ],
+      [
+        "Intermediate",
+        "Intermediate"
+      ],
+      [
+        "Graduation",
+        "Graduation"
+      ],
+      [
+        "Post graduation",
+        "Post graduation"
+      ]
+    ],
+    "ddlVegetarianOrNon": [
+      [
+        "0",
+        "Select"
+      ],
+      [
+        "Vegetarian",
+        "Vegetarian"
+      ],
+      [
+        "Non-Vegetarian",
+        "Non-Vegetarian"
+      ]
+    ]
+  },
+  "validators": [
+    {
+      "id": "rfvddlCourse",
+      "control": "ddlCourse",
+      "message": "Please Select Course.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvddlCourseLevel",
+      "control": "ddlCourseLevel",
+      "message": "Please Select Course Level.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvddlScheduleCourse",
+      "control": "ddlScheduleCourse",
+      "message": "Please Select Schedule Course.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvddlState",
+      "control": "ddlState",
+      "message": "Please Select State.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtCourseFee",
+      "control": "txtCourseFee",
+      "message": "Please Enter Course Fee.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtName",
+      "control": "txtName",
+      "message": "Please Enter Name.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtFatherName",
+      "control": "txtFatherName",
+      "message": "Please Enter Father's Name.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtNationality",
+      "control": "txtNationality",
+      "message": "Please Enter Nationality.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtDateOfBirth",
+      "control": "txtDateOfBirth",
+      "message": "Please Enter DateOfBirth.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "regvtxtDateOfBirth",
+      "control": "txtDateOfBirth",
+      "message": "Invalid date only this format dd/MM/yyyy are allow.",
+      "pattern": "(((0|1)[0-9]|2[0-9]|3[0-1])\\\\/(0[1-9]|1[0-2])\\\\/((19|20)\\\\d\\\\d))$",
+      "evaluation": "RegularExpressionValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvFupBirthCertificate",
+      "control": "FupBirthCertificate",
+      "message": "Please Upload Date of birth.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "regvFupBirthCertificate",
+      "control": "FupBirthCertificate",
+      "message": "Only .pdf, .gif, .jpg, .png, .jpeg, files & Size 1MB are allowed.",
+      "pattern": "(.*\\\\.([Pp][Df][Ff])|.*\\\\.([Gg][Ii][Ff])|.*\\\\.([Jj][Pp][Gg])|.*\\\\.([pP][nN][gG])|.*\\\\.([Jj][Pp][Ee][Gg])$)",
+      "evaluation": "RegularExpressionValidatorEvaluateIsValid",
+      "group": "prosv"
+    },
+    {
+      "id": "regvFupDomicileAttachProof",
+      "control": "FupDomicileAttachProof",
+      "message": "Only .pdf, .gif, .jpg, .png, .jpeg, files & Size 1MB are allowed.",
+      "pattern": "(.*\\\\.([Pp][Dd][Ff])|.*\\\\.([Gg][Ii][Ff])|.*\\\\.([Jj][Pp][Gg])|.*\\\\.([pP][nN][gG])|.*\\\\.([Jj][Pp][Ee][Gg])$)",
+      "evaluation": "RegularExpressionValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtHouseNoApartment",
+      "control": "txtHouseNoApartment",
+      "message": "Please Enter House No. / Apartment.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtStreetVillageColony",
+      "control": "txtStreetVillageColony",
+      "message": "Please Enter Street/Village/Colony.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtDistrictCity",
+      "control": "txtDistrictCity",
+      "message": "Please Enter District/City.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtPincode",
+      "control": "txtPincode",
+      "message": "Please Enter Pincode.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtMobileNo",
+      "control": "txtMobileNo",
+      "message": "Please Enter Mobile No.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtEmailId",
+      "control": "txtEmailId",
+      "message": "Please Enter EmailId.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "revemailid",
+      "control": "txtEmailId",
+      "message": "Please Enter Valid Email ID",
+      "pattern": "\\\\w+([-+.\\']\\\\w+)*@\\\\w+([-.]\\\\w+)*\\\\.\\\\w+([-.]\\\\w+)*",
+      "evaluation": "RegularExpressionValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvddlEduationQualification",
+      "control": "ddlEduationQualification",
+      "message": "Please Select Eduation Qualification.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvFupEducationQualification",
+      "control": "FupEducationQualification",
+      "message": "Please Upload Bank Passbook Photo.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "regvFupEducationQualification",
+      "control": "FupEducationQualification",
+      "message": "Only .pdf, .gif, .jpg, .png, .jpeg, files & Size 1MB are allowed.",
+      "pattern": "(.*\\\\.([Pp][Dd][Ff])|.*\\\\.([Gg][Ii][Ff])|.*\\\\.([Jj][Pp][Gg])|.*\\\\.([pP][nN][gG])|.*\\\\.([Jj][Pp][Ee][Gg])$)",
+      "evaluation": "RegularExpressionValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "regvFupAnyAdventureCoursePhoto",
+      "control": "FupAnyAdventureCoursePhoto",
+      "message": "Only .pdf, .gif, .jpg, .png, .jpeg, files & Size 1MB are allowed.",
+      "pattern": "(.*\\\\.([Pp][Dd][Ff])|.*\\\\.([Gg][Ii][Ff])|.*\\\\.([Jj][Pp][Gg])|.*\\\\.([pP][nN][gG])|.*\\\\.([Jj][Pp][Ee][Gg])$)",
+      "evaluation": "RegularExpressionValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "regvFupCurrentEmployment",
+      "control": "FupCurrentEmployment",
+      "message": "Only .pdf, .gif, .jpg, .png, .jpeg, files & Size 1MB are allowed.",
+      "pattern": "(.*\\\\.([Pp][Dd][Ff])|.*\\\\.([Gg][Ii][Ff])|.*\\\\.([Jj][Pp][Gg])|.*\\\\.([pP][nN][gG])|.*\\\\.([Jj][Pp][Ee][Gg])$)",
+      "evaluation": "RegularExpressionValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "RequiredFieldValidator1",
+      "control": "ddlEduationQualification",
+      "message": "Please Select Vegetarian / Non-Vegetarian .",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtBloodGroup",
+      "control": "txtBloodGroup",
+      "message": "Please Enter Blood Group.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvFupPhototOfApplicant",
+      "control": "FupPhototOfApplicant",
+      "message": "Please Upload Photo of Applicant.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "regvFupPhototOfApplicant",
+      "control": "FupPhototOfApplicant",
+      "message": "Only .gif, .jpg, .png, .jpeg, files & Size 1MB are allowed.",
+      "pattern": "(.*\\\\.([Gg][Ii][Ff])|.*\\\\.([Jj][Pp][Gg])|.*\\\\.([pP][nN][gG])|.*\\\\.([Jj][Pp][Ee][Gg])$)",
+      "evaluation": "RegularExpressionValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvFupSignatureOfAppicant",
+      "control": "FupSignatureOfAppicant",
+      "message": "Please Upload Signature of Applicant.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "regvFupSignatureOfAppicant",
+      "control": "FupSignatureOfAppicant",
+      "message": "Only .gif, .jpg, .png, .jpeg, files & Size 1MB are allowed.",
+      "pattern": "(.*\\\\.([Gg][Ii][Ff])|.*\\\\.([Jj][Pp][Gg])|.*\\\\.([pP][nN][gG])|.*\\\\.([Jj][Pp][Ee][Gg])$)",
+      "evaluation": "RegularExpressionValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtEmergencyContactName",
+      "control": "txtEmergencyContactName",
+      "message": "Please Enter Emergency Contact Name.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvtxtEmergencyContactPhone",
+      "control": "txtEmergencyContactPhone",
+      "message": "Please Enter Emergency Contact Phone.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "rfvFupParentGuardianSignature",
+      "control": "FupParentGuardianSignature",
+      "message": "Please Upload Parent/Guardian's Signature.",
+      "pattern": "",
+      "evaluation": "RequiredFieldValidatorEvaluateIsValid",
+      "group": "sv"
+    },
+    {
+      "id": "regvFupParentGuardianSignature",
+      "control": "FupParentGuardianSignature",
+      "message": "Only .gif, .jpg, .png, .jpeg, files & Size 1MB are allowed.",
+      "pattern": "(.*\\\\.([Gg][Ii][Ff])|.*\\\\.([Jj][Pp][Gg])|.*\\\\.([pP][nN][gG])|.*\\\\.([Jj][Pp][Ee][Gg])$)",
+      "evaluation": "RegularExpressionValidatorEvaluateIsValid",
+      "group": "sv"
+    }
+  ],
+  "clientFileSizeChecks": [
+    "1048576"
+  ],
+  "coursePostbacks": [
+    {
+      "course": "Snow Skiing Courses at Gulmarg",
+      "levels": [
+        [
+          "0",
+          "Select Course Level"
+        ],
+        [
+          "4",
+          "Basic SSC"
+        ],
+        [
+          "5",
+          "Intermediate SSC"
+        ],
+        [
+          "6",
+          "Advance SSC"
+        ],
+        [
+          "28",
+          "Snow Boarding"
+        ]
+      ],
+      "batches": [
+        [
+          "0",
+          "Select Schedule Course"
+        ]
+      ],
+      "seats": "0",
+      "fee": "0",
+      "afterBasicLevelPostback": {
+        "batches": [
+          [
+            "0",
+            "Select Schedule Course"
+          ]
+        ],
+        "level": "4",
+        "seats": "0",
+        "fee": "0"
+      }
+    }
+  ]
+}

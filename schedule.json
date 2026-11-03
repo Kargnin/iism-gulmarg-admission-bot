@@ -1,0 +1,20 @@
+{
+  "season": "2026-27",
+  "source": "IISM Gulmarg: schedule of 14-day snow skiing, snowboarding & MOI courses at Gulmarg & Kargil, FY 2026-27",
+  "bookingOpensAt": "2026-11-12T10:00:00+05:30",
+  "batches": {
+    "G1": {"location": "Gulmarg", "from": "2026-12-20", "to": "2027-01-02", "offers": ["Snow Skiing"], "seats": "80 shared by Basic, Intermediate & Advance"},
+    "G2": {"location": "Gulmarg", "from": "2027-01-03", "to": "2027-01-16", "offers": ["Snow Skiing"], "seats": "Basic 50, Intermediate 20, Advance 10"},
+    "G3": {"location": "Gulmarg", "from": "2027-01-17", "to": "2027-01-30", "offers": ["Snow Skiing"], "seats": "Basic 50, Intermediate 20, Advance 10"},
+    "G4": {"location": "Gulmarg", "from": "2027-01-31", "to": "2027-02-13", "offers": ["Snow Skiing", "Snow Boarding"], "seats": "Basic 40, Intermediate 10, Advance 10, Snow Boarding 20"},
+    "G5": {"location": "Gulmarg", "from": "2027-02-14", "to": "2027-02-27", "offers": ["Snow Skiing", "MOI"], "seats": "Basic 50, Intermediate 10, Advance 10, MOI 10"},
+    "G6": {"location": "Gulmarg", "from": "2027-02-28", "to": "2027-03-13", "offers": ["Snow Skiing"], "seats": "Basic 50, Intermediate 20, Advance 10"},
+    "K1": {"location": "Kargil", "from": "2027-02-08", "to": "2027-02-21", "offers": ["Snow Skiing"], "seats": "40 shared by Basic, Intermediate & Advance"},
+    "K2": {"location": "Kargil", "from": "2027-02-22", "to": "2027-03-07", "offers": ["Snow Skiing"], "seats": "40 shared by Basic, Intermediate & Advance"}
+  },
+  "fees": {
+    "Gulmarg": "Rs 10,000 (age up to 25) / Rs 20,000 (above 25); MOI Rs 20,000",
+    "Kargil": "Rs 5,000 (local participants) / Rs 10,000 (other regions)"
+  },
+  "ageLimits": [10, 40]
+}
