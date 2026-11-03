@@ -33,7 +33,7 @@ Use this field map unless the inspected current template differs. All applicant/
 | Local document folder | `documentsDir` |
 | Photo and applicant signature filenames | `documents.photo`, `documents.signature` |
 | DOB proof and education proof filenames | `documents.dobProof`, `documents.educationProof` |
-| Real guardian signature, required under 18 | `documents.parentSignature` |
+| Real guardian signature, required when the website reports under 18 or requests it | `documents.parentSignature` |
 
 Confirm template defaults such as nationality, education, and diet instead of treating them as my answers. Optional fields can remain blank unless I want to supply them: `applicant.domicile`, `applicant.medicalCategory`, `applicant.height` (cm), `applicant.weight` (kg), `applicant.waist` (inches), `applicant.shoeSize` (UK), `documents.domicileProof`, `documents.skiingCertificate`, and `documents.employmentProof`. Intermediate/Advance preferences may need a previous-course certificate, but those booking paths remain unsupported/unvalidated; Basic skiing is the supported path. Do not silently change a requested level.
 
@@ -49,13 +49,13 @@ Phone input must be wholly recognizable as a phone number. Keep values as string
 
 ## Prepare and inspect the documents locally
 
-Required uploads are a photo, applicant signature, DOB proof, and education proof. Applicants under 18 need a real parent/guardian signature. Adults may explicitly provide one. The configured filenames are resolved from `documentsDir`; use an absolute folder path or `~` to avoid confusion about paths relative to `configs/`.
+Required uploads are a photo, applicant signature, DOB proof, and education proof. DOB is required, and the website—not a local course-date calculation—determines the age response after it is entered. A website-reported minor or explicit guardian demand requires a real parent/guardian signature. Adults may explicitly provide one. The configured filenames are resolved from `documentsDir`; use an absolute folder path or `~` to avoid confusion about paths relative to `configs/`.
 
 Prepare nonempty JPG/JPEG/PNG files at most 500,000 bytes each, using the stricter published 500 KB rule even if a page script mentions PDF/GIF/1 MB. Preserve originals. Work locally; do not use cloud conversion/OCR services or upload private documents elsewhere by default. Never fabricate, redraw, or alter a signature, identity detail, or certificate content.
 
 On macOS the bot can convert PDFs/oversized images with the built-in tools and place prepared copies in `runs/.../upload-ready/`. PDF conversion takes only the first page. Review which page contains the needed information, show me the prepared documents locally, and obtain my legibility/content review. Do not assume the first page is sufficient for a multi-page proof. On other systems help me make suitable local image copies with available tools, or explain exactly which files still need manual preparation. Do not rename a PDF to `.jpg` or report readiness based on size alone. Check file bytes/type, dimensions as helpful, size, and that each config path points to the intended document; automated checks cannot establish identity or legibility.
 
-Report the two existing behaviors plainly: the client may continue without TLS certificate verification after a logged certificate error; and `bot.parentSignatureFallback` defaults to allowing an adult applicant's own signature in the guardian slot only if the site insists. A real minor must always have a real guardian signature, including when the server's age calculation classifies them as a minor. Do not add another fallback or compatibility behavior.
+Report the two existing behaviors plainly: the client may continue without TLS certificate verification after a logged certificate error; and `bot.parentSignatureFallback` allows an applicant signature in the guardian slot only after the website positively reports adulthood and still insists. A website-reported minor must use a real guardian signature. Missing website age is unknown, never proof of adulthood, and must not enable substitution. Do not add a local age fallback or another compatibility behavior.
 
 ## Check readiness without making a live application
 
@@ -104,3 +104,5 @@ Finish the local work, then give a concise readiness report with:
 Explain that each missing/full/disappearing preference remains pending until it succeeds or I stop. Recoverable site/page-state errors start a fresh HTTP session from mobile entry and criteria, preserving that preference's phone and prepared documents; exponential backoff is capped at 10 seconds. If a final submission has an unknown outcome, only its preference waits while siblings continue. I must check the actual application/email and answer `booked` or `not booked` in the terminal; you must not guess the answer or rotate phones to evade uncertainty.
 
 I must watch the configured email for a payment link, check its deadline, and complete payment myself. Accepted application, payment, and admission are separate. IISM's one-course-per-person-per-year and non-refundable-fee rules apply; the bot's ability to attempt alternatives with separate numbers does not establish permission or eligibility. Do not promise a seat, invent institution rules, or automatically act on a future booking date.
+
+There is no reset command. Preserve the same config and progress files, and reconcile any uncertain application instead of deleting, renaming, or replacing state.

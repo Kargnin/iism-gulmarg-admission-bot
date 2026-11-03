@@ -2025,12 +2025,12 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(any("email" in error for error in errors))
         self.assertEqual(self.site.requests, 0)
 
-    def test_parent_signature_is_required_only_for_minors(self):
-        for born, required in (("15/05/1998", False), ("15/05/2010", True)):
+    def test_parent_signature_requirement_is_deferred_to_the_website(self):
+        for born in ("15/05/1998", "15/05/2010"):
             cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"], applicant={"dateOfBirth": born})
             settings, _, _ = bot.parse_settings(cfg, None)
             problems, _ = bot.prepare_documents(settings, self.out)
-            self.assertEqual(any("parentSignature" in p for p in problems), required)
+            self.assertFalse(any("parentSignature" in p for p in problems))
 
     def test_server_classified_minor_without_guardian_is_parked_before_submit(self):
         course_id = self.key("G2")[0]
@@ -2055,6 +2055,36 @@ class EndToEnd(unittest.TestCase):
                          ("GET", "admission_instructions.aspx"))
         self.assertNotEqual(next_request["sid"], first_submit["sid"])
 
+    def test_unknown_website_age_never_enables_adult_signature_substitution(self):
+        original = mock_site.Handler.form
+
+        def hide_age(handler, mobile, values, listed, invalid=(), alert=None):
+            body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
+            if values.get("__EVENTTARGET") == "txtDateOfBirth":
+                body = re.sub(r'(<span id="lblDOBMsg"[^>]*>).*?(</span>)', r'\1\2', body, count=1)
+                body = re.sub(r'(name="hdfAgeCountDate"[^>]*value=")[^"]*', r'\1', body, count=1)
+            return body
+
+        with mock.patch.object(mock_site.Handler, "form", hide_age):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertTrue(instance.finished())
+        self.assertFalse(instance.parent_fallback)
+        self.assertNotIn("FupParentGuardianSignature", self.site.applications[0]["files"])
+
+        self.site.used.clear()
+        self.site.applications.clear()
+        self.site.sessions.clear()
+        self.site.viewstates.clear()
+        with mock.patch.object(mock_site.Handler, "form", hide_age):
+            held = run_bot(make_config(self.tmp, PHONES[:1], ["G2 Basic"],
+                                       applicant={"dateOfBirth": "15/05/2010"}), self.url,
+                           self.tmp / "unknown-age-held", timeout=1)
+        self.assertEqual(held.bookings, [])
+        self.assertEqual(self.site.applications, [])
+        self.assertFalse(held.parent_fallback)
+        self.assertIn("real guardian signature", held.blocked[0]["why"])
+        self.assertEqual(held.failures, [])
+
     def test_omitted_configured_guardian_retries_with_real_file_when_control_returns(self):
         self.site.parent_signature_required = True
         cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"])
@@ -2067,10 +2097,13 @@ class EndToEnd(unittest.TestCase):
 
         def first_guardian_control_missing(handler, mobile, values, listed, invalid=(), alert=None):
             body = original(handler, mobile, values, listed, invalid=invalid, alert=alert)
-            if values.get("__EVENTTARGET") == "txtDateOfBirth" and not omitted:
-                omitted.append(handler.sid)
-                body = body.replace('type="file" name="FupParentGuardianSignature"',
-                                    'type="file" disabled="disabled" name="FupParentGuardianSignature"')
+            if values.get("__EVENTTARGET") == "txtDateOfBirth":
+                body = re.sub(r'(<span id="lblDOBMsg"[^>]*>).*?(</span>)', r'\1\2', body, count=1)
+                body = re.sub(r'(name="hdfAgeCountDate"[^>]*value=")[^"]*', r'\1', body, count=1)
+                if not omitted:
+                    omitted.append(handler.sid)
+                    body = body.replace('type="file" name="FupParentGuardianSignature"',
+                                        'type="file" disabled="disabled" name="FupParentGuardianSignature"')
             return body
 
         with mock.patch.object(mock_site.Handler, "form", first_guardian_control_missing):
@@ -2088,6 +2121,26 @@ class EndToEnd(unittest.TestCase):
         instance = self.run_with(PHONES[:1], ["G2 Basic"])
         self.assertTrue(instance.finished())
         self.assertNotIn("FupParentGuardianSignature", self.site.applications[0]["files"])
+
+    def test_changed_positive_website_fee_is_carried_without_client_comparison(self):
+        original = bot.Session.cascade
+
+        def stale_snapshot(session, target):
+            selection = original(session, target)
+            selection.fee = "1.00"
+            return selection
+
+        with mock.patch.object(bot.Session, "cascade", stale_snapshot):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertTrue(instance.finished())
+        self.assertNotEqual(self.site.applications[0]["fee"], "1.00")
+
+
+class CommandSurface(unittest.TestCase):
+    def test_removed_reset_state_flag_is_rejected(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as stopped:
+            bot.main(["--reset-state"])
+        self.assertEqual(stopped.exception.code, 2)
 
 
 class EndToEndOtherLayout(EndToEnd):

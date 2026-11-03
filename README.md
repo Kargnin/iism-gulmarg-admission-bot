@@ -71,7 +71,7 @@ Dates and opening time come from `schedule.json`. Missing, full, or disappearing
 
 ## 3. Prepare documents and check
 
-Set `documentsDir` to your local document folder and fill the filenames in `documents`. You need a photo, applicant signature, DOB proof, and education proof. A real guardian signature is required for applicants under 18; adults may supply one too.
+Set `documentsDir` to your local document folder and fill the filenames in `documents`. You need a photo, applicant signature, DOB proof, and education proof. The website calculates age after DOB entry. If it reports an applicant under 18 or explicitly requires guardian proof, a real guardian signature is required; adults may supply one in advance too. The bot does not infer guardian eligibility from course dates.
 
 Uploads must be nonempty JPG/JPEG/PNG files, **at most 500 KB each**. On macOS, the bot can convert PDFs and oversized images without changing originals. PDF conversion uses the first page only. Review the prepared files for readable text, the right person, and all necessary information. Windows/Linux users should supply ready images.
 
@@ -101,6 +101,8 @@ It prepares documents, waits until shortly before opening, then checks continuou
 
 If a final reply is uncertain, that preference waits for you to check the actual application/email and answer **`booked`** or **`not booked`** in the terminal. Other workers continue. Do not guess or delete saved progress to retry.
 
+There is no progress-reset mode. Restart with the same config and reconcile any saved uncertain application instead of renaming, deleting, or replacing its state.
+
 The bot does not pay fees. Watch the configured email for the payment link and follow its deadline. IISM's one-course-per-person-per-year and non-refundable-fee rules still apply; separate phone numbers do not establish eligibility. Booking is not guaranteed.
 
-The existing client may continue without certificate verification after a logged certificate error. If the site insists on a guardian upload from an adult, the default `bot.parentSignatureFallback` permits reusing the applicant's signature; minors always need a real guardian signature. See [booking behavior and evidence](docs/booking-decisions.md) for details and unverified live boundaries.
+The existing client may continue without certificate verification after a logged certificate error. If the site positively reports an adult and nevertheless insists on a guardian upload, the default `bot.parentSignatureFallback` permits reusing the applicant's signature. A reported minor needs a real guardian signature, and missing website age never enables substitution. See [booking behavior and evidence](docs/booking-decisions.md) for details and unverified live boundaries.

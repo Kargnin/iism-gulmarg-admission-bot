@@ -61,7 +61,7 @@
     "signature": "signature.jpg",        // mandatory
     "dobProof": "FILL_ME",               // mandatory: Class X marksheet, birth certificate, passport...
     "educationProof": "FILL_ME",         // mandatory: latest marksheet / degree
-    "parentSignature": "",               // required under 18; optional for adults
+    "parentSignature": "",               // required when the website reports under 18 or requests it
     "domicileProof": "",                 // optional
     "skiingCertificate": "",             // for Intermediate / Advance: your previous course certificate
     "employmentProof": ""                // optional
@@ -72,7 +72,7 @@
     "parallel": true,                    // work on several numbers at once (false = one number after another)
     "notify": true,                      // Mac notification + beep when a seat is booked
     "maxRetryDelaySec": 10,               // no cumulative retry limit; delays never exceed 10 seconds
-    "parentSignatureFallback": true      // if the site insists on a parent/guardian signature from an
-                                         // adult, resend with your own signature in that slot
+    "parentSignatureFallback": true      // only after the website positively reports an adult and still
+                                         // insists, resend with the applicant signature in that slot
   }
 }

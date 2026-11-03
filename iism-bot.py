@@ -402,25 +402,15 @@ def now_ist():
     return datetime.now(IST)
 
 
-def age_on(born, day):
-    return day.year - born.year - ((day.month, day.day) < (born.month, born.day))
-
-
-def observed_server_age(page, born):
+def observed_server_age(page):
     for message in page.messages():
-        match = re.search(r"\byour\s+age\s+(\d+)\s+years?\b", message, re.I)
+        match = re.search(r"\byour\s+age\s+([0-9]+)\s+years?\b", message, re.I)
         if match:
             return int(match.group(1))
-    raw = (page.value("hdfAgeCountDate") or "").strip()
-    for pattern in ("%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y", "%Y-%m-%d", "%d/%m/%Y"):
-        try:
-            return age_on(born, datetime.strptime(raw, pattern).date())
-        except ValueError:
-            pass
     return None
 
 
-def document_applies(key, target, dob):
+def document_applies(key, target):
     if key == "parentSignature":
         return True  # optional for adults when explicitly configured; required only for minors
     if key == "skiingCertificate":
@@ -1340,7 +1330,7 @@ def parse_settings(cfg, config_path):
         s.targets.append(t)
     if not s.targets and not any(p.startswith("coursePriorities") for p in placeholders):
         errors.append("coursePriorities is empty - list your choices, e.g. [\"G2 Basic\", \"G3 Basic\"]")
-    if (any(document_applies("skiingCertificate", t, s.dob) for t in s.targets)
+    if (any(document_applies("skiingCertificate", t) for t in s.targets)
             and not cfg.get("documents", {}).get("skiingCertificate")):
         warnings.append("Intermediate/Advance choices need your previous course certificate in documents.skiingCertificate")
     if any(target.level in ("Intermediate", "Advance") for target in s.targets):
@@ -1411,7 +1401,7 @@ def prepare_documents(settings, out_dir):
     settings.docs = {}
     preparation_id = uuid.uuid4().hex
     for key, _, _, required in DOCUMENTS:
-        applies = any(document_applies(key, target, settings.dob) for target in settings.targets)
+        applies = any(document_applies(key, target) for target in settings.targets)
         if key in ("parentSignature", "skiingCertificate") and not applies:
             continue
         src = settings.doc_sources.get(key)
@@ -1420,9 +1410,6 @@ def prepare_documents(settings, out_dir):
                 continue
             if required is True:
                 problems.append(f"documents.{key} is not set (the form requires it)")
-            elif required == "minor" and any(settings.dob and age_on(settings.dob, t.start) < 18
-                                             for t in settings.targets):
-                problems.append(f"documents.{key} is not set (needed because the applicant is under 18)")
             continue
         if not src.is_file():
             problems.append(f"documents.{key}: file not found: {src}")
@@ -2363,13 +2350,14 @@ class Session:
         echoed = page.value("txtDateOfBirth")
         if has_any(" | ".join(said).lower(), AGE_PHRASES) or (echoed is not None and not echoed.strip()):
             raise Rejected(f"date of birth not accepted for {target.label}: {'; '.join(said) or 'date cleared'}")
-        server_age = observed_server_age(page, bot.s.dob) if bot.s.dob else None
+        server_age = observed_server_age(page)
         return Selection(course, level, batch, state, seats, page.value("txtCourseFee"), page, server_age)
 
     def prepare_submit(self, target, sel):
         bot = self.bot
         page = sel.page
         minor = sel.server_age is not None and sel.server_age < 18
+        adult = sel.server_age is not None and sel.server_age >= 18
         if minor and not bot.s.docs.get("parentSignature"):
             raise Rejected(f"the site classifies the applicant as age {sel.server_age} for {target.label}; "
                            "documents.parentSignature must contain the real guardian signature")
@@ -2390,16 +2378,19 @@ class Session:
         enabled_files = set(page.file_inputs())
         for key, input_name, flag, requirement in DOCUMENTS:
             path = bot.s.docs.get(key)
-            if not document_applies(key, target, bot.s.dob):
+            if not document_applies(key, target):
                 path = None
-            if (key == "parentSignature" and path is None and bot.parent_fallback
-                    and sel.server_age is not None and sel.server_age >= 18):
+            fallback = key == "parentSignature" and target.index in bot.parent_fallback
+            if fallback and path is None and adult:
                 path = bot.s.docs.get("signature")
             required_now = requirement is True or (key == "parentSignature" and (
-                minor or bot.parent_fallback or target.index in bot.guardian_required))
+                minor or fallback or target.index in bot.guardian_required))
             flag_ready = not page.missing_enabled((flag,))
             input_ready = input_name in enabled_files
             if required_now and path is None:
+                if key == "parentSignature":
+                    raise Rejected(f"the site requires a real guardian signature for {target.label}; "
+                                   "configure documents.parentSignature")
                 raise ConfigError(f"prepared required document {key} is unavailable")
             if required_now:
                 required_controls.add(flag)
@@ -2446,13 +2437,8 @@ class Session:
         if seats <= 0:
             raise TargetFull("0 seats left on the latest form")
         current_fee = parse_server_number(page.value("txtCourseFee"), allow_decimal=True)
-        selected_fee = parse_server_number(sel.fee, allow_decimal=True)
         if current_fee is None or current_fee <= 0:
             raise Transient("the latest form does not report a valid course fee")
-        if selected_fee is None or selected_fee <= 0:
-            raise Transient("the selected form did not report a valid course fee")
-        if current_fee != selected_fee:
-            raise Transient("the latest form reports a different course fee")
         values = {}
         for field, section, key in TEXT_FIELDS:
             configured = bot.s.form_values[field]
@@ -2585,17 +2571,20 @@ class Session:
             bot = self.bot
             wants_parent = has_any(" ".join(failed_validators).lower(), ("parent", "guardian"))
             if wants_parent:
-                if sel.server_age is None:
-                    raise Rejected("the site requested a guardian signature, but its age response did not "
-                                   "establish that the applicant is an adult")
                 guardian_sent = "FupParentGuardianSignature" in sent_files
-                if sel.server_age >= 18 and bot.s.docs.get("parentSignature") and not guardian_sent:
+                if bot.s.docs.get("parentSignature") and not guardian_sent:
                     bot.require_guardian(target)
                     raise Resend("the site requires the configured guardian signature; retrying from a fresh form")
-                if (not guardian_sent and not bot.s.docs.get("parentSignature") and not bot.parent_fallback
-                        and sel.server_age >= 18 and bot.s.docs.get("signature")
+                if sel.server_age is None:
+                    raise Rejected("the site requires a real guardian signature and did not establish that the "
+                                   "applicant is an adult; configure documents.parentSignature")
+                if sel.server_age < 18:
+                    raise Rejected("the site requires a real guardian signature for the reported minor; "
+                                   "configure documents.parentSignature")
+                if (not guardian_sent and not bot.s.docs.get("parentSignature")
+                        and target.index not in bot.parent_fallback and bot.s.docs.get("signature")
                         and bot.opt.get("parentSignatureFallback")):
-                    bot.use_parent_fallback(reason)
+                    bot.use_parent_fallback(target, reason)
                     raise Resend("the site wants a parent/guardian signature - resending with the applicant's signature")
             raise Rejected(f"{reason} (page saved: {saved})")
         if resp.status == 429:
@@ -2896,7 +2885,7 @@ class Bot:
         self.season_seen = None
         self.attention_seen = {}
         self.refusals = {}
-        self.parent_fallback = False
+        self.parent_fallback = set()
         self.guardian_required = set()
         self.course_hint = {}
         self.status = {}
@@ -3096,9 +3085,9 @@ class Bot:
             self.refusals[phone] = self.refusals.get(phone, 0) + 1
             return self.refusals[phone] >= self.opt["maxRejections"]
 
-    def use_parent_fallback(self, why):
+    def use_parent_fallback(self, target, why):
         with self.lock:
-            self.parent_fallback = True
+            self.parent_fallback.add(target.index)
         self.log.warn("The site insists on an adult's guardian-signature upload; using the applicant's "
                       f"configured signature as authorized. Site says: {why}")
 
@@ -3421,12 +3410,6 @@ def run_check(settings, errors, warnings, doc_problems, doc_notes, base_url, log
     if settings.opens_at:
         left = (settings.opens_at - now_ist()).total_seconds()
         log.info(f"Booking opens {fmt_when(settings.opens_at)}" + (f" (in {fmt_duration(left)})" if left > 0 else " (already open)"))
-    if settings.dob and settings.targets:
-        age = age_on(settings.dob, min(t.start for t in settings.targets))
-        log.info(f"Age at the first chosen batch: {age} (allowed 10-40; Gulmarg fee Rs "
-                 f"{'10,000' if age <= 25 else '20,000'} at this age, Kargil Rs 5,000 local / 10,000 others)")
-        if not 10 <= age <= 40:
-            warnings.append(f"age {age} is outside the 10-40 limit")
     log.info("Documents:")
     for note in doc_notes:
         log.info(f"  {note}")
@@ -3538,7 +3521,6 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="run preference workers without final submissions")
     ap.add_argument("--now", action="store_true", help="start immediately")
     ap.add_argument("--phone", help="configured number to use with --discover")
-    ap.add_argument("--reset-state", action="store_true", help="reset only progress without existing or pending applications")
     ap.add_argument("--base-url", default=DEFAULT_BASE_URL, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     log, bot, awake = Log(), None, None
@@ -3570,19 +3552,6 @@ def main(argv=None):
             log.error("Fix these startup problems before booking; --check lists them without submitting.")
             return 2
         log.info("Startup preflight passed; all workers share the prepared upload snapshots.")
-        if args.reset_state:
-            old = State(out_dir / "state.json", True)
-            try:
-                old.acquire()
-                if old.data["bookings"] or any(i["status"] == "submitting" for i in old.data["phones"].values()):
-                    raise ConfigError("Cannot reset existing or unresolved applications. Reconcile them first; "
-                                      "use a distinct season/config for a new booking plan.")
-                if old.path.exists():
-                    backup = old.path.with_name(f"state.json.bak-{uuid.uuid4().hex}")
-                    old.path.rename(backup)
-                    log.info(f"Progress without applications moved to {backup}")
-            finally:
-                old.release()
         bot = Bot(settings, out_dir, base_url=args.base_url, dry_run=args.dry_run or args.discover, log=log)
         if args.discover:
             phone = parse_phone(args.phone) if args.phone else settings.phones[0]
