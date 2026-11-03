@@ -623,10 +623,19 @@ def configured_day(value, where, required=False):
         if required:
             raise ConfigError(f"{where} is missing")
         return None
+    require_single_configured_date(value, where)
     parsed = parse_day(value)
     if parsed is None:
         raise ConfigError(f"{where} date {value!r} is unreadable")
     return parsed
+
+
+def require_single_configured_date(value, where):
+    if isinstance(value, date):
+        return
+    spans = {reading.span for reading in dates_in(value)}
+    if len(spans) > 1:
+        raise ConfigError(f"{where} must contain exactly one written date, not {value!r}")
 
 
 def require_date_range(start, end, where):
@@ -647,6 +656,13 @@ def financial_season(value, where):
         return value, date(start_year, 4, 1), date(start_year + 1, 3, 31)
     except ValueError as exc:
         raise ConfigError(f"{where} contains an unsupported financial year") from exc
+
+
+def require_dates_in_season(start, end, season, season_start, season_end, where):
+    if ((start is not None and not season_start <= start <= season_end)
+            or (end is not None and not season_start <= end <= season_end)):
+        raise ConfigError(f"{where} dates must fall within financial season {season} "
+                          f"({season_start.isoformat()} through {season_end.isoformat()})")
 
 
 def location_score(text, location):
@@ -1185,12 +1201,26 @@ def load_season(cfg, config_dir):
         start = configured_day(b.get("from"), f"{source}.{bid}.from", required=True)
         end = configured_day(b.get("to"), f"{source}.{bid}.to")
         require_date_range(start, end, f"{source}.{bid}")
-        if not season_start <= start <= season_end or (end is not None and not season_start <= end <= season_end):
-            raise ConfigError(f"{source}.{bid} dates must fall within financial season {season} "
-                              f"({season_start.isoformat()} through {season_end.isoformat()})")
+        require_dates_in_season(start, end, season, season_start, season_end, f"{source}.{bid}")
         batches[bid] = {"location": b.get("location", ""), "from": start,
                         "to": end, "offers": b.get("offers") or [],
                         "seats": b.get("seats", "")}
+    for index, item in enumerate(cfg.get("coursePriorities") or []):
+        if not isinstance(item, dict):
+            continue
+        start_value, end_value = item.get("from"), item.get("to")
+        require_single_configured_date(start_value, f"coursePriorities[{index}].from")
+        require_single_configured_date(end_value, f"coursePriorities[{index}].to")
+        explicit_start = parse_day(start_value)
+        explicit_end = parse_day(end_value)
+        start_supplied = isinstance(start_value, str) and bool(start_value.strip())
+        end_supplied = isinstance(end_value, str) and bool(end_value.strip())
+        bid = str(item.get("batch") or "").strip().upper()
+        batch = batches.get(bid) or {}
+        start = explicit_start if start_supplied else batch.get("from")
+        end = explicit_end if end_supplied else batch.get("to")
+        require_dates_in_season(start, end, season, season_start, season_end,
+                                f"coursePriorities[{index}]")
     opens = cfg.get("bookingOpensAt") or data.get("bookingOpensAt")
     opens_at = None
     if opens:

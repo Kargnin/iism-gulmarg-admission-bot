@@ -50,7 +50,7 @@ Use an object only when a batch string cannot express the choice, for example wh
 
 - `batch` names a code from the active schedule. Without one, `from` is required.
 - `course` is `Snow Skiing`, `Snow Boarding`, or `MOI`; `level` is a skiing level such as `Basic` (Intermediate/Advance remain unsupported paths).
-- `from`, optional `to`, and `location` supply or override the schedule evidence used for matching. Dates must be unambiguous and the end cannot precede the start.
+- `from`, optional `to`, and `location` supply or override the schedule evidence used for matching. Each date field must contain exactly one written date, remain inside the declared financial season, and the end cannot precede the start.
 - `label` is the name shown in logs and prompts.
 - `courseText`, `levelText`, and `batchText` are optional live-label hints. They only break ties among semantically compatible choices and cannot override conflicting course, level, date, or location evidence.
 

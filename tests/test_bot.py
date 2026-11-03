@@ -590,6 +590,87 @@ class ConfigurationAndDocuments(unittest.TestCase):
                 self.assertEqual(bot.main(["--check", "--config", str(config_path)]), 2)
             http.assert_not_called()
 
+    def test_preference_dates_obey_season_in_parser_and_all_cli_modes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            invalid_priorities = (
+                {"batch": "G2", "from": "2028-01-03", "to": "2028-01-16"},
+                {"batch": "G2", "from": "2028-01-03"},
+                {"batch": "G2", "to": "2028-01-16"},
+                {"from": "2028-01-03", "to": "2028-01-16", "course": "Snow Skiing"},
+                {"batch": "G2", "from": "2028-01-03", "to": "not-a-date"},
+                {"batch": "G2", "from": "not-a-date", "to": "2028-01-16"},
+            )
+            for priority in invalid_priorities:
+                with self.subTest(priority=priority), self.assertRaisesRegex(
+                        bot.ConfigError, "must fall within financial season 2026-27"):
+                    bot.parse_settings(make_config(tmp, PHONES[:1], [priority]), None)
+
+            same_season = {"batch": "G2", "from": "2027-02-01", "to": "2027-02-14"}
+            settings, errors, _ = bot.parse_settings(make_config(tmp, PHONES[:1], [same_season]), None)
+            self.assertEqual(errors, [])
+            self.assertEqual((settings.targets[0].start, settings.targets[0].end),
+                             (date(2027, 2, 1), date(2027, 2, 14)))
+
+            cfg = make_config(tmp, PHONES[:1], [invalid_priorities[0]])
+            path = tmp / "out-of-season.json"
+            path.write_text(json.dumps(cfg))
+            preserved = path.read_bytes()
+            invocations = (
+                ["--config", str(path), "--now"],
+                ["--config", str(path), "--check"],
+                ["--config", str(path), "--discover"],
+            )
+            for invocation in invocations:
+                with self.subTest(invocation=invocation), \
+                        mock.patch.object(bot, "Http") as http, \
+                        mock.patch.object(bot, "Bot") as bot_type:
+                    self.assertEqual(bot.main(invocation), 2)
+                    http.assert_not_called()
+                    bot_type.assert_not_called()
+                    self.assertEqual(path.read_bytes(), preserved)
+
+    def test_configured_dates_reject_multiple_written_spans(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            ambiguous = "2027-01-03 through 2027-01-17"
+            schedule = tmp / "ambiguous-schedule.json"
+            schedule.write_text(json.dumps({
+                "season": "2026-27",
+                "batches": {"G2": {"from": ambiguous, "to": "2027-01-16", "location": "Gulmarg"}},
+            }))
+            cases = (
+                make_config(tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(schedule)),
+                make_config(tmp, PHONES[:1], ["G2 Basic"],
+                            batches={"G2": {"from": ambiguous, "to": "2027-01-16"}}),
+                make_config(tmp, PHONES[:1], [{"batch": "G2", "from": ambiguous}]),
+                make_config(tmp, PHONES[:1], [{"batch": "G2", "to": ambiguous}]),
+            )
+            for index, cfg in enumerate(cases):
+                with self.subTest(source=index), self.assertRaisesRegex(
+                        bot.ConfigError, "exactly one written date"):
+                    bot.parse_settings(cfg, None)
+
+            cfg = make_config(tmp, PHONES[:1], [
+                {"from": "03/01/2027", "to": "16/01/2027", "course": "Snow Skiing"}])
+            settings, errors, _ = bot.parse_settings(cfg, None)
+            self.assertEqual(errors, [])
+            self.assertEqual((settings.targets[0].start, settings.targets[0].end),
+                             (date(2027, 1, 3), date(2027, 1, 16)))
+
+            cfg = make_config(tmp, PHONES[:1], [{"batch": "G2", "from": ambiguous}])
+            path = tmp / "ambiguous-preference.json"
+            path.write_text(json.dumps(cfg))
+            preserved = path.read_bytes()
+            for invocation in (
+                    ["--config", str(path), "--now"],
+                    ["--config", str(path), "--check"],
+                    ["--config", str(path), "--discover"]):
+                with self.subTest(invocation=invocation), mock.patch.object(bot, "Http") as http:
+                    self.assertEqual(bot.main(invocation), 2)
+                    http.assert_not_called()
+                    self.assertEqual(path.read_bytes(), preserved)
+
     def test_site_numeric_fields_require_ascii_without_restricting_unicode_text(self):
         cases = (
             ("dob", lambda cfg: cfg["applicant"].update(dateOfBirth="١٥/٠٥/١٩٩٨"), "dateOfBirth"),
@@ -2088,14 +2169,16 @@ class EndToEnd(unittest.TestCase):
         finally:
             shutil.rmtree(out_dir, ignore_errors=True)
 
-    def test_old_booking_does_not_complete_a_changed_date(self):
+    def test_changed_date_outside_season_fails_before_booking(self):
         self.run_with(PHONES[:1], ["G2 Basic"])
         changed = {"batch": "G2", "from": "2028-01-03", "to": "2028-01-16", "label": "G2 Basic"}
-        instance = self.run_with(PHONES[:1], [changed], timeout=0.3)
-        self.assertFalse(instance.finished())
-        self.assertEqual(len(instance.bookings), 1)
-        self.assertEqual(instance.bookings[0]["phone"], PHONES[0])
-        self.assertEqual(instance.phone_state[PHONES[0]], "booked")
+        state_path = self.out / "state.json"
+        preserved = state_path.read_bytes()
+        requests = self.site.requests
+        with self.assertRaisesRegex(bot.ConfigError, "must fall within financial season 2026-27"):
+            bot.parse_settings(make_config(self.tmp, PHONES[:1], [changed]), None)
+        self.assertEqual(state_path.read_bytes(), preserved)
+        self.assertEqual(self.site.requests, requests)
         self.assertEqual(len(self.site.applications), 1)
 
     def test_missing_or_empty_required_controls_never_start_final_submission(self):
