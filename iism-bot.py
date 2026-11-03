@@ -634,6 +634,21 @@ def require_date_range(start, end, where):
         raise ConfigError(f"{where} ends before it starts")
 
 
+def financial_season(value, where):
+    if not isinstance(value, str) or value != value.strip():
+        raise ConfigError(f"{where} must be canonical nonblank text in YYYY-YY form, e.g. 2026-27")
+    match = re.fullmatch(r"([0-9]{4})-([0-9]{2})", value)
+    if match is None:
+        raise ConfigError(f"{where} must be canonical nonblank text in YYYY-YY form, e.g. 2026-27")
+    start_year = int(match.group(1))
+    if int(match.group(2)) != (start_year + 1) % 100:
+        raise ConfigError(f"{where} must name adjacent financial years in YYYY-YY form, e.g. 2026-27")
+    try:
+        return value, date(start_year, 4, 1), date(start_year + 1, 3, 31)
+    except ValueError as exc:
+        raise ConfigError(f"{where} contains an unsupported financial year") from exc
+
+
 def location_score(text, location):
     if not location:
         return 0
@@ -1157,6 +1172,7 @@ def load_season(cfg, config_dir):
     data = load_jsonc(path) if path.exists() else {}
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: schedule root must be an object")
+    season, season_start, season_end = financial_season(data.get("season"), f"{path}: season")
     batches = {}
     scheduled = data["batches"] if "batches" in data else {}
     configured = cfg["batches"] if "batches" in cfg else {}
@@ -1169,6 +1185,9 @@ def load_season(cfg, config_dir):
         start = configured_day(b.get("from"), f"{source}.{bid}.from", required=True)
         end = configured_day(b.get("to"), f"{source}.{bid}.to")
         require_date_range(start, end, f"{source}.{bid}")
+        if not season_start <= start <= season_end or (end is not None and not season_start <= end <= season_end):
+            raise ConfigError(f"{source}.{bid} dates must fall within financial season {season} "
+                              f"({season_start.isoformat()} through {season_end.isoformat()})")
         batches[bid] = {"location": b.get("location", ""), "from": start,
                         "to": end, "offers": b.get("offers") or [],
                         "seats": b.get("seats", "")}
@@ -1185,7 +1204,7 @@ def load_season(cfg, config_dir):
             raise ConfigError(f"bookingOpensAt \"{opens}\" should look like 2026-11-12T10:00:00+05:30")
         if opens_at.tzinfo is None:
             opens_at = opens_at.replace(tzinfo=IST)
-    return batches, opens_at, data.get("season", "")
+    return batches, opens_at, season
 
 
 class Settings:
@@ -2233,6 +2252,8 @@ class Session:
                 page = nxt
             elif page.name == CRITERIA_PAGE:
                 nxt = self.checked(self.postback(page, "lnkbtnNext", {"chkAccept": "on"}))
+                if nxt.name == INSTRUCTIONS_PAGE:
+                    raise SessionLost("the site sent us back to mobile verification after criteria")
                 said = self.verdict(nxt, deep=nxt.name == CRITERIA_PAGE, full_ok=False)
                 if nxt.name == CRITERIA_PAGE:
                     if said:

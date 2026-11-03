@@ -69,6 +69,8 @@ The checked-in 2026–27 schedule opens **12 November 2026 at 10:00 IST**:
 
 Dates and opening time come from `schedule.json`. Missing, full, or disappearing slots keep being checked until that preference succeeds or you stop the bot.
 
+A replacement `scheduleFile` must declare its financial season in canonical `YYYY-YY` form (for example, `2026-27`). The years must be adjacent, and all effective source or top-level override batch dates must fall from 1 April of the first year through 31 March of the second. Same-season top-level batch overrides remain supported; moving dates into another financial year requires a replacement schedule with that new season so progress stays isolated. `bookingOpensAt` is an independent timestamp and may be overridden separately.
+
 ## 3. Prepare documents and check
 
 Set `documentsDir` to your local document folder and fill the filenames in `documents`. You need a photo, applicant signature, DOB proof, and education proof. The website calculates age after DOB entry. If it reports an applicant under 18 or explicitly requires guardian proof, a real guardian signature is required; adults may supply one in advance too. The bot does not infer guardian eligibility from course dates.

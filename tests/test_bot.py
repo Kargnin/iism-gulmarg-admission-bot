@@ -507,21 +507,88 @@ class ConfigurationAndDocuments(unittest.TestCase):
             http.assert_not_called()
 
             duplicate_schedule = tmp / "duplicate-schedule.json"
-            duplicate_schedule.write_text(json.dumps({"batches": {"G2": record, " g2 ": dict(record)}}))
+            duplicate_schedule.write_text(json.dumps({
+                "season": "2026-27", "batches": {"G2": record, " g2 ": dict(record)}}))
             cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(duplicate_schedule))
             with self.assertRaisesRegex(bot.ConfigError, "defines batch G2 more than once"):
                 bot.parse_settings(cfg, None)
 
             base_schedule = tmp / "base-schedule.json"
-            base_schedule.write_text(json.dumps({"batches": {"G2": record}}))
-            override = {"from": "2028-01-04", "to": "2028-01-17", "location": "Kargil"}
+            base_schedule.write_text(json.dumps({"season": "2026-27", "batches": {"G2": record}}))
+            override = {"from": "2027-02-01", "to": "2027-02-14", "location": "Kargil"}
             cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(base_schedule),
                               batches={" g2 ": override})
             settings, errors, _ = bot.parse_settings(cfg, None)
             self.assertEqual(errors, [])
-            self.assertEqual(settings.batches["G2"]["from"], date(2028, 1, 4))
+            self.assertEqual(settings.batches["G2"]["from"], date(2027, 2, 1))
             self.assertEqual(settings.batches["G2"]["location"], "Kargil")
-            self.assertEqual(settings.targets[0].start, date(2028, 1, 4))
+            self.assertEqual(settings.targets[0].start, date(2027, 2, 1))
+
+    def test_schedule_season_bounds_config_state_and_cli(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            schedule = tmp / "schedule.json"
+            record = {"from": "2027-01-03", "to": "2027-01-16", "location": "Gulmarg"}
+
+            for label, season in (
+                    ("missing", None), ("blank", ""), ("nontext", 2026),
+                    ("malformed", "FY2026-27"), ("nonadjacent", "2026-28")):
+                with self.subTest(invalid=label):
+                    data = {"batches": {"G2": record}}
+                    if label != "missing":
+                        data["season"] = season
+                    schedule.write_text(json.dumps(data))
+                    cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(schedule))
+                    with self.assertRaisesRegex(bot.ConfigError, "season"):
+                        bot.parse_settings(cfg, None)
+
+            schedule.write_text(json.dumps({
+                "season": "2026-27",
+                "batches": {"G2": {"from": "2028-01-03", "to": "2028-01-16", "location": "Gulmarg"}},
+            }))
+            cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(schedule))
+            with self.assertRaisesRegex(bot.ConfigError, "must fall within financial season 2026-27"):
+                bot.parse_settings(cfg, None)
+
+            schedule.write_text(json.dumps({"season": "2026-27", "batches": {"G2": record}}))
+            cfg = make_config(
+                tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(schedule),
+                batches={"G2": {"from": "2028-01-03", "to": "2028-01-16", "location": "Kargil"}})
+            with self.assertRaisesRegex(bot.ConfigError, "must fall within financial season 2026-27"):
+                bot.parse_settings(cfg, None)
+
+            schedule.write_text(json.dumps({
+                "season": "2026-27", "batches": {"G2": record}}))
+            first_cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(schedule))
+            first = bot.parse_settings(first_cfg, None)[0]
+            state_dir = tmp / "state-boundary"
+            progress = bot.State(state_dir / "state.json", True)
+            progress.bind(bot.expected_state_identity(first, "https://example.test"))
+            progress.acquire()
+            try:
+                progress.save()
+            finally:
+                progress.release()
+            preserved = progress.path.read_bytes()
+
+            schedule.write_text(json.dumps({
+                "season": "2027-28",
+                "batches": {"G2": {"from": "2028-01-03", "to": "2028-01-16", "location": "Gulmarg"}},
+            }))
+            second = bot.parse_settings(first_cfg, None)[0]
+            self.assertEqual((first.season, second.season), ("2026-27", "2027-28"))
+            self.assertNotEqual(bot.expected_state_identity(first, "https://example.test"),
+                                bot.expected_state_identity(second, "https://example.test"))
+            with self.assertRaisesRegex(bot.ConfigError, "different applicant, season or site"):
+                bot.Bot(second, state_dir, base_url="https://example.test", dry_run=False, log=bot.Log(echo=False))
+            self.assertEqual(progress.path.read_bytes(), preserved)
+
+            schedule.write_text(json.dumps({"batches": {"G2": record}}))
+            config_path = tmp / "invalid-season-config.json"
+            config_path.write_text(json.dumps(first_cfg))
+            with mock.patch.object(bot, "Http") as http:
+                self.assertEqual(bot.main(["--check", "--config", str(config_path)]), 2)
+            http.assert_not_called()
 
     def test_site_numeric_fields_require_ascii_without_restricting_unicode_text(self):
         cases = (
@@ -613,6 +680,7 @@ class ConfigurationAndDocuments(unittest.TestCase):
 
             schedule = tmp / "date-only-schedule.json"
             schedule.write_text(json.dumps({
+                "season": "2026-27",
                 "bookingOpensAt": "2026-11-12",
                 "batches": {"G2": {"from": "2027-01-03", "to": "2027-01-16", "location": "Gulmarg"}},
             }))
@@ -672,7 +740,7 @@ class ConfigurationAndDocuments(unittest.TestCase):
                 bot.parse_settings(cfg, None)
 
             schedule = tmp / "reversed-schedule.json"
-            schedule.write_text(json.dumps({"batches": {
+            schedule.write_text(json.dumps({"season": "2026-27", "batches": {
                 "G2": {"from": "2027-01-16", "to": "2027-01-03", "location": "Gulmarg"}}}))
             cfg = make_config(tmp, PHONES[:1], ["G2 Basic"], scheduleFile=str(schedule))
             with self.assertRaisesRegex(bot.ConfigError, "ends before it starts"):
@@ -1626,6 +1694,56 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual((next_request["method"], next_request["page"]),
                          ("GET", "admission_instructions.aspx"))
         self.assertNotEqual(next_request["sid"], failed[0])
+
+    def test_criteria_bounce_restarts_booking_with_fresh_cookie(self):
+        original = mock_site.Handler.post_criteria
+        bounced = []
+
+        def bounce_once(handler, session, query, values):
+            if values.get("__EVENTTARGET") == "lnkbtnNext" and not bounced:
+                bounced.append(handler.sid)
+                handler.site.sessions.pop(handler.sid, None)
+                return handler.redirect("/Admission_instructions.aspx")
+            return original(handler, session, query, values)
+
+        with mock.patch.object(mock_site.Handler, "post_criteria", bounce_once):
+            instance = self.run_with(PHONES[:2], ["G2 Basic"])
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertNotIn(PHONES[1], self.site.used)
+        self.assert_fresh_after_criteria_bounce(bounced[0])
+
+    def test_criteria_bounce_restarts_discovery_without_submitting(self):
+        original = mock_site.Handler.post_criteria
+        bounced = []
+
+        def bounce_once(handler, session, query, values):
+            if values.get("__EVENTTARGET") == "lnkbtnNext" and not bounced:
+                bounced.append(handler.sid)
+                handler.site.sessions.pop(handler.sid, None)
+                return handler.redirect("/Admission_instructions.aspx")
+            return original(handler, session, query, values)
+
+        settings = bot.parse_settings(make_config(self.tmp, PHONES[:1], ["G2 Basic"]), None)[0]
+        instance = bot.Bot(settings, self.out, base_url=self.url, dry_run=True, log=bot.Log(echo=False))
+        with mock.patch.object(mock_site.Handler, "post_criteria", bounce_once):
+            self.assertEqual(bot.run_discover(instance, PHONES[0]), 0)
+        self.assertEqual(self.site.applications, [])
+        self.assertFalse(any(item["submit"] for item in self.site.request_log))
+        self.assert_fresh_after_criteria_bounce(bounced[0])
+
+    def assert_fresh_after_criteria_bounce(self, bounced_sid):
+        criteria_index = next(
+            index for index, item in enumerate(self.site.request_log)
+            if item["method"] == "POST" and item["page"] == "admission_criteria.aspx"
+            and item["sid"] == bounced_sid)
+        redirected_index = next(
+            index for index, item in enumerate(self.site.request_log[criteria_index + 1:], criteria_index + 1)
+            if item["method"] == "GET" and item["page"] == "admission_instructions.aspx"
+            and item["sid"] == bounced_sid)
+        restarted = self.site.request_log[redirected_index + 1]
+        self.assertEqual((restarted["method"], restarted["page"]),
+                         ("GET", "admission_instructions.aspx"))
+        self.assertNotEqual(restarted["sid"], bounced_sid)
 
     def test_survives_crashes_sessions_and_application_restarts(self):
         self.site.chaos, self.site.session_loss, self.site.restarts = 0.35, 0.04, 0.02

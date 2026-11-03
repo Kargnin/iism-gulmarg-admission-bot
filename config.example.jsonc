@@ -47,8 +47,9 @@
   // Intermediate/Advance are not supported yet and produce a warning.
   "coursePriorities": ["G2 Basic", "G3 Basic", "G6 Basic"],
 
-  // Optional explicit schedule sources. scheduleFile replaces the default schedule.json;
-  // top-level batches override matching codes, and bookingOpensAt overrides the schedule time.
+  // Optional explicit schedule sources. scheduleFile replaces the default schedule.json and must
+  // declare a season such as "2026-27"; every batch date must fall in that Apr-Mar financial year.
+  // Top-level batches override matching codes within that season; bookingOpensAt overrides the time.
   // "scheduleFile": "schedule.custom.json",
   // "bookingOpensAt": "2026-11-12T10:00:00+05:30",
 
