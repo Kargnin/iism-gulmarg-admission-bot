@@ -50,11 +50,12 @@ def scenario(busy=0,receipt=False,crash=0,parallel=False,cold=False,full_once=Fa
     with tempfile.TemporaryDirectory(prefix='verify-direct-',dir=repo/'configs') as directory:
         root=Path(directory);(root/'configs').mkdir();(root/'capsules').mkdir()
         cfg=support.make_config(root,['9000000011','9000000012','9000000013','9000000014'],['G4 Basic','G1 Basic'])
+        cfg['documents']['parentSignature']='sign.jpg'
         config=root/'configs/me.jsonc';config.write_text(json.dumps(cfg));config.chmod(0o600)
         site=make_site(busy,receipt,crash);site.cold=cold;site.full_once=full_once;site.fail_before_commit=manual_reconcile;site.prep_busy=2 if cold else 0;site.selector_busy=2 if cold else 0;server=ThreadingHTTPServer(('127.0.0.1',0),ReadyHandler);server.site=site;server.daemon_threads=True;server.handle_error=lambda *a:None
         threading.Thread(target=server.serve_forever,daemon=True).start();url=f'http://127.0.0.1:{server.server_port}'
         def command(target,prepare=True,confirm=False,once=False):
-            return [sys.executable,'-c',"import importlib.util,sys;from pathlib import Path;s=importlib.util.spec_from_file_location('direct',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);m.ROOT=Path(sys.argv[2]);m.HERE=m.ROOT/'capsules';m.ALLOCATIONS={'G1':('synthetic-shared','synthetic-4-4-80'),'G4':('synthetic-shared','synthetic-4-4-83')};r=m.run(sys.argv[3],m.ROOT/'configs/me.jsonc',sys.argv[4],prepare_only=True) if sys.argv[5]=='1' else 0;raise SystemExit(r or m.run(sys.argv[3],m.ROOT/'configs/me.jsonc',sys.argv[4],confirm_not_booked=sys.argv[6]=='1',limit=1 if sys.argv[7]=='1' else None))",str(ENGINE),str(root),target,url,'1' if prepare else '0','1' if confirm else '0','1' if once else '0']
+            return [sys.executable,'-c',"import importlib.util,sys;from pathlib import Path;s=importlib.util.spec_from_file_location('direct',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);m.ROOT=Path(sys.argv[2]);m.HERE=m.ROOT/'capsules';raise SystemExit(m.run(sys.argv[3],m.ROOT/'configs/me.jsonc',sys.argv[4],confirm_not_booked=sys.argv[6]=='1',limit=1 if sys.argv[7]=='1' else None))",str(ENGINE),str(root),target,url,'1' if prepare else '0','1' if confirm else '0','1' if once else '0']
         try:
             targets=['G4','G1'] if parallel else ['G4']
             processes=[subprocess.Popen(command(t,once=manual_once),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True) for t in targets]
@@ -100,14 +101,15 @@ def scenario(busy=0,receipt=False,crash=0,parallel=False,cold=False,full_once=Fa
                 if process.poll() is None:process.kill();process.wait()
             server.shutdown();server.server_close()
 
-scenario(busy=2,parallel=True)
-scenario(receipt=True)
-scenario(crash=1)
+if __name__=='__main__':
+    scenario(busy=2,parallel=True)
+    scenario(receipt=True)
+    scenario(crash=1)
 
-scenario(busy=2,parallel=True,cold=True)
+    scenario(busy=2,parallel=True,cold=True)
 
-scenario(full_once=True)
+    scenario(full_once=True)
 
-scenario(busy=7,parallel=True)
-scenario(full_once=True,manual_once=True)
-scenario(manual_reconcile=True)
+    scenario(busy=7,parallel=True)
+    scenario(full_once=True,manual_once=True)
+    scenario(manual_reconcile=True)

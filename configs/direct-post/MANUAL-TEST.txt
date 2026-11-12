@@ -1,23 +1,34 @@
-Manual single-request tests. Run --confirm-not-booked only after checking that the earlier pending attempt was not accepted. It records your explicit confirmation and clears only that batch's marker.
+Direct POST workers: G1 and G4
 
-G1:
+Configuration is read at the start of every request iteration from:
+/Users/bhushanmalani/Code/iism/configs/me.jsonc
+
+Edit the config while the updated worker runs. The next request uses a newly validated snapshot; an in-flight request keeps the old values until it settles. Invalid/partial JSON, invalid fields, or missing/invalid documents pause sending and automatically resume after correction. The worker never silently sends an old config while the current one is invalid.
+
+Address/contact fields, education, diet and document paths come from config. Changed document contents at the same path are detected too. Local-only edits rebuild the multipart body without additional site preparation. State, DOB, phone and semantic course/level/batch changes invalidate dependent server preparation once. No fixed24-hour validity timer is used. ViewState/EventValidation errors trigger fresh server preparation.
+
+Each live process prepares current server values once at startup, including availability. It then reuses matching state across final POST retries and adopts updated state from completed rejected forms. Fee and allocation are read from that prepared state, without a per-loop price/allocation query; for the existing profile these are10000, shared G1 allocation0 and G4 allocation7. Age is calculated only by the website. The existing confirmed G4 catalogue date typo is handled only for its original exact date range.
+
+Guardian upload is now explicit in documents.parentSignature. It is currently signature.jpg, preserving your requested upload. A different configured guardian path is honored; clearing that required path pauses instead of silently substituting the applicant signature. Optional configured documents are included when applicable; removing one clears its upload flag.
+
+Phone/target changes preserve used-number and booking history. An applicant name/father/DOB identity correction can rebind only an empty unsubmitted ledger. Existing submission/used-phone history blocks identity replacement. An unresolved final request retains its original phone/target and must be reconciled before a replacement can be sent. No progress reset or automatic history migration occurs. A season/run change requires a restart and does not touch the other run namespace.
+
+Explicit bot.requestTimeoutSec and bot.submitTimeoutSec edits apply to subsequent requests. If omitted, direct mode retains its previous15-second preparation timeout and30-second final timeout. Direct workers still have no artificial HTTP retry delay; normal-bot parallel/backoff settings do not control these independent scripts. The brief local polling wait is used only while configuration is paused, not between valid HTTP retries.
+
+Continuous use, in two Terminal tabs:
+python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py
+python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g4.py
+
+The commands above already prepare fresh state at startup. No separate --prepare-only command is needed before a live run. Restart existing old-version processes once to load this code; subsequent config edits need no restart.
+
+Manual single-final-request tests, only after verifying an earlier pending attempt was not accepted:
 python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py --once --confirm-not-booked
-
-G4:
 python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g4.py --once --confirm-not-booked
 
-Each makes one final request attempt, then exits. A completed no-seats response is saved and exits1; that means no application was confirmed, not a Python crash. If no response arrives, the JSON records responseReceived=false, and a possibly-sent request remains pending.
+--confirm-not-booked records your explicit confirmation and clears only that batch's pending marker. It cannot clear a confirmed booking or used-phone history. --once performs one final POST attempt after preparation; a complete no-seats reply exits1, meaning no application was confirmed. A possibly sent request without a verified reply stays pending.
 
-The terminal prints responseFile and responseMetadata. Manual responses are stored separately under:
-/Users/bhushanmalani/Code/iism/configs/direct-post/responses/once/G1
-/Users/bhushanmalani/Code/iism/configs/direct-post/responses/once/G4
+Optional preparation for offline packet inspection (never submits):
+python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py --prepare-only
+python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py --plan
 
-HTML is the server response page; JSON contains HTTP status, headers, redirect count and error details. The newest result is also referenced by responses/latest-G1.json or latest-G4.json. A timed-out attempt has no new HTML response; do not mistake the preceding no-seats page for its outcome.
-
-Continuous loops keep at most5 results per batch (10 loop results total). Manual --once results are retained separately. Seat Not Available is not a stopping condition for continuous mode.
-
-Tomorrow13November2026,10AMIST, use two Terminal tabs after reconciling any pending results. For fresh state followed by continuous final posts:
-python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py --prepare-only && python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py
-python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g4.py --prepare-only && python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g4.py
-
-No deliberate retry delay. Fee10000 and the captured current allocation0(shared G1)/7(G4) are pinned. Signed WebForms state remains server-generated. Guardian uses your supplied signature. Do not launch a second instance of a worker that is already running.
+The terminal prints responseFile and responseMetadata. Manual responses are retained separately under responses/once/G1 and responses/once/G4. Continuous mode retains only the latest5 results per batch. HTML contains the response page; JSON includes status, headers, redirects and errors. A timeout has no new HTML body, so inspect responseReceived in the metadata. Seat Not Available is a retry condition for continuous mode. Ctrl+C stops a worker and preserves any unresolved final request.

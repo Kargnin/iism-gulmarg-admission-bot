@@ -62,7 +62,7 @@
     "signature": "signature.jpg",        // mandatory
     "dobProof": "class-10-dob-proof.jpg",               // mandatory: Class X marksheet, birth certificate, passport...
     "educationProof": "education-proof.jpg",         // mandatory: latest marksheet / degree
-    "parentSignature": "",               // required when the website reports under 18 or requests it
+    "parentSignature": "signature.jpg",               // required when the website reports under 18 or requests it
     "domicileProof": "",                 // optional
     "skiingCertificate": "",             // for Intermediate / Advance: your previous course certificate
     "employmentProof": ""                // optional
