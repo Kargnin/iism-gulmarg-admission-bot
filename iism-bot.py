@@ -79,6 +79,11 @@ BOT_DEFAULTS = {
     "submitTimeoutSec": 120,
     "retryDelaySec": 1.0,        # first retry delay; grows with repeated failures ...
     "maxRetryDelaySec": 10.0,    # ... up to this
+    # A server error (503 busy, 5xx, error page, dropped/timed-out connection) on one step - the
+    # course, level or seat reload, the mobile or terms page - sends that same step again with the
+    # same session, keeping the steps already done, for up to this long before starting over.
+    "stepRetrySec": 120,
+    "stepRetryDelaySec": 1.0,    # pause between those same-step retries
     "maxRejections": 3,          # site rejected the form this often for a choice -> move on
     "rejectedRetrySec": 5,       # pause after the site rejected the form
     # The form's own check asks for a parent/guardian signature even from adults. If the site
@@ -96,6 +101,8 @@ BOT_NUMBER_MINIMUMS = {
     "submitTimeoutSec": (0, False),
     "retryDelaySec": (0, False),
     "maxRetryDelaySec": (0, False),
+    "stepRetrySec": (0, True),
+    "stepRetryDelaySec": (0, False),
     "rejectedRetrySec": (0, True),
     "statusEverySec": (0, False),
 }
@@ -285,6 +292,16 @@ VIEWSTATE_ERRORS = [
     "validation of viewstate mac failed", "invalid viewstate",
     "invalid postback or callback argument", "the state information is invalid",
 ]
+# A busy server or gateway: the request was turned away before the site's own code ran.
+SERVER_BUSY_STATUSES = (429, 502, 503, 504)
+STEP_APP_ERROR_TRIES = 3  # a step that hits the site's own error page this often starts the visit over
+STEP_NAMES = {
+    "ddlCourse": "choosing the course (loads the course levels)",
+    "ddlCourseLevel": "choosing the course level (loads the course dates)",
+    "ddlScheduleCourse": "choosing the course dates (loads the seat count)",
+    "ddlState": "choosing the state",
+    "txtDateOfBirth": "entering the date of birth",
+}
 
 SKI_KIND_PATTERN = r"(?:\bsnow\s*ski(?:ing)?\b|\bski(?:ing)?\b)"
 BOARD_KIND_PATTERN = r"(?:\bsnow\s*board(?:ing)?\b|\bboard(?:ing)?\b)"
@@ -321,13 +338,21 @@ class ConfigError(Exception):
 class Transient(Exception):
     """Temporary trouble (network, 5xx, error page): retry the same step."""
 
-    def __init__(self, message, retry_after=None):
+    def __init__(self, message, retry_after=None, app_error=False):
         super().__init__(message)
         self.retry_after = retry_after
+        # True when the site's own code failed (HTTP 500, an error page, an unexpected page): its
+        # session may be broken, so that step is resent only a few times before starting over.
+        # False for a busy server (503, 502, 504, 429) or a dropped/timed-out connection.
+        self.app_error = app_error
 
 
 class RateLimited(Transient):
-    """The final request was explicitly refused with HTTP 429 and is safe to retry."""
+    """The final request was refused before processing (HTTP 429, or IIS's 503.2) and is safe to resend."""
+
+
+class NotSent(Transient):
+    """The final request failed before any of it reached the site: safe to send again."""
 
 
 class Cancelled(Exception):
@@ -773,28 +798,55 @@ def state_aliases(name):
     return next(([a for a in group if a != n] for group in STATE_ALIASES if n in group), [])
 
 
-def batch_candidates(options, target):
+def day_match(found, day):
+    """Same day and month, read day-first (or unambiguously), whatever year is written."""
+    return day is not None and any(
+        reading.reading != "mdy" and (reading.month, reading.day) == (day.month, day.day) for reading in found)
+
+
+def clearly_this_season(options, batches):
+    """Whether a schedule list is this season's: at least two entries carry a written year that matches
+    this season's published dates. A lone wrong year in one entry is then the site's typo - on
+    12 Nov 2026 it listed "4th course from 31 Jan to 13 Feb 2026" for the 2027 batch - and not an
+    old batch from last season."""
+    days = [b[key] for b in (batches or {}).values() for key in ("from", "to") if b.get(key)]
+    hits = 0
+    for _, text in real_options(options):
+        written = [reading for reading in dates_in(text) if reading.year is not None]
+        if any(date_match(written, day) == 2 for day in days):
+            hits += 1
+    return hits >= 2
+
+
+def batch_candidates(options, target, season_list=False):
+    """Schedule entries for this choice, best first. With season_list (see clearly_this_season) a
+    written year that disagrees with the choice's dates counts as a typo, not as another batch."""
     ranked = []
     for index, (value, text) in enumerate(real_options(options)):
         found = dates_in(text)
-        start = date_match(found, target.start)
+
+        def dated(day):
+            exact = date_match(found, day)
+            return exact or (1 if season_list and day_match(found, day) else 0)
+
+        start = dated(target.start)
         if not start:
             continue
-        if target.end and len({reading.span for reading in found}) >= 2 and not date_match(found, target.end):
+        if target.end and len({reading.span for reading in found}) >= 2 and not dated(target.end):
             continue
         location = location_score(text, target.location)
         level = level_score(text, target)
         if location < 0 or level < 0:
             continue
-        score = (10 * start + 5 * date_match(found, target.end) + location + level
+        score = (10 * start + 5 * dated(target.end) + location + level
                  + (100 if target.batch_text and norm(target.batch_text) in norm(text) else 0))
         if score > 0:
             ranked.append((-score, index, (value, text)))
     return [option for _, _, option in sorted(ranked)]
 
 
-def match_batch(options, target):
-    choices = batch_candidates(options, target)
+def match_batch(options, target, season_list=False):
+    choices = batch_candidates(options, target, season_list)
     return choices[0] if choices else None
 
 
@@ -1274,7 +1326,7 @@ def validate_tuning(cfg, errors):
 
     if opt["maxRetryDelaySec"] < opt["retryDelaySec"]:
         errors.append("bot.maxRetryDelaySec must be at least bot.retryDelaySec")
-    if opt["maxRetryDelaySec"] > 10 or opt["retryDelaySec"] > 10:
+    if opt["maxRetryDelaySec"] > 10 or opt["retryDelaySec"] > 10 or opt["stepRetryDelaySec"] > 10:
         errors.append("bot retry delays must be at most 10 seconds")
     return opt
 
@@ -1925,6 +1977,17 @@ class TrackedHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(factory, request, context=self._context)
 
 
+def refused_before_processing(page):
+    """IIS's own "503.2" page - too many requests at once (serverRuntime appConcurrentRequestLimit),
+    the error the real site gave most often on 12 Nov 2026. IIS sends it before the site's code runs,
+    so a final form refused this way was never processed and is safe to send again. Any other 503
+    may come from a proxy after the form was processed, so it stays uncertain."""
+    if page.status != 503:
+        return False
+    text = f"{page.title()} {page.body[:4000]}".lower()
+    return "503.2" in text or "appconcurrentrequestlimit" in text
+
+
 def response_retry_after(page):
     value = page.headers.get("retry-after", "")
     try:
@@ -2201,8 +2264,41 @@ class Session:
                 raise SessionLost("the site rejected our page state")
             what = f"HTTP {page.status}" if page.status >= 400 else "error page"
             title = page.title()
-            raise Transient(what + (f" ({title[:80]})" if title else ""), response_retry_after(page))
+            busy = page.status in SERVER_BUSY_STATUSES
+            raise Transient(what + (f" ({title[:80]})" if title else ""), response_retry_after(page),
+                            app_error=not busy)
         return page
+
+    def step(self, what, action):
+        """Run one request of the visit. On a server error send that same request again - same cookies,
+        same page state - instead of starting over at mobile verification, so the steps already done
+        are kept. (On 12 Nov 2026 the site answered most requests with 503 for 20 minutes; a visit that
+        needed about seven successes in a row never got through, while resending one step does.)
+        A lost session starts over at once; a failure of the site's own code (HTTP 500, an error page)
+        is resent only STEP_APP_ERROR_TRIES times; a busy server or a dropped connection is resent for
+        up to bot.stepRetrySec."""
+        bot = self.bot
+        budget = bot.opt["stepRetrySec"]
+        started = time.monotonic()
+        tries = app_errors = 0
+        while True:
+            if bot.stop.is_set():
+                raise Cancelled()
+            try:
+                result = action()
+            except (SessionLost, Refused, Resend):
+                raise
+            except Transient as exc:
+                tries += 1
+                app_errors += bool(exc.app_error)
+                if budget <= 0 or app_errors >= STEP_APP_ERROR_TRIES or time.monotonic() - started >= budget:
+                    raise
+                bot.note(self.who, f"{exc} while {what}; sending that step again (the earlier steps are kept)")
+                bot.sleep(bot.step_delay(exc))
+                continue
+            if tries:
+                bot.note(self.who, f"got through {what} after retrying")
+            return result
 
     def get(self, path):
         return self.checked(self.http.get(path))
@@ -2261,14 +2357,15 @@ class Session:
 
     def open_form(self):
         """Mobile verification + criteria; returns the admission form."""
-        page = self.get("Admission_instructions.aspx")
+        page = self.step("opening the site", lambda: self.get("Admission_instructions.aspx"))
         for _ in range(4):
             if page.name == FORM_PAGE:
                 self.verdict(page, full_ok=False)
                 self.bot.number_accepted(self.phone)
                 return page
             if page.name == INSTRUCTIONS_PAGE:
-                nxt = self.checked(self.postback(page, "lnkbtnSubmit", {"txtMobileNo": self.phone}))
+                nxt = self.step("mobile verification", lambda page=page: self.checked(
+                    self.postback(page, "lnkbtnSubmit", {"txtMobileNo": self.phone})))
                 if nxt.name in (CRITERIA_PAGE, FORM_PAGE):
                     self.bot.number_accepted(self.phone)
                 said = self.verdict(nxt, deep=nxt.name == INSTRUCTIONS_PAGE, full_ok=False)
@@ -2281,7 +2378,8 @@ class Session:
                     raise Transient("mobile verification did not go through")
                 page = nxt
             elif page.name == CRITERIA_PAGE:
-                nxt = self.checked(self.postback(page, "lnkbtnNext", {"chkAccept": "on"}))
+                nxt = self.step("accepting the terms", lambda page=page: self.checked(
+                    self.postback(page, "lnkbtnNext", {"chkAccept": "on"})))
                 if nxt.name == INSTRUCTIONS_PAGE:
                     raise SessionLost("the site sent us back to mobile verification after criteria")
                 said = self.verdict(nxt, deep=nxt.name == CRITERIA_PAGE, full_ok=False)
@@ -2294,32 +2392,48 @@ class Session:
                 raise Transient(f"unexpected page '{page.name}'")
         raise Transient("could not get through to the admission form")
 
-    def select(self, page, event, values, classify_full=False):
-        """Postback after changing a dropdown/date; returns the refreshed form page."""
+    def select(self, page, event, values, classify_full=False, check=None):
+        """Postback after changing a dropdown/date; returns the refreshed form page. A server error
+        sends the same postback again from the same page (see step), as does a reply that `check`
+        rejects with Transient."""
         values = dict(values)
-        nxt = self.checked(self.postback(page, event, values))
-        if nxt.name != FORM_PAGE:
-            if nxt.name in (INSTRUCTIONS_PAGE, CRITERIA_PAGE):
-                raise SessionLost(f"the site sent us back to {nxt.name}")
-            raise Transient(f"unexpected page '{nxt.name}' after choosing {event}")
-        try:
-            self.verdict(nxt)
-        except TargetFull:
-            if classify_full:
-                return nxt, True
-            raise
-        return (nxt, False) if classify_full else nxt
+
+        def send():
+            nxt = self.checked(self.postback(page, event, values))
+            if nxt.name != FORM_PAGE:
+                if nxt.name in (INSTRUCTIONS_PAGE, CRITERIA_PAGE):
+                    raise SessionLost(f"the site sent us back to {nxt.name}")
+                raise Transient(f"unexpected page '{nxt.name}' after choosing {event}", app_error=True)
+            try:
+                self.verdict(nxt)
+            except TargetFull:
+                if classify_full:
+                    return nxt, True
+                raise
+            if check is not None:
+                check(nxt)
+            return nxt, False
+
+        nxt, full = self.step(STEP_NAMES.get(event, f"choosing {event}"), send)
+        return (nxt, full) if classify_full else nxt
 
     def cascade(self, target):
         """Choose course, level, batch, state and date of birth for this target.
 
-        Each attempt starts from scratch because the site only recovers reliably after a new
-        cookie session repeats mobile verification and every dependent postback."""
+        Each attempt starts with a new cookie session (mobile verification and the terms), because
+        the course list only refreshes that way. Within the attempt a server error resends just the
+        failed step (see step); a lost session, or a step that keeps failing, starts over."""
         bot = self.bot
         excluded_courses = set()
         excluded_levels = set()
         excluded_batches = set()
+        no_seats = []  # what was listed but full, for the message
         found = None
+
+        def seat_count_ok(candidate):
+            if parse_server_number(candidate.value("txtAvailableSeat")) is None:
+                raise Transient("the selected schedule reported an invalid seat count", app_error=True)
+
         while found is None:
             self.restart()
             page = self.open_form()
@@ -2334,6 +2448,7 @@ class Session:
                     classify_full=True)
                 if full:
                     excluded_courses.add(value)
+                    no_seats.append(f"{text}: the site says it is full")
                     restart = True
                     break
                 level_options = page.options("ddlCourseLevel")
@@ -2351,12 +2466,14 @@ class Session:
                             classify_full=True)
                         if full:
                             excluded_levels.add(level_key)
+                            no_seats.append(f"{level[1]}: the site says it is full")
                             restart = True
                             break
                     batches = page.options("ddlScheduleCourse")
                     if any(is_season_batch(t, bot.s.batches) for _, t in real_options(batches)):
                         bot.saw_season()
-                    for batch in batch_candidates(batches, target):
+                    season_list = clearly_this_season(batches, bot.s.batches)
+                    for batch in batch_candidates(batches, target, season_list):
                         batch_key = level_key + (batch[0],)
                         if batch_key in excluded_batches or selection_conflicts(
                                 (value, text), level, batch, target):
@@ -2364,16 +2481,17 @@ class Session:
                         values = {"ddlScheduleCourse": batch[0]}
                         if level:
                             values["ddlCourseLevel"] = level[0]
-                        candidate_page, full = self.select(page, "ddlScheduleCourse", values, classify_full=True)
+                        candidate_page, full = self.select(page, "ddlScheduleCourse", values, classify_full=True,
+                                                           check=seat_count_ok)
                         if full:
                             excluded_batches.add(batch_key)
+                            no_seats.append(f"{batch[1]}: the site says it is full")
                             restart = True
                             break
                         seats = parse_server_number(candidate_page.value("txtAvailableSeat"))
-                        if seats is None:
-                            raise Transient("the selected schedule reported an invalid seat count")
                         if seats == 0:
                             excluded_batches.add(batch_key)
+                            no_seats.append(f"{batch[1]}: 0 seats left")
                             restart = True
                             break
                         found = ((value, text), level, batch, candidate_page, seats)
@@ -2388,6 +2506,8 @@ class Session:
         if not found:
             if bot.season_seen is None:
                 raise NotOpen("the snow courses are not listed yet" + listing(page, "ddlCourse"))
+            if no_seats:
+                raise TargetFull(f"{target.when()} has no seats right now ({no_seats[-1]})")
             raise TargetFull(f"{target.when()} is not listed" + listing(page, "ddlScheduleCourse"))
         course, level, batch, page, seats = found
         if not has_semantic_evidence(course, level, batch, target):
@@ -2483,9 +2603,10 @@ class Session:
         stale = [name for name, value in expected.items() if current[name] is None or page.value(name) != value]
         if stale:
             raise Transient("the latest form no longer contains and selects: " + ", ".join(stale))
+        season_list = clearly_this_season(page.options("ddlScheduleCourse"), bot.s.batches)
         if (selection_conflicts(current["ddlCourse"], current["ddlCourseLevel"],
                                 current["ddlScheduleCourse"], target)
-                or match_batch([current["ddlScheduleCourse"]], target) is None):
+                or match_batch([current["ddlScheduleCourse"]], target, season_list) is None):
             raise Transient("the latest course, level or batch meaning no longer matches the configured preference")
         current_state = match_choice(page.options("ddlState"), bot.s.state, state_aliases(bot.s.state))
         if current_state is None or current_state[0] != sel.state[0]:
@@ -2549,6 +2670,7 @@ class Session:
             bot.log.info(f"{self.who}SUBMITTING {target.label}: {sel}")
             resp = self.postback(page, "", values, files=files, timeout=bot.opt["submitTimeoutSec"],
                                  on_start=note_request_started)
+            resp = self.reload_receipt(resp)
             saved = bot.save_page(self.who, f"submit-{target.label}", resp)
             result = self.judge_submit(resp, target, sel, saved, set(files))
         except (RateLimited, Resend, Rejected, TargetFull, NotOpen, PhoneUsed):
@@ -2562,7 +2684,7 @@ class Session:
         except Uncertain as exc:
             if not request_started:
                 bot.clear_submitting(self.phone)
-                raise Transient(f"final request did not start: {exc}") from exc
+                raise NotSent(f"final request did not start: {exc}") from exc
             raise
         except (Cancelled, ConfigError):
             if not request_started:
@@ -2571,9 +2693,34 @@ class Session:
         except Exception as exc:
             if not request_started:
                 bot.clear_submitting(self.phone)
-                raise Transient(f"final request did not start: {exc}") from exc
+                raise NotSent(f"final request did not start: {exc}") from exc
             raise Uncertain(str(exc)) from exc
         return result
+
+    def reload_receipt(self, resp):
+        """The site took the final form and redirected it, but the page it redirected to failed to
+        load (503 busy or another server error). Load that page again - a plain GET; the form is
+        never sent again - so its receipt can confirm the booking. Whatever comes back is judged as
+        before; it still counts as a redirect, so anything short of a clear receipt stays uncertain."""
+        bot = self.bot
+        receipt_failed = resp.status >= 500 or resp.status in SERVER_BUSY_STATUSES
+        if not (resp.redirects and resp.complete and receipt_failed):
+            return resp
+        started = time.monotonic()
+        while time.monotonic() - started < bot.opt["stepRetrySec"] and not bot.stop.is_set():
+            bot.note(self.who, f"the final form was taken, but its receipt page failed to load "
+                     f"(HTTP {resp.status}); loading the receipt again")
+            bot.sleep(bot.step_delay())
+            if bot.stop.is_set():
+                break
+            try:
+                again = self.http.send("GET", resp.url)
+            except Transient:
+                continue
+            if again.complete and again.status < 500 and again.status not in SERVER_BUSY_STATUSES:
+                again.redirects = resp.redirects + again.redirects
+                return again
+        return resp
 
     def judge_submit(self, resp, target, sel, saved, sent_files):
         self.http.check_destination(resp.url)
@@ -2604,7 +2751,7 @@ class Session:
         failed_validators = failed_validator_messages(resp.body) if resp.name == FORM_PAGE else []
         confirmed_evidence = explicit_success or payment_receipt
         if (positive_evidence or payment_receipt) and (
-                negative or phone_used or full or closed or failed_validators or resp.status == 429):
+                negative or phone_used or full or closed or failed_validators or resp.status in (429, 503)):
             raise Uncertain("the final response contains conflicting success and rejection evidence")
         if 200 <= resp.status < 300 and confirmed_evidence:
             message = next((m for m in msgs if affirmative_success(m.lower())), "") or query.get("resp", "")
@@ -2651,6 +2798,10 @@ class Session:
             raise Rejected(f"{reason} (page saved: {saved})")
         if resp.status == 429:
             raise RateLimited("submit was rate limited: HTTP 429", response_retry_after(resp))
+        if refused_before_processing(resp):
+            title = resp.title()
+            raise RateLimited("the site was too busy to take the final form: HTTP 503"
+                              + (f" ({title[:80]})" if title else ""), response_retry_after(resp))
         if resp.status >= 400 or not resp.is_aspx:
             if has_any(resp.body.lower(), VIEWSTATE_ERRORS):
                 raise SessionLost("the site rejected our page state on submit")
@@ -2676,7 +2827,20 @@ class Session:
         if self.bot.dry_run:
             self.bot.log.info(f"{self.who}DRY RUN - would submit {target.label} now: {sel}")
             return {"message": f"dry run: {sel}", "applicationId": "", "dryRun": True}
-        return self.submit(target, sel, values, files)
+        # The site turning the final form away unprocessed (IIS 503.2 "too busy", 429) or a failure
+        # before any of it was sent: send the same filled form again rather than redoing every step.
+        started = time.monotonic()
+        while True:
+            try:
+                return self.submit(target, sel, values, files)
+            except (RateLimited, NotSent) as exc:
+                budget = self.bot.opt["stepRetrySec"]
+                if budget <= 0 or time.monotonic() - started >= budget:
+                    raise
+                self.bot.note(self.who, f"{target.label}: {exc}; sending the same final form again")
+                self.bot.sleep(self.bot.step_delay(exc))
+                if self.bot.stop.is_set():
+                    raise Cancelled()
 
 
 # ---------------------------------------------------------------------------
@@ -3024,6 +3188,13 @@ class Bot:
         delay = self.backoff(failures)
         if error.retry_after is not None:
             self.note("", f"Server requested Retry-After {error.retry_after:g}s; retry waits are capped at 10s.")
+            delay = max(delay, min(10.0, error.retry_after))
+        return min(10.0, delay)
+
+    def step_delay(self, error=None):
+        """Pause before resending one failed step: short and steady, or the server's Retry-After (capped)."""
+        delay = self.opt["stepRetryDelaySec"] * random.uniform(0.7, 1.3)
+        if error is not None and getattr(error, "retry_after", None) is not None:
             delay = max(delay, min(10.0, error.retry_after))
         return min(10.0, delay)
 

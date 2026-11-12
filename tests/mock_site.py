@@ -252,6 +252,10 @@ YSOD = ("<html><head><title>Runtime Error</title></head><body><h1>Server Error i
         "connection from the pool.</p></body></html>")
 IIS_503 = ("<html><head><title>Service Unavailable</title></head><body><h2>Service Unavailable</h2><hr>"
            "<p>HTTP Error 503. The service is unavailable.</p></body></html>")
+# what the real site answered most requests with on 12 Nov 2026, 10:00-10:20
+IIS_503_2 = ("<html><head><title>IIS 10.0 Detailed Error - 503.2 - Service Unavailable</title></head><body>"
+             "<h3>HTTP Error 503.2 - Service Unavailable</h3><h4>The serverRuntime@appConcurrentRequestLimit "
+             "setting is being exceeded.</h4></body></html>")
 IIS_403 = ("<html><head><title>IIS 10.0 Detailed Error - 403.14 - Forbidden</title></head><body><h3>HTTP Error "
            "403.14 - Forbidden</h3><h4>The Web server is configured to not list the contents of this directory."
            "</h4></body></html>")

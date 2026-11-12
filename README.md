@@ -99,7 +99,7 @@ Run this command yourself in an interactive terminal and keep the computer awake
 python3 iism-bot.py --config configs/me.jsonc
 ```
 
-It prepares documents, waits until shortly before opening, then checks continuously. Add `--now` only when you intend to start checking immediately. Recoverable errors start a fresh session with the same phone and prepared documents; retry waits grow up to 10 seconds. Ctrl+C stops further work. Restart with the same config to preserve progress in `runs/`.
+It prepares documents, waits until shortly before opening, then checks continuously. Add `--now` only when you intend to start checking immediately. A server error on one step (503 busy, another 5xx, an error page, a dropped or timed-out connection) sends just that step again in the same session, keeping the steps already done, for up to 2 minutes (`bot.stepRetrySec`); the final form is sent again only when IIS refused it unprocessed (its 503.2 "too busy" page, or 429). A lost session, or a step that keeps failing, starts a fresh session with the same phone; those waits grow up to 10 seconds. Ctrl+C stops further work. Restart with the same config to preserve progress in `runs/`.
 
 If a final reply is uncertain, that preference waits for you to check the actual application/email and answer **`booked`** or **`not booked`** in the terminal. Other workers continue. Do not guess or delete saved progress to retry.
 
