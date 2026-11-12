@@ -1,0 +1,79 @@
+// IISM Gulmarg booking bot - one person's config.
+//
+// Copy this file to config.jsonc, or to configs/<name>.jsonc for another person,
+// and replace every FILL_ME - those are the fields the form marks as mandatory (*).
+// Lines starting with // are comments.
+{
+  "applicant": {
+    "name": "Bhushan Malani",
+    "fatherName": "Ram Malani",
+    "dateOfBirth": "03/04/2002",            // dd/mm/19xx or dd/mm/20xx, e.g. 15/05/1998
+    "nationality": "Indian",
+    "email": "bhushanmalani3@gmail.com",                  // the payment link is sent here
+    "education": "Graduation",           // High School, Intermediate, Graduation or Post graduation
+    "diet": "vegetarian",                // Vegetarian or Non-Vegetarian
+    "bloodGroup": "B+ve",             // e.g. B+
+    "emergencyContactName": "Ram Malani",
+    "emergencyContactPhone": "9422156757",
+
+    // optional (not marked mandatory on the form)
+    "domicile": "",
+    "medicalCategory": "",
+    "height": "",                        // cm
+    "weight": "",                        // kg
+    "waist": "",                         // inches
+    "shoeSize": ""                       // UK size
+  },
+
+  "address": {
+    "houseNo": "C5/87, Hari Nirmal",
+    "street": "Narhari Nagar, Rajapeth",
+    "district": "Amravati",
+    "state": "Maharashtra",                  // e.g. Maharashtra, Delhi, Karnataka
+    "pincode": "444606"
+  },
+
+  // One primary per preference in the same order. Extra numbers are reserves. Common
+  // +91/0, space, parenthesis, and hyphen formatting is normalized to 10 ASCII digits.
+  "phoneNumbers": ["8668486184", "7498858917", "9422156757", "9834925758"],
+
+  // Your independent choices, in primary-number order. Simple entries use
+  // "<batch> <level or course>"; README.md documents the object form.
+  //   Gulmarg: G1 20 Dec-02 Jan, G2 03-16 Jan, G3 17-30 Jan, G4 31 Jan-13 Feb,
+  //            G5 14-27 Feb, G6 28 Feb-13 Mar          Kargil: K1 08-21 Feb, K2 22 Feb-07 Mar
+  //   Snow Skiing levels: Basic, Intermediate, Advance. Do not add a skiing level to
+  //   other courses; use "G4 Snowboarding" or "G5 MOI" directly.
+  // Every preference stays active independently, including missing/full slots.
+  // Intermediate/Advance are not supported yet and produce a warning.
+  "coursePriorities": ["G4 Basic", "G1 Basic"],
+
+  // Optional explicit schedule sources. scheduleFile replaces the default schedule.json and must
+  // declare a season such as "2026-27"; every batch date must fall in that Apr-Mar financial year.
+  // Top-level batches override matching codes within that season; bookingOpensAt overrides the time.
+  // "scheduleFile": "schedule.custom.json",
+  // "bookingOpensAt": "2026-11-12T10:00:00+05:30",
+
+  // Folder with your documents. "~" is your home folder; names below are inside it.
+  // The site wants JPG/PNG under 500 KB - on a Mac, PDFs and big images are
+  // converted automatically (your originals are not touched).
+  "documentsDir": "/Users/bhushanmalani/Code/iism/documents/booking/prepared",
+  "documents": {
+    "photo": "photo.jpg",                // mandatory
+    "signature": "signature.jpg",        // mandatory
+    "dobProof": "class-10-dob-proof.jpg",               // mandatory: Class X marksheet, birth certificate, passport...
+    "educationProof": "education-proof.jpg",         // mandatory: latest marksheet / degree
+    "parentSignature": "",               // required when the website reports under 18 or requests it
+    "domicileProof": "",                 // optional
+    "skiingCertificate": "",             // for Intermediate / Advance: your previous course certificate
+    "employmentProof": ""                // optional
+  },
+
+  // Optional tuning - the defaults are fine for booking day.
+  "bot": {
+    "parallel": true,                    // work on several numbers at once (false = one number after another)
+    "notify": true,                      // Mac notification + beep when a seat is booked
+    "maxRetryDelaySec": 10,               // no cumulative retry limit; delays never exceed 10 seconds
+    "parentSignatureFallback": true      // only after the website positively reports an adult and still
+                                         // insists, resend with the applicant signature in that slot
+  }
+}

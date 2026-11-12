@@ -1,0 +1,23 @@
+Manual single-request tests. Run --confirm-not-booked only after checking that the earlier pending attempt was not accepted. It records your explicit confirmation and clears only that batch's marker.
+
+G1:
+python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py --once --confirm-not-booked
+
+G4:
+python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g4.py --once --confirm-not-booked
+
+Each makes one final request attempt, then exits. A completed no-seats response is saved and exits1; that means no application was confirmed, not a Python crash. If no response arrives, the JSON records responseReceived=false, and a possibly-sent request remains pending.
+
+The terminal prints responseFile and responseMetadata. Manual responses are stored separately under:
+/Users/bhushanmalani/Code/iism/configs/direct-post/responses/once/G1
+/Users/bhushanmalani/Code/iism/configs/direct-post/responses/once/G4
+
+HTML is the server response page; JSON contains HTTP status, headers, redirect count and error details. The newest result is also referenced by responses/latest-G1.json or latest-G4.json. A timed-out attempt has no new HTML response; do not mistake the preceding no-seats page for its outcome.
+
+Continuous loops keep at most5 results per batch (10 loop results total). Manual --once results are retained separately. Seat Not Available is not a stopping condition for continuous mode.
+
+Tomorrow13November2026,10AMIST, use two Terminal tabs after reconciling any pending results. For fresh state followed by continuous final posts:
+python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py --prepare-only && python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py
+python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g4.py --prepare-only && python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g4.py
+
+No deliberate retry delay. Fee10000 and the captured current allocation0(shared G1)/7(G4) are pinned. Signed WebForms state remains server-generated. Guardian uses your supplied signature. Do not launch a second instance of a worker that is already running.
