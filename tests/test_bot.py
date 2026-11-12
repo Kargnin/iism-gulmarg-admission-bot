@@ -9,6 +9,7 @@ a copy of the real site's pages and flow.
 import contextlib
 import copy
 import hashlib
+import http.client
 import importlib.util
 import io
 import json
@@ -21,7 +22,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -35,8 +36,8 @@ spec.loader.exec_module(bot)
 
 FAST = {"parallel": True, "notify": False, "preventSleep": False, "startEarlySec": 0, "pollSec": 0.1,
         "requestTimeoutSec": 2, "submitTimeoutSec": 2, "retryDelaySec": 0.01, "maxRetryDelaySec": 0.05,
-        "stepRetrySec": 1.0, "stepRetryDelaySec": 0.01, "maxRejections": 3, "rejectedRetrySec": 0.05,
-        "statusEverySec": 999}
+        "stepRetrySec": 1.0, "stepRetryDelaySec": 0.01, "holdResendSec": 0.05, "holdIdleResendSec": 0.05,
+        "maxRejections": 3, "rejectedRetrySec": 0.05, "statusEverySec": 999}
 PHONES = ["9000000011", "9000000012", "9000000013"]
 
 
@@ -984,6 +985,27 @@ def offline_bot():
                    log=bot.Log(echo=False))
 
 
+class HeldFormTiming(unittest.TestCase):
+    def test_fast_window_around_opening_and_refresh_only_after_it(self):
+        instance = offline_bot()
+        instance.opt.update(holdResendSec=1.0, holdIdleResendSec=20)
+        opens = datetime(2026, 11, 13, 10, 0, tzinfo=bot.IST)
+        instance.s.opens_at = opens
+        expectations = [  # (time, pause between sends, refresh allowed)
+            (opens - timedelta(minutes=10), 20, False),
+            (opens - timedelta(seconds=59), 1.0, False),
+            (opens + timedelta(minutes=29), 1.0, False),
+            (opens + timedelta(minutes=31), 20, True),
+        ]
+        for moment, pause, refresh in expectations:
+            with self.subTest(moment=moment.time()), mock.patch.object(bot, "now_ist", return_value=moment):
+                self.assertEqual(instance.hold_interval(), pause)
+                self.assertEqual(instance.hold_refresh_allowed(), refresh)
+        instance.s.opens_at = None
+        self.assertEqual(instance.hold_interval(), 1.0)
+        self.assertTrue(instance.hold_refresh_allowed())
+
+
 class EndToEnd(unittest.TestCase):
     layout = "levels"
 
@@ -1072,6 +1094,85 @@ class EndToEnd(unittest.TestCase):
         steps_failed = {key[2] for key, count in failed.items() if count > 2}
         self.assertTrue({"ddlCourse", "ddlCourseLevel", "ddlScheduleCourse"} <= steps_failed, failed)
         self.assertGreaterEqual(failed[("POST", "admission_form.aspx", "", True)], 3)  # final form resent
+
+    def test_held_form_is_sent_again_until_seats_open(self):
+        """Kargnin's finding, 12 Nov 2026: the site checks seats when the final form arrives. With no
+        seats shown, the form is filled in anyway and sent again, so one request books once seats open."""
+        key = self.key("G2")
+        self.site.seats[key] = 0
+        timer = threading.Timer(0.6, lambda: self.site.seats.__setitem__(key, 2))
+        timer.start()
+        try:
+            instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        finally:
+            timer.cancel()
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(self.site.applications), 1)
+        submits = [item for item in self.site.request_log if item["submit"]]
+        self.assertGreater(len(submits), 2)  # "seat not available" answers before the booking
+        self.assertEqual(len({item["sid"] for item in submits}), 1)  # the same filled form was kept
+
+    def test_connection_broken_while_uploading_the_final_form_resends_it(self):
+        original_send = http.client.HTTPConnection.send
+        broken = []
+
+        def break_first_final_upload(connection, data):
+            if not broken and isinstance(data, (bytes, bytearray)) and b'name="btnSubmit"' in data:
+                broken.append(len(data))
+                raise BrokenPipeError(32, "Broken pipe")
+            return original_send(connection, data)
+
+        def no_feedback(*args):
+            self.fail("a final form that never finished uploading must not need feedback")
+
+        with mock.patch.object(http.client.HTTPConnection, "send", break_first_final_upload):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"], confirmation_handler=no_feedback)
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(broken), 1)
+        self.assertEqual(len(self.site.applications), 1)
+
+    def test_held_form_is_not_used_when_hold_is_off(self):
+        self.site.seats[self.key("G2")] = 0
+        instance = self.run_with(PHONES[:1], ["G2 Basic"], timeout=1.0, bot={"holdForm": False})
+        self.assertEqual(instance.bookings, [])
+        self.assertFalse(any(item["submit"] for item in self.site.request_log))
+
+    def test_dry_run_with_no_seats_fills_the_form_in_without_sending_it(self):
+        self.site.seats[self.key("G2")] = 0
+        instance = run_bot(make_config(self.tmp, PHONES[:1], ["G2 Basic"]), self.url, self.out, dry_run=True,
+                           timeout=8)
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "dry-run")])
+        events = [item["event"] for item in self.site.request_log]
+        self.assertIn("txtDateOfBirth", events)
+        self.assertFalse(any(item["submit"] for item in self.site.request_log))
+
+    def test_schedule_wise_capacity_with_allocation_zero_is_sent(self):
+        """The live G1 schedule carries hdfTypeOfCapacitySheet ScheduleCourseWise with allocation 0."""
+        original_form, original_submit = mock_site.Handler.form, mock_site.Handler.submit
+        sent = []
+
+        def live_g1_allocation(handler, mobile, values, listed, invalid=(), alert=None):
+            body = original_form(handler, mobile, values, listed, invalid=invalid, alert=alert)
+            if values.get("__EVENTTARGET") not in ("ddlScheduleCourse", "ddlState", "txtDateOfBirth"):
+                return body
+            for name, replacement in (("hdfTypeOfCapacitySheet", "ScheduleCourseWise"),
+                                      ("hdfCapacitySheetAllocationId", "0")):
+                pattern = rf'(<input\b[^>]*\bname="{name}"[^>]*\bvalue=")[^"]*(")'
+                body = re.sub(pattern, rf'\g<1>{replacement}\2', body, count=1, flags=re.I)
+            return body
+
+        def accept(handler, mobile, v, files, listed, course, level, batch):
+            sent.append((v.get("hdfTypeOfCapacitySheet"), v.get("hdfCapacitySheetAllocationId")))
+            key = (v["ddlCourse"], v["ddlCourseLevel"], v["ddlScheduleCourse"])
+            v = dict(v, hdfTypeOfCapacitySheet="synthetic-shared",
+                     hdfCapacitySheetAllocationId="synthetic-" + "-".join(key))
+            return original_submit(handler, mobile, v, files, listed, course, level, batch)
+
+        with mock.patch.object(mock_site.Handler, "form", live_g1_allocation), \
+                mock.patch.object(mock_site.Handler, "submit", accept):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(sent, [("ScheduleCourseWise", "0")])
 
     def test_listed_batch_without_seats_is_reported_as_full_not_unlisted(self):
         self.site.seats[self.key("G2")] = 0
@@ -1254,6 +1355,15 @@ class EndToEnd(unittest.TestCase):
         self.assertNotIn(PHONES[2], self.site.used)
 
     def test_disappearing_slot_returns_with_its_primary_while_sibling_books(self):
+        g2_attempts = self._disappearing_slot_returns(hold=False)
+        self.assertEqual(g2_attempts, [PHONES[0], PHONES[0]])
+
+    def test_held_form_of_a_disappearing_slot_keeps_its_primary_while_sibling_books(self):
+        g2_attempts = self._disappearing_slot_returns(hold=True)
+        self.assertGreaterEqual(len(g2_attempts), 2)
+        self.assertEqual(set(g2_attempts), {PHONES[0]})
+
+    def _disappearing_slot_returns(self, hold):
         g2 = self.key("G2")
         self.site.seats[g2] = 0
         self.site.shown_seats[g2] = 4
@@ -1285,14 +1395,14 @@ class EndToEnd(unittest.TestCase):
 
         try:
             with mock.patch.object(mock_site.Handler, "submit", submit_then_hide):
-                instance = self.run_with(PHONES, ["G2 Basic", "G3 Basic"])
+                instance = self.run_with(PHONES, ["G2 Basic", "G3 Basic"], bot={"holdForm": hold})
         finally:
             if timer:
                 timer.cancel()
         self.assertEqual({x["target"]: x["phone"] for x in instance.bookings},
                          {"G2 Basic": PHONES[0], "G3 Basic": PHONES[1]})
-        self.assertEqual(g2_attempts, [PHONES[0], PHONES[0]])
         self.assertEqual(sibling_finished_before_return, [True])
+        return g2_attempts
         self.assertNotIn(PHONES[2], self.site.used)
 
     def test_seat_race_at_submit_keeps_retrying_same_number(self):
@@ -1345,7 +1455,8 @@ class EndToEnd(unittest.TestCase):
                 self.assertTrue(instance.finished())
                 self.assertEqual(self.site.applications[0]["mobile"], PHONES[0])
                 submit = next(item for item in self.site.request_log if item["submit"])
-                if name == "dob-format":
+                # holdForm sends a form that shows 0 seats anyway and lets the site decide
+                if name in ("dob-format", "seats"):
                     self.assertEqual(submit["sid"], changed_sid[0])
                 else:
                     self.assertNotEqual(submit["sid"], changed_sid[0])
@@ -2398,7 +2509,9 @@ class EndToEnd(unittest.TestCase):
                 self.site.sessions.clear()
                 self.site.viewstates.clear()
                 applicant = {"dateOfBirth": "15/05/2010"} if case == "minor-guardian" else {}
-                cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"], applicant=applicant)
+                # with holdForm a 0-seat form is ready to hold (test_dry_run_with_no_seats_...); without it, not
+                hold_off = {"bot": {"holdForm": False}} if case == "seats" else {}
+                cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"], applicant=applicant, **hold_off)
                 if case == "minor-guardian":
                     cfg["documents"]["parentSignature"] = "sign.jpg"
                 out = self.tmp / f"dry-unready-{case}"

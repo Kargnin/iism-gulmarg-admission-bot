@@ -84,6 +84,11 @@ BOT_DEFAULTS = {
     # same session, keeping the steps already done, for up to this long before starting over.
     "stepRetrySec": 120,
     "stepRetryDelaySec": 1.0,    # pause between those same-step retries
+    # When the chosen dates show 0 seats, fill in the rest of the form anyway and keep sending it:
+    # the site checks seats when the final form arrives, so one request is enough once seats open.
+    "holdForm": True,
+    "holdResendSec": 1.0,        # pause between sends from 1 minute before opening to 30 minutes after
+    "holdIdleResendSec": 20,     # pause between sends at other times (also keeps the session alive)
     "maxRejections": 3,          # site rejected the form this often for a choice -> move on
     "rejectedRetrySec": 5,       # pause after the site rejected the form
     # The form's own check asks for a parent/guardian signature even from adults. If the site
@@ -92,7 +97,7 @@ BOT_DEFAULTS = {
     "statusEverySec": 30,
 }
 
-BOT_BOOLEAN_OPTIONS = {"parallel", "notify", "preventSleep", "parentSignatureFallback"}
+BOT_BOOLEAN_OPTIONS = {"parallel", "notify", "preventSleep", "parentSignatureFallback", "holdForm"}
 BOT_INTEGER_MINIMUMS = {"maxRejections": 1}
 BOT_NUMBER_MINIMUMS = {
     "startEarlySec": (0, True),
@@ -103,6 +108,8 @@ BOT_NUMBER_MINIMUMS = {
     "maxRetryDelaySec": (0, False),
     "stepRetrySec": (0, True),
     "stepRetryDelaySec": (0, False),
+    "holdResendSec": (0, False),
+    "holdIdleResendSec": (0, False),
     "rejectedRetrySec": (0, True),
     "statusEverySec": (0, False),
 }
@@ -295,6 +302,9 @@ VIEWSTATE_ERRORS = [
 # A busy server or gateway: the request was turned away before the site's own code ran.
 SERVER_BUSY_STATUSES = (429, 502, 503, 504)
 STEP_APP_ERROR_TRIES = 3  # a step that hits the site's own error page this often starts the visit over
+HOLD_RUSH_BEFORE_SEC = 60        # a held form is sent every holdResendSec from this long before opening ...
+HOLD_RUSH_AFTER_SEC = 30 * 60    # ... until this long after it
+HOLD_REFRESH_SEC = 15 * 60       # after that window, fill a held form in afresh this often
 STEP_NAMES = {
     "ddlCourse": "choosing the course (loads the course levels)",
     "ddlCourseLevel": "choosing the course level (loads the course dates)",
@@ -353,6 +363,11 @@ class RateLimited(Transient):
 
 class NotSent(Transient):
     """The final request failed before any of it reached the site: safe to send again."""
+
+
+class UploadInterrupted(Transient):
+    """The connection broke while the request was still being written out (before any redirect),
+    so the site never received all of it and cannot have processed it."""
 
 
 class Cancelled(Exception):
@@ -1892,9 +1907,10 @@ class RedirectResponse:
 
 
 class TransportStartMixin:
-    def __init__(self, *args, on_write, deadline, **kwargs):
+    def __init__(self, *args, on_write, deadline, on_write_failed=None, **kwargs):
         self._on_write = on_write
         self._deadline = deadline
+        self._on_write_failed = on_write_failed
         self._write_started = False
         self._in_tunnel = False
         super().__init__(*args, **kwargs)
@@ -1912,7 +1928,13 @@ class TransportStartMixin:
         if not self._in_tunnel and not self._write_started:
             self._on_write()
             self._write_started = True
-        return super().send(data)
+        try:
+            return super().send(data)
+        except BaseException:
+            # the request never finished going out, so the site cannot have processed it
+            if self._write_started and self._on_write_failed is not None:
+                self._on_write_failed()
+            raise
 
     def getresponse(self):
         remaining = self._deadline - time.monotonic()
@@ -1954,26 +1976,30 @@ class TrackedHTTPSConnection(TransportStartMixin, http.client.HTTPSConnection):
 
 
 class TrackedHTTPHandler(urllib.request.HTTPHandler):
-    def __init__(self, on_write, deadline):
+    def __init__(self, on_write, deadline, on_write_failed=None):
         super().__init__()
         self.on_write = on_write
         self.deadline = deadline
+        self.on_write_failed = on_write_failed
 
     def http_open(self, request):
         def factory(host, **kwargs):
-            return TrackedHTTPConnection(host, on_write=self.on_write, deadline=self.deadline(), **kwargs)
+            return TrackedHTTPConnection(host, on_write=self.on_write, deadline=self.deadline(),
+                                         on_write_failed=self.on_write_failed, **kwargs)
         return self.do_open(factory, request)
 
 
 class TrackedHTTPSHandler(urllib.request.HTTPSHandler):
-    def __init__(self, on_write, deadline, context):
+    def __init__(self, on_write, deadline, context, on_write_failed=None):
         super().__init__(context=context)
         self.on_write = on_write
         self.deadline = deadline
+        self.on_write_failed = on_write_failed
 
     def https_open(self, request):
         def factory(host, **kwargs):
-            return TrackedHTTPSConnection(host, on_write=self.on_write, deadline=self.deadline(), **kwargs)
+            return TrackedHTTPSConnection(host, on_write=self.on_write, deadline=self.deadline(),
+                                          on_write_failed=self.on_write_failed, **kwargs)
         return self.do_open(factory, request, context=self._context)
 
 
@@ -2092,6 +2118,7 @@ class Http:
         self.jar = http.cookiejar.CookieJar()
         self._on_write = None
         self._deadline = None
+        self._upload_broken = False
         self._build(verify)
 
     def _build(self, verify):
@@ -2101,14 +2128,18 @@ class Http:
             ctx.verify_mode = ssl.CERT_NONE
         self.verified = verify
         self.redirect_handler = OriginRedirectHandler(self.origin, self.stop, self._drain_redirect)
-        self.opener = urllib.request.build_opener(TrackedHTTPHandler(self._before_write, self._request_deadline),
-                                                  TrackedHTTPSHandler(self._before_write, self._request_deadline, ctx),
-                                                  urllib.request.HTTPCookieProcessor(self.jar),
-                                                  self.redirect_handler)
+        self.opener = urllib.request.build_opener(
+            TrackedHTTPHandler(self._before_write, self._request_deadline, self._write_failed),
+            TrackedHTTPSHandler(self._before_write, self._request_deadline, ctx, self._write_failed),
+            urllib.request.HTTPCookieProcessor(self.jar),
+            self.redirect_handler)
 
     def _before_write(self):
         if self._on_write is not None:
             self._on_write()
+
+    def _write_failed(self):
+        self._upload_broken = True
 
     def _request_deadline(self):
         if self._deadline is None:
@@ -2167,14 +2198,18 @@ class Http:
             chunks.append(chunk)
 
     def _network_error(self, message, retry_after=None):
-        kind = RedirectFailure if self.redirect_handler.history else Transient
-        return kind(message, retry_after)
+        if self.redirect_handler.history:
+            return RedirectFailure(message, retry_after)
+        if self._upload_broken:
+            return UploadInterrupted(f"{message} (before the request was fully sent)", retry_after)
+        return Transient(message, retry_after)
 
     def send(self, method, url, data=None, content_type=None, referer=None, timeout=None, on_start=None):
         self.check_destination(url)
         timeout = timeout or self.timeout
         deadline = time.monotonic() + timeout
         self.redirect_handler.history = []
+        self._upload_broken = False
         headers = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
                    "Accept-Language": "en-IN,en;q=0.9", "Cache-Control": "no-cache"}
         if content_type:
@@ -2429,6 +2464,9 @@ class Session:
         excluded_batches = set()
         no_seats = []  # what was listed but full, for the message
         found = None
+        hold = bot.opt["holdForm"]
+        zero_seat = set()    # schedules passed over because they showed 0 seats
+        accept_zero = False  # holdForm second pass: no compatible option had seats, so hold one that showed 0
 
         def seat_count_ok(candidate):
             if parse_server_number(candidate.value("txtAvailableSeat")) is None:
@@ -2439,7 +2477,8 @@ class Session:
             page = self.open_form()
             course_options = page.options("ddlCourse")
             restart = False
-            for value, text in course_candidates(course_options, target, bot.course_hint.get(target.index)):
+            courses_here = course_candidates(course_options, target, bot.course_hint.get(target.index))
+            for course_index, (value, text) in enumerate(courses_here):
                 if value in excluded_courses:
                     continue
                 page, full = self.select(
@@ -2455,7 +2494,8 @@ class Session:
                 levels = level_candidates(level_options, target, loose=kind_score(text, target.kind) > 0)
                 if real_options(level_options) and not levels:
                     continue
-                for level in levels or [None]:
+                level_list = levels or [None]
+                for level_index, level in enumerate(level_list):
                     level_key = (value, level[0] if level else "")
                     if level_key in excluded_levels:
                         continue
@@ -2473,11 +2513,11 @@ class Session:
                     if any(is_season_batch(t, bot.s.batches) for _, t in real_options(batches)):
                         bot.saw_season()
                     season_list = clearly_this_season(batches, bot.s.batches)
-                    for batch in batch_candidates(batches, target, season_list):
+                    batch_list = [option for option in batch_candidates(batches, target, season_list)
+                                  if level_key + (option[0],) not in excluded_batches
+                                  and not selection_conflicts((value, text), level, option, target)]
+                    for batch_index, batch in enumerate(batch_list):
                         batch_key = level_key + (batch[0],)
-                        if batch_key in excluded_batches or selection_conflicts(
-                                (value, text), level, batch, target):
-                            continue
                         values = {"ddlScheduleCourse": batch[0]}
                         if level:
                             values["ddlCourseLevel"] = level[0]
@@ -2490,10 +2530,19 @@ class Session:
                             break
                         seats = parse_server_number(candidate_page.value("txtAvailableSeat"))
                         if seats == 0:
-                            excluded_batches.add(batch_key)
-                            no_seats.append(f"{batch[1]}: 0 seats left")
-                            restart = True
-                            break
+                            # holdForm fills a 0-seat choice in anyway, but only once no other compatible
+                            # option is left to try, so an option that has seats always wins
+                            others_left = (
+                                batch_index + 1 < len(batch_list)
+                                or any((value, other[0] if other else "") not in excluded_levels
+                                       for other in level_list[level_index + 1:])
+                                or any(other[0] not in excluded_courses for other in courses_here[course_index + 1:]))
+                            if not (hold and (accept_zero or not others_left)):
+                                excluded_batches.add(batch_key)
+                                zero_seat.add(batch_key)
+                                no_seats.append(f"{batch[1]}: 0 seats left")
+                                restart = True
+                                break
                         found = ((value, text), level, batch, candidate_page, seats)
                         break
                     if found or restart:
@@ -2501,6 +2550,10 @@ class Session:
                 if found or restart:
                     break
             if restart:
+                continue
+            if found is None and hold and zero_seat and not accept_zero:
+                accept_zero = True  # nothing compatible had seats: hold the first one that showed 0
+                excluded_batches -= zero_seat
                 continue
             break
         if not found:
@@ -2590,7 +2643,11 @@ class Session:
         required_tokens = ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION",
                            "hdfTypeOfCapacitySheet", "hdfCapacitySheetAllocationId")
         empty_tokens = [name for name in required_tokens if not str(page.value(name) or "").strip()]
-        if str(page.value("hdfCapacitySheetAllocationId") or "").strip() == "0":
+        allocation = str(page.value("hdfCapacitySheetAllocationId") or "").strip()
+        sheet_type = norm(page.value("hdfTypeOfCapacitySheet") or "").replace(" ", "")
+        # "0" is a reset placeholder, except that the live G1 schedule genuinely carries allocation 0
+        # with capacity type ScheduleCourseWise (captured from the live form, 12 Nov 2026)
+        if allocation == "0" and sheet_type != "schedulecoursewise":
             empty_tokens.append("hdfCapacitySheetAllocationId")
         if empty_tokens:
             raise Transient("required final form values are empty or reset: " + ", ".join(sorted(set(empty_tokens))))
@@ -2617,7 +2674,7 @@ class Session:
         seats = parse_server_number(page.value("txtAvailableSeat"))
         if seats is None:
             raise Transient("the latest form does not report a valid seat count")
-        if seats <= 0:
+        if seats <= 0 and not bot.opt["holdForm"]:
             raise TargetFull("0 seats left on the latest form")
         current_fee = parse_server_number(page.value("txtCourseFee"), allow_decimal=True)
         if current_fee is None or current_fee <= 0:
@@ -2671,7 +2728,8 @@ class Session:
             resp = self.postback(page, "", values, files=files, timeout=bot.opt["submitTimeoutSec"],
                                  on_start=note_request_started)
             resp = self.reload_receipt(resp)
-            saved = bot.save_page(self.who, f"submit-{target.label}", resp)
+            saved = bot.save_page(self.who, f"submit-{target.label}", resp,
+                                  keep=20 if bot.opt["holdForm"] else None)
             result = self.judge_submit(resp, target, sel, saved, set(files))
         except (RateLimited, Resend, Rejected, TargetFull, NotOpen, PhoneUsed):
             bot.clear_submitting(self.phone)
@@ -2690,6 +2748,9 @@ class Session:
             if not request_started:
                 bot.clear_submitting(self.phone)
             raise
+        except UploadInterrupted as exc:
+            bot.clear_submitting(self.phone)
+            raise NotSent(f"the final form did not finish uploading: {exc}") from exc
         except Exception as exc:
             if not request_started:
                 bot.clear_submitting(self.phone)
@@ -2818,29 +2879,60 @@ class Session:
         raise Transient(f"unexpected page '{resp.name}' after submitting (saved: {saved})")
 
     def book(self, target):
+        bot = self.bot
         sel = self.cascade(target)
-        if self.bot.stop.is_set():
+        if bot.stop.is_set():
             raise Cancelled()
         values, files = self.prepare_submit(target, sel)
-        if self.bot.stop.is_set():
+        if bot.stop.is_set():
             raise Cancelled()
-        if self.bot.dry_run:
-            self.bot.log.info(f"{self.who}DRY RUN - would submit {target.label} now: {sel}")
+        hold = bot.opt["holdForm"]
+        if bot.dry_run:
+            held = (" - it shows 0 seats now, so the filled form would be held and sent again until the site "
+                    "takes it" if hold and not sel.seats else "")
+            bot.log.info(f"{self.who}DRY RUN - would submit {target.label} now: {sel}{held}")
             return {"message": f"dry run: {sel}", "applicationId": "", "dryRun": True}
         # The site turning the final form away unprocessed (IIS 503.2 "too busy", 429) or a failure
         # before any of it was sent: send the same filled form again rather than redoing every step.
-        started = time.monotonic()
+        # holdForm: a "no seats" answer to the final form also keeps the filled form and sends it again
+        # (the site checks seats when the form arrives), at bot.hold_interval() - fast around opening.
+        prepared = time.monotonic()
+        busy_since = last_sent = retry_at = None
+        jitter = 1.0
         while True:
+            while not bot.stop.is_set():  # re-evaluated every second, so the fast phase starts on time
+                if retry_at is not None:
+                    left = retry_at - time.monotonic()
+                elif last_sent is None:
+                    left = 0
+                else:
+                    left = last_sent + bot.hold_interval() * jitter - time.monotonic()
+                if left <= 0:
+                    break
+                bot.sleep(min(left, 1.0))
+            if bot.stop.is_set():
+                raise Cancelled()
+            last_sent, retry_at = time.monotonic(), None
             try:
                 return self.submit(target, sel, values, files)
             except (RateLimited, NotSent) as exc:
-                budget = self.bot.opt["stepRetrySec"]
-                if budget <= 0 or time.monotonic() - started >= budget:
+                busy_since = busy_since if busy_since is not None else last_sent
+                budget = bot.opt["stepRetrySec"]
+                if not hold and (budget <= 0 or time.monotonic() - busy_since >= budget):
                     raise
-                self.bot.note(self.who, f"{target.label}: {exc}; sending the same final form again")
-                self.bot.sleep(self.bot.step_delay(exc))
-                if self.bot.stop.is_set():
-                    raise Cancelled()
+                bot.note(self.who, f"{target.label}: {exc}; sending the same final form again")
+                retry_at = time.monotonic() + bot.step_delay(exc)
+            except (TargetFull, NotOpen) as exc:
+                if not hold:
+                    raise
+                busy_since = None
+                why = f"{target.when()} has no seats right now ({exc}); the filled form is kept and sent again"
+                with bot.lock:
+                    bot.blocked[target.index] = {"why": why, "kind": "pending"}
+                bot.note(self.who, f"{target.label}: {why}")
+                if bot.hold_refresh_allowed() and time.monotonic() - prepared >= HOLD_REFRESH_SEC:
+                    raise TargetFull(f"{target.when()}: filling the held form in afresh")
+                jitter = random.uniform(0.85, 1.15)
 
 
 # ---------------------------------------------------------------------------
@@ -3118,6 +3210,7 @@ class Bot:
         self.status = {}
         self.notes = {}
         self.saved_pages = 0
+        self.kept_pages = {}  # (who, tag) -> newest rotating pages still on disk
         self.blocked = {}
         self._restore()
 
@@ -3191,6 +3284,25 @@ class Bot:
             delay = max(delay, min(10.0, error.retry_after))
         return min(10.0, delay)
 
+    def hold_interval(self):
+        """Pause between sends of a held form: holdResendSec from HOLD_RUSH_BEFORE_SEC before the
+        announced opening until HOLD_RUSH_AFTER_SEC after it (or always, with no opening time),
+        holdIdleResendSec otherwise."""
+        opens = self.s.opens_at
+        if opens is not None:
+            now = now_ist()
+            if not (opens - timedelta(seconds=HOLD_RUSH_BEFORE_SEC) <= now
+                    <= opens + timedelta(seconds=HOLD_RUSH_AFTER_SEC)):
+                return self.opt["holdIdleResendSec"]
+        return self.opt["holdResendSec"]
+
+    def hold_refresh_allowed(self):
+        """A held form is filled in afresh only after the fast window around opening has passed, so a
+        form filled in before opening is never dropped (the site emptied its course list before the
+        12 Nov opening, and a fresh fill-in might then find nothing)."""
+        opens = self.s.opens_at
+        return opens is None or now_ist() > opens + timedelta(seconds=HOLD_RUSH_AFTER_SEC)
+
     def step_delay(self, error=None):
         """Pause before resending one failed step: short and steady, or the server's Retry-After (capped)."""
         delay = self.opt["stepRetryDelaySec"] * random.uniform(0.7, 1.3)
@@ -3209,11 +3321,28 @@ class Bot:
             self.notes[key] = now
         (self.log.warn if warning else self.log.info)(f"{who}{message}")
 
-    def save_page(self, who, tag, page):
+    def save_page(self, who, tag, page, keep=None):
+        """Save a response page. With keep, only the newest `keep` pages of this tag stay on disk and
+        they do not count toward the 500-page cap (a held form's 'no seats' replies come every second)."""
         with self.lock:
-            if self.saved_pages >= 500:
-                return None
-            self.saved_pages += 1
+            if keep is None:
+                if self.saved_pages >= 500:
+                    return None
+                self.saved_pages += 1
+        path = self._write_page(who, tag, page)
+        if keep and path is not None:
+            with self.lock:
+                kept = self.kept_pages.setdefault((who, tag), [])
+                kept.append(path)
+                stale, kept[:] = kept[:-keep], kept[-keep:]
+            for old in stale:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        return path
+
+    def _write_page(self, who, tag, page):
         folder = self.out_dir / "responses"
         name = re.sub(r"[^A-Za-z0-9.-]+", "_", f"{datetime.now():%Y%m%d-%H%M%S}-{who}-{tag}")
         path = folder / f"{name}-{uuid.uuid4().hex}.html"
