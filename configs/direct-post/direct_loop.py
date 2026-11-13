@@ -13,7 +13,6 @@ import threading
 import time
 import tempfile
 import urllib.parse
-from contextlib import contextmanager
 
 ROOT=Path(__file__).resolve().parents[2]
 HERE=Path(__file__).resolve().parent
@@ -58,6 +57,7 @@ def save_result(target,attempt,manual,response=None,error=None,request_started=F
         for old in records[:-5]:
             (folder/(old+'.html')).unlink(missing_ok=True);(folder/(old+'.json')).unlink(missing_ok=True)
     emit(responseFile=str(body_path) if body_path else None,responseMetadata=str(meta_path))
+    return meta_path
 
 class ConfigPaused(b.ConfigError):
     """A local edit is not safe to apply yet; send nothing until corrected."""
@@ -163,67 +163,35 @@ def desired_selection(page,settings,target):
     return course,level,batch,state
 
 class Progress:
-    """Short transactions permit G1 and G4 requests in parallel, preserving native progress."""
+    """Diagnostics only: direct retries never gate on native booking/pending history."""
     @staticmethod
     def output_dir(settings,base_url):
         config=settings.config_path
         identity=json.dumps([str(config.resolve()),b.origin(base_url),settings.season])
         return ROOT/'runs'/(config.stem+'-'+hashlib.sha256(identity.encode()).hexdigest()[:16])
-    def __init__(self,settings,base_url,readonly=False):
+    def __init__(self,settings,base_url):
         self.out=self.output_dir(settings,base_url)
-        state=b.State(self.out/'state.json',True)
-        wanted=b.expected_state_identity(settings,base_url)
-        if state.data['identity'] not in (None,wanted):
-            if readonly:
-                if state.data['bookings'] or state.data['phones']:
-                    raise ConfigPaused('Applicant identity changed while saved submission/phone history exists. Restore it or use a separate applicant config.')
-                self.bot=b.Bot(settings,self.out,base_url=base_url,dry_run=True,log=b.Log(echo=False))
-                return
-            try:state.acquire()
-            except b.ConfigError as exc:raise ConfigPaused(str(exc)) from exc
-            try:
-                if state.data['identity'] not in (None,wanted):
-                    if state.data['bookings'] or state.data['phones']:
-                        raise ConfigPaused('Applicant identity changed while saved submission/phone history exists. Restore it or use a separate applicant config.')
-                    state.identity=wanted;state.data['identity']=wanted;state.save()
-            finally:state.release()
-        try:self.bot=b.Bot(settings,self.out,base_url=base_url,log=b.Log(echo=False))
-        except b.ConfigError as exc:raise ConfigPaused(str(exc)) from exc
-    @contextmanager
-    def transaction(self,startup=False):
-        state=self.bot.state
-        b.private_dir(state.path.parent)
-        fd=b.private_descriptor(state.path.with_suffix('.lock'),os.O_RDWR|os.O_CREAT|os.O_APPEND)
-        handle=os.fdopen(fd,'a+b')
-        try:
-            if startup:
-                end=time.monotonic()+1
-                while True:
-                    try:fcntl.flock(handle.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB);break
-                    except BlockingIOError:
-                        if time.monotonic()>=end:
-                            raise b.ConfigError('The original bot still holds the progress lock. Stop it with Ctrl+C before starting the direct workers; no request was sent.')
-            else:fcntl.flock(handle.fileno(),fcntl.LOCK_EX)
-            state.lease=handle
-            state.reload();state.bind(b.expected_state_identity(self.bot.s,self.bot.base_url));self.bot._restore()
-            yield self.bot
-        finally:
-            state.lease=None;handle.close()
-    def check(self,target,phone,startup=False):
-        with self.transaction(startup) as bot:
-            if target.index in bot.booked:return 'booked'
-            if phone in bot.pending:raise b.ConfigError('This preference has an uncertain saved submission. Verify booked/not booked before retrying.')
-            if bot.assignments.get(b.target_key(target))!=phone:raise b.ConfigError('This primary no longer owns the preference; inspect saved progress.')
-        return 'ready'
+        # Disabled native state is used only as the response-parser context. It never
+        # reads, clears or rewrites the original bot's saved submission history.
+        self.bot=b.Bot(settings,self.out,base_url=base_url,dry_run=True,log=b.Log(echo=False))
+        self.current=None
     def start(self,target,phone):
-        with self.transaction() as bot:
-            if target.index in bot.booked:raise b.ConfigError('This preference is already booked; no duplicate was sent.')
-            if phone in bot.pending:raise b.ConfigError('An unresolved final request already exists for this number.')
-            bot.mark_submitting(phone,target)
+        self.current={'target':target.label,'batch':target.batch_id,'targetKey':b.target_key(target),'phone':phone,
+                      'status':'submitting','at':b.now_ist().isoformat(),
+                      'applicantIdentity':b.expected_state_identity(self.bot.s,self.bot.base_url)}
+        write_private(HERE/(target.batch_id+'-attempt-state.json'),json.dumps(self.current,indent=2))
+    def finish(self,target,phone,status,info=None):
+        record=dict(self.current or {},target=target.label,targetKey=b.target_key(target),phone=phone,
+                    status=status,at=b.now_ist().isoformat())
+        if info is not None:record['result']=info
+        write_private(HERE/(target.batch_id+'-attempt-state.json'),json.dumps(record,indent=2))
+        if status=='confirmed':
+            write_private(HERE/(target.batch_id+'-last-success.json'),json.dumps(record,indent=2))
     def clear(self,phone):
-        with self.transaction() as bot:bot.clear_submitting(phone)
-    def confirm(self,target,phone,info):
-        with self.transaction() as bot:bot.record_booking(phone,target,info)
+        if self.current is not None:
+            record=dict(self.current,status='not_confirmed',at=b.now_ist().isoformat())
+            write_private(HERE/(record['batch']+'-attempt-state.json'),json.dumps(record,indent=2))
+    def confirm(self,target,phone,info):self.finish(target,phone,'confirmed',info)
 
 def build_packet(settings,target,page):
     phone=settings.phones[target.index]
@@ -344,7 +312,7 @@ def prepare_form(settings,target,http,deadline,check_config=None):
             emit(status='preparing_retry',target=target.batch_id,reason=str(exc))
 
 
-def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_only=False,prepare_seconds=None,confirm_not_booked=False):
+def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_only=False,prepare_seconds=None):
     reader=ConfigReader(config)
     first=reader.read() if plan else reader.wait(target_code)
     first.target(target_code)
@@ -356,7 +324,7 @@ def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_
         except BlockingIOError:raise b.ConfigError('This direct worker is already running.')
     active=None;settings=None;target=None;phone=None;progress=None
     http=None;page=None;binding=None;prepared_binding=None;packet=None;attempts=0
-    first_check=True;last_pause=None
+    last_pause=None
     try:
         while True:
             candidate=reader.read() if plan else reader.wait(target_code)
@@ -366,22 +334,7 @@ def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_
             next_binding=server_key(next_settings,next_target,base_url)
             try:
                 if active is None or candidate.digest!=active.digest:
-                    if progress is not None and Progress.output_dir(next_settings,base_url)!=progress.out:
-                        raise ConfigPaused('The season/run changed while this worker is active. Restart it using the intended config; saved history is preserved.')
-                    candidate_progress=Progress(next_settings,base_url,readonly=plan or prepare_only)
-                    if not plan and not prepare_only:
-                        if first_check and confirm_not_booked:
-                            with candidate_progress.transaction(startup=True) as bot:
-                                if next_target.index in bot.booked:
-                                    emit(status='already_booked',target=target_code);return 0
-                                previous=bot.state.data['phones'].get(next_phone)
-                                if next_phone in bot.pending:bot.clear_submitting(next_phone)
-                            write_private(HERE/(target_code+'-manual-confirmation.json'),json.dumps({'target':target_code,'at':b.now_ist().isoformat(),'operatorConfirmation':'previous attempt not booked','previousRecord':previous},indent=2))
-                        try:state=candidate_progress.check(next_target,next_phone,startup=True)
-                        except b.ConfigError as exc:
-                            if first_check:raise
-                            raise ConfigPaused(str(exc)) from exc
-                        if state=='booked':emit(status='already_booked',target=target_code);return 0
+                    candidate_progress=Progress(next_settings,base_url)
                     server_changed=binding!=next_binding
                     settings,target,phone,progress=next_settings,next_target,next_phone,candidate_progress
                     if server_changed:
@@ -389,7 +342,7 @@ def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_
                     http.timeout=next_settings.direct_request_timeout
                     packet=None
                     if active is not None:emit(status='config_reloaded',target=target_code,serverRefresh=server_changed)
-                    active=candidate;binding=next_binding;first_check=False
+                    active=candidate;binding=next_binding
                 if page is None:
                     if plan:
                         if snapshot:
@@ -448,7 +401,10 @@ def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_
             except Exception as exc:
                 save_result(target_code,attempts,limit==1,error=exc,request_started=started)
                 if started:
-                    emit(status='uncertain',target=target_code,reason=str(exc),savedProgress=str(request_progress.bot.state.path));return 1
+                    request_progress.finish(request_target,request_phone,'uncertain',{'error':str(exc)})
+                    emit(status='once_uncertain' if limit==1 else 'retrying_uncertain',target=target_code,reason=str(exc))
+                    if limit and attempts>=limit:return 1
+                    continue
                 if isinstance(exc,b.ConfigError):
                     try:latest=reader.read()
                     except ConfigPaused:continue
@@ -458,7 +414,7 @@ def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_
                 emit(status='once_not_sent' if limit==1 else 'retrying',target=target_code,reason=str(exc))
                 if limit and attempts>=limit:return 1
                 continue
-            save_result(target_code,attempts,limit==1,response=response,request_started=started)
+            result_metadata=save_result(target_code,attempts,limit==1,response=response,request_started=started)
             if definite_iis_busy(response):
                 request_progress.clear(request_phone)
                 emit(status='once_rejected_503' if limit==1 else 'retrying',target=target_code,httpStatus=503,reason='IIS 503.2 rejected before application handler')
@@ -473,7 +429,7 @@ def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_
             course,level,batch,state=desired_selection(request_page,request_settings,request_target)
             selection=b.Selection(course,level,batch,state,b.parse_server_number(request_page.value('txtAvailableSeat')),
                                   request_page.value('txtCourseFee'),request_page,b.observed_server_age(request_page))
-            try:info=session.judge_submit(response,request_target,selection,HERE/'responses'/('latest-'+target_code+'.json'),set(files))
+            try:info=session.judge_submit(response,request_target,selection,result_metadata,set(files))
             except (b.TargetFull,b.NotOpen,b.RateLimited) as exc:
                 request_progress.clear(request_phone)
                 emit(status='once_rejected' if limit==1 else 'retrying_rejection',target=target_code,reason=str(exc))
@@ -484,26 +440,33 @@ def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_
                 if limit and attempts>=limit:return 1
                 continue
             except (b.Rejected,b.PhoneUsed) as exc:
-                request_progress.clear(request_phone);emit(status='rejected',target=target_code,reason=str(exc));return 1
+                request_progress.finish(request_target,request_phone,'rejected',{'reason':str(exc)})
+                emit(status='once_rejected' if limit==1 else 'retrying_rejection',target=target_code,reason=str(exc))
+                if limit and attempts>=limit:return 1
+                continue
             except Exception as exc:
-                emit(status='uncertain',target=target_code,httpStatus=response.status,reason=str(exc),savedProgress=str(request_progress.bot.state.path));return 1
+                request_progress.finish(request_target,request_phone,'uncertain',{'error':str(exc)})
+                emit(status='once_uncertain' if limit==1 else 'retrying_uncertain',target=target_code,httpStatus=response.status,reason=str(exc))
+                if limit and attempts>=limit:return 1
+                continue
             request_progress.confirm(request_target,request_phone,info)
-            emit(status='confirmed',target=target_code,applicationId=info.get('applicationId'),receipt=info.get('url'));return 0
+            emit(status='confirmed',target=target_code,applicationId=info.get('applicationId'),receipt=info.get('url'))
+            if limit and attempts>=limit:return 0
+            # User-requested always-run mode continues even after confirmed acceptance.
+            continue
     finally:
         if lockfile is not None:lockfile.close()
 
 
 def entry(target):
-    parser=argparse.ArgumentParser(description=f'Direct final multipart POST for {target}; serial immediate retry after definite IIS 503.2.')
-    parser.add_argument('--confirm-not-booked',action='store_true',help='record your confirmation that the previous pending attempt was not accepted; clears only this batch')
+    parser=argparse.ArgumentParser(description=f'Always-retrying direct final POST for {target}; --once makes a single attempt.')
     parser.add_argument('--once',action='store_true',help='make one final-request attempt for manual inspection')
     parser.add_argument('--plan',action='store_true',help='inspect the prepared packet without submitting')
     parser.add_argument('--prepare-only',action='store_true',help='capture server fee, seats, allocation ID and signed form state; never submit')
     parser.add_argument('--prepare-seconds',type=float,default=None,help='optional preparation deadline; default is continuous retry')
     parser.add_argument('--snapshot',type=Path,help='private HTML snapshot with matching .json metadata, for offline packet inspection')
     args=parser.parse_args()
-    if args.confirm_not_booked and (args.plan or args.prepare_only):parser.error('--confirm-not-booked is for a live run, not preparation/inspection')
     if args.snapshot and not args.plan:parser.error('--snapshot is only permitted with --plan')
-    try:return run(target,ROOT/'configs/me.jsonc',b.DEFAULT_BASE_URL,plan=args.plan,limit=1 if args.once else None,snapshot=args.snapshot,prepare_only=args.prepare_only,prepare_seconds=args.prepare_seconds,confirm_not_booked=args.confirm_not_booked)
-    except KeyboardInterrupt:emit(status='stopped',target=target,reason='Any possibly-sent request remains pending in saved progress.');return 130
+    try:return run(target,ROOT/'configs/me.jsonc',b.DEFAULT_BASE_URL,plan=args.plan,limit=1 if args.once else None,snapshot=args.snapshot,prepare_only=args.prepare_only,prepare_seconds=args.prepare_seconds)
+    except KeyboardInterrupt:emit(status='stopped',target=target,reason='Stopped by user; prior booking status does not block the next direct run.');return 130
     except Exception as exc:emit(error=str(exc),target=target);return 2

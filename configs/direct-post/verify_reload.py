@@ -42,8 +42,8 @@ class Handler(fixture.ReadyHandler):
             threading.Event().wait(self.site.final_delay)
             return self.send(503,fixture.BUSY)
         if number==0:
-            data=json.loads(next((self.site.root/'runs').glob('*/state.json')).read_text())
-            self.site.pending_was_durable=data['phones'][phone]['status']=='submitting'
+            data=json.loads((self.site.root/'capsules/G4-attempt-state.json').read_text())
+            self.site.attempt_was_logged=data['status']=='submitting' and data['phone']==phone
             self.site.change()
             return self.send(503,fixture.mock_site.IIS_503 if self.site.uncertain else fixture.BUSY)
         return super().post_form(sess,query,values,files)
@@ -60,7 +60,7 @@ class ReloadTests(unittest.TestCase):
         self.site.cold=False;self.site.full_once=False;self.site.fail_before_commit=False
         self.site.prep_busy=0;self.site.selector_busy=0;self.site.change=lambda:None
         self.site.prep_change=None;self.site.uncertain=False;self.site.requests_seen=[]
-        self.site.form_gets=0;self.site.prep_events=[];self.site.pending_was_durable=False;self.site.page_seats=None;self.site.final_delay=0
+        self.site.form_gets=0;self.site.prep_events=[];self.site.attempt_was_logged=False;self.site.page_seats=None;self.site.final_delay=0
         ski=self.site.courses['4'];ski['levels']=[('4','Basic SSC'),('5','Intermediate SSC'),('28','Snow Boarding')]
         ski['batches'].append(('82','Course from 17 Jan to 30 Jan 2027',fixture.mock_site.date(2027,1,17),'Gulmarg'))
         self.site.seats={(cv,lv,batch[0]):3 for cv,c in self.site.courses.items() for lv,_ in c['levels'] for batch in c['batches']}
@@ -76,6 +76,7 @@ class ReloadTests(unittest.TestCase):
     def edit(self,fn):
         cfg=json.loads(self.config.read_text());fn(cfg);self.write(cfg)
     def state(self):return json.loads(next((self.root/'runs').glob('*/state.json')).read_text())
+    def attempt(self):return json.loads((self.root/'capsules/G4-attempt-state.json').read_text())
     def seed_used(self,with_history=True):
         settings,errors,_=b.parse_settings(self.cfg,self.config);self.assertFalse(errors)
         identity=json.dumps([str(self.config.resolve()),b.origin(self.url),settings.season])
@@ -86,10 +87,9 @@ class ReloadTests(unittest.TestCase):
             if with_history:state.data['phones']['9000000013']={'status':'used','note':'known refused before this test'}
             state.save()
         finally:state.release()
-    def start(self,hook=None):
-        code="import importlib.util,sys;from pathlib import Path;s=importlib.util.spec_from_file_location('direct',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);m.ROOT=Path(sys.argv[2]);m.HERE=m.ROOT/'capsules';m.ALLOCATIONS={'G1':('synthetic-shared','synthetic-4-4-80'),'G4':('synthetic-shared','synthetic-4-4-83')};raise SystemExit(m.run('G4',m.ROOT/'configs/me.jsonc',sys.argv[3]))"
-        if hook is not None:code=code.replace("raise SystemExit(m.run","exec("+repr(hook)+");raise SystemExit(m.run")
-        proc=subprocess.Popen([sys.executable,'-u','-c',code,str(ENGINE),str(self.root),self.url],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+    def start(self,limit=2):
+        code="import importlib.util,sys;from pathlib import Path;s=importlib.util.spec_from_file_location('direct',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);m.ROOT=Path(sys.argv[2]);m.HERE=m.ROOT/'capsules';m.ALLOCATIONS={'G1':('synthetic-shared','synthetic-4-4-80'),'G4':('synthetic-shared','synthetic-4-4-83')};raise SystemExit(m.run('G4',m.ROOT/'configs/me.jsonc',sys.argv[3],limit=int(sys.argv[4])))"
+        proc=subprocess.Popen([sys.executable,'-u','-c',code,str(ENGINE),str(self.root),self.url,str(limit)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
         self.processes.append(proc)
         def read():
             for line in proc.stdout:
@@ -100,7 +100,7 @@ class ReloadTests(unittest.TestCase):
         try:proc.wait(timeout=10)
         except subprocess.TimeoutExpired:self.fail('Worker did not complete: '+''.join(self.lines[-25:]))
         thread.join(timeout=2)
-        self.assertEqual(proc.returncode,0,''.join(self.lines));self.assertTrue(self.site.pending_was_durable)
+        self.assertEqual(proc.returncode,0,''.join(self.lines));self.assertTrue(self.site.attempt_was_logged)
         self.assertEqual(len(self.site.applications),1)
     def stop_children(self):
         for proc in self.processes:
@@ -152,14 +152,14 @@ class ReloadTests(unittest.TestCase):
         proc,thread=self.start();self.finish(proc,thread)
         self.assertEqual(self.site.requests_seen[-1]['fields']['ddlState'],'29')
         self.assertEqual(self.site.form_gets,2);self.assertEqual(self.site.prep_events,['txtDateOfBirth'])
-    def test_dob_change_rebinds_only_empty_history_and_refreshes(self):
+    def test_dob_change_refreshes_and_logs_current_identity(self):
         self.site.change=lambda:self.edit(lambda cfg:cfg['applicant'].update(dateOfBirth='15/05/2005'))
         proc,thread=self.start();self.finish(proc,thread)
         self.assertEqual(self.site.requests_seen[-1]['fields']['txtDateOfBirth'],'15/05/2005')
         self.assertEqual(self.site.requests_seen[-1]['fields']['txtCourseFee'],'10000')
         self.assertEqual(self.site.form_gets,2)
         settings,errors,_=b.parse_settings(json.loads(self.config.read_text()),self.config);self.assertFalse(errors)
-        self.assertEqual(self.state()['identity'],b.expected_state_identity(settings,self.url))
+        self.assertEqual(self.attempt()['applicantIdentity'],b.expected_state_identity(settings,self.url))
     def test_phone_change_keeps_used_history_and_reprepares_mobile(self):
         self.seed_used()
         self.site.change=lambda:self.edit(lambda cfg:cfg['phoneNumbers'].__setitem__(0,'9000000099'))
@@ -167,23 +167,21 @@ class ReloadTests(unittest.TestCase):
         self.assertEqual(self.site.applications[0]['mobile'],'9000000099')
         self.assertEqual(self.state()['phones']['9000000013']['status'],'used')
         self.assertEqual(self.site.form_gets,2)
-    def test_identity_edit_with_used_history_pauses_without_erasing_it(self):
-        self.seed_used();self.site.change=lambda:self.edit(lambda cfg:cfg['applicant'].update(name='Another Person'))
-        proc,thread=self.start();self.assertTrue(self.paused.wait(3),''.join(self.lines))
-        self.assertEqual(len(self.site.requests_seen),1)
-        self.assertEqual(self.state()['phones']['9000000013']['status'],'used')
-        self.write(self.cfg);self.finish(proc,thread)
-        self.assertEqual(self.site.applications[0]['name'],'Test Person')
-    def test_uncertain_request_keeps_old_phone_binding_after_edit(self):
+    def test_identity_edit_ignores_old_used_history_without_erasing_it(self):
+        self.seed_used();state_path=next((self.root/'runs').glob('*/state.json'));before=state_path.read_bytes()
+        self.site.change=lambda:self.edit(lambda cfg:cfg['applicant'].update(name='Another Person'))
+        proc,thread=self.start();self.finish(proc,thread)
+        self.assertEqual(self.site.applications[0]['name'],'Another Person')
+        self.assertEqual(state_path.read_bytes(),before)
+    def test_uncertain_reply_retries_with_latest_phone_and_keeps_old_history(self):
+        self.seed_used();state_path=next((self.root/'runs').glob('*/state.json'));before=state_path.read_bytes()
         self.site.uncertain=True
         self.site.change=lambda:self.edit(lambda cfg:cfg['phoneNumbers'].__setitem__(0,'9000000099'))
-        proc,thread=self.start();proc.wait(timeout=5);thread.join(timeout=2)
-        self.assertEqual(proc.returncode,1)
-        self.assertEqual(self.state()['phones']['9000000011']['status'],'submitting')
-        self.assertFalse(self.site.applications)
-        state_path=next((self.root/'runs').glob('*/state.json'));before=state_path.read_bytes();count=self.site.requests
-        self.paused.clear();other,other_thread=self.start();self.assertTrue(self.paused.wait(3),''.join(self.lines))
-        threading.Event().wait(.2);self.assertEqual(self.site.requests,count);self.assertEqual(state_path.read_bytes(),before)
+        proc,thread=self.start();self.finish(proc,thread)
+        self.assertIn('retrying_uncertain',''.join(self.lines))
+        self.assertEqual(self.site.requests_seen[0]['phone'],'9000000011')
+        self.assertEqual(self.site.requests_seen[-1]['phone'],'9000000099')
+        self.assertEqual(state_path.read_bytes(),before)
     def test_level_change_refreshes_allocation_and_sends_new_level(self):
         self.site.change=lambda:self.edit(lambda cfg:cfg['coursePriorities'].__setitem__(0,'G4 Intermediate'))
         proc,thread=self.start();self.finish(proc,thread)
@@ -201,28 +199,6 @@ class ReloadTests(unittest.TestCase):
         self.assertEqual(self.site.requests_seen[-1]['fields']['ddlState'],'29')
         self.assertEqual(self.site.form_gets,2)
 
-    def test_config_identity_race_before_first_byte_reloads_without_old_post(self):
-        self.seed_used(with_history=False)
-        hook="""
-original_start=m.Progress.start
-changed=False
-def race_start(progress,target,phone):
-    global changed
-    if not changed:
-        changed=True
-        path=progress.bot.s.config_path
-        cfg=m.b.load_jsonc(path);cfg['applicant']['name']='Raced Person'
-        path.write_text(m.json.dumps(cfg))
-        settings=m.ConfigReader(path).read().settings
-        other=m.Progress(settings,progress.bot.base_url)
-        other.check(next(t for t in settings.targets if t.batch_id=='G4'),phone)
-    return original_start(progress,target,phone)
-m.Progress.start=race_start
-"""
-        proc,thread=self.start(hook);self.finish(proc,thread)
-        self.assertTrue(all(item['fields']['txtName']=='Raced Person' for item in self.site.requests_seen),str([item['fields']['txtName'] for item in self.site.requests_seen])+'\n'+''.join(self.lines))
-        self.assertIn('config_changed_before_send',''.join(self.lines))
-        self.assertEqual(self.site.form_gets,1)
     def test_optional_document_removal_clears_upload_and_flag(self):
         self.cfg['documents']['domicileProof']='dob.jpg';self.write(self.cfg)
         self.site.change=lambda:self.edit(lambda cfg:cfg['documents'].update(domicileProof=''))
@@ -244,7 +220,7 @@ m.Progress.start=race_start
         self.assertEqual(proc.returncode,1,''.join(self.lines))
         self.assertIn('uncertain',''.join(self.lines))
         self.assertIn('within 0.05s',''.join(self.lines))
-        self.assertEqual(self.state()['phones']['9000000011']['status'],'submitting')
+        self.assertEqual(self.attempt()['status'],'uncertain')
         self.assertEqual(self.site.form_gets,1)
     def test_course_kind_change_selects_its_own_live_level(self):
         self.site.change=lambda:self.edit(lambda cfg:cfg['coursePriorities'].__setitem__(0,'G4 Snowboarding'))

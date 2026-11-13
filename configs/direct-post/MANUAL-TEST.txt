@@ -1,34 +1,25 @@
-Direct POST workers: G1 and G4
+G1/G4 direct scripts: always-run retry mode
 
-Configuration is read at the start of every request iteration from:
-/Users/bhushanmalani/Code/iism/configs/me.jsonc
+Continuous mode no longer reads or blocks on the original bot's pending, used-phone or booked records. It keeps retrying after timeouts, ambiguous replies, site rejections, Seat Not Available, Phone Already Registered and confirmed acceptance. This can resubmit an already accepted application. Stop it yourself with Ctrl+C when you want it stopped.
 
-Edit the config while the updated worker runs. The next request uses a newly validated snapshot; an in-flight request keeps the old values until it settles. Invalid/partial JSON, invalid fields, or missing/invalid documents pause sending and automatically resume after correction. The worker never silently sends an old config while the current one is invalid.
-
-Address/contact fields, education, diet and document paths come from config. Changed document contents at the same path are detected too. Local-only edits rebuild the multipart body without additional site preparation. State, DOB, phone and semantic course/level/batch changes invalidate dependent server preparation once. No fixed24-hour validity timer is used. ViewState/EventValidation errors trigger fresh server preparation.
-
-Each live process prepares current server values once at startup, including availability. It then reuses matching state across final POST retries and adopts updated state from completed rejected forms. Fee and allocation are read from that prepared state, without a per-loop price/allocation query; for the existing profile these are10000, shared G1 allocation0 and G4 allocation7. Age is calculated only by the website. The existing confirmed G4 catalogue date typo is handled only for its original exact date range.
-
-Guardian upload is now explicit in documents.parentSignature. It is currently signature.jpg, preserving your requested upload. A different configured guardian path is honored; clearing that required path pauses instead of silently substituting the applicant signature. Optional configured documents are included when applicable; removing one clears its upload flag.
-
-Phone/target changes preserve used-number and booking history. An applicant name/father/DOB identity correction can rebind only an empty unsubmitted ledger. Existing submission/used-phone history blocks identity replacement. An unresolved final request retains its original phone/target and must be reconciled before a replacement can be sent. No progress reset or automatic history migration occurs. A season/run change requires a restart and does not touch the other run namespace.
-
-Explicit bot.requestTimeoutSec and bot.submitTimeoutSec edits apply to subsequent requests. If omitted, direct mode retains its previous15-second preparation timeout and30-second final timeout. Direct workers still have no artificial HTTP retry delay; normal-bot parallel/backoff settings do not control these independent scripts. The brief local polling wait is used only while configuration is paused, not between valid HTTP retries.
-
-Continuous use, in two Terminal tabs:
+G1:
 python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py
+
+G4, in another Terminal tab:
 python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g4.py
 
-The commands above already prepare fresh state at startup. No separate --prepare-only command is needed before a live run. Restart existing old-version processes once to load this code; subsequent config edits need no restart.
+No --confirm-not-booked flag is needed or supported. Existing history is preserved verbatim and is not used as a direct-request gate. The original bot's own behavior is unchanged. A second simultaneous copy of the same G1 or G4 worker is still blocked by the worker lock.
 
-Manual single-final-request tests, only after verifying an earlier pending attempt was not accepted:
-python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py --once --confirm-not-booked
-python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g4.py --once --confirm-not-booked
+For one manual final-request attempt:
+python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py --once
+python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g4.py --once
 
---confirm-not-booked records your explicit confirmation and clears only that batch's pending marker. It cannot clear a confirmed booking or used-phone history. --once performs one final POST attempt after preparation; a complete no-seats reply exits1, meaning no application was confirmed. A possibly sent request without a verified reply stays pending.
+--once deliberately exits after one attempt. Default mode continues indefinitely, with no added HTTP retry sleep or backoff. Per-request network timeouts bound an individual connection; they do not stop continuous mode.
 
-Optional preparation for offline packet inspection (never submits):
-python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py --prepare-only
-python3 /Users/bhushanmalani/Code/iism/configs/direct-post/post_g1.py --plan
+The terminal prints responseFile and responseMetadata. Manual results are stored separately in responses/once/G1 and responses/once/G4. Loop history retains the latest5 results per batch. A timeout has no new response body; its metadata explicitly records that. The latest attempt status is in G1-attempt-state.json or G4-attempt-state.json, and the latest confirmed success is retained in G1-last-success.json or G4-last-success.json. These are diagnostics, not stopping conditions.
 
-The terminal prints responseFile and responseMetadata. Manual responses are retained separately under responses/once/G1 and responses/once/G4. Continuous mode retains only the latest5 results per batch. HTML contains the response page; JSON includes status, headers, redirects and errors. A timeout has no new HTML body, so inspect responseReceived in the metadata. Seat Not Available is a retry condition for continuous mode. Ctrl+C stops a worker and preserves any unresolved final request.
+Config is read before each iteration from /Users/bhushanmalani/Code/iism/configs/me.jsonc. Changes apply to the next request. Local-only edits rebuild the packet without server preparation; state, DOB, phone, course, level and batch changes refresh dependent server fields. Invalid/partial config or missing documents pause sending and resume after correction. In-flight values stay immutable until that request settles.
+
+Fresh server preparation happens once at process startup and after explicit state rejection; preparation failures retry continuously. Server fee/allocation/age and signed fields remain server-owned. State, education, diet and all document paths come from config. documents.parentSignature explicitly selects the guardian upload. Normal-bot parallel/backoff settings do not control these independent direct workers.
+
+The native state/history is neither cleared nor modified by the direct scripts. Status history can be inspected independently, but it never prevents sending. Keep your personal config and documents in their existing locations.
