@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Config-reloading direct POST workers with dependency-bound server state."""
+"""Config-reloading direct POST workers using saved server form state."""
 import argparse
 import fcntl
 import hashlib
@@ -341,16 +341,17 @@ def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_
                         http=b.Http(base_url,next_settings.direct_request_timeout,b.Log(echo=False));page=None;prepared_binding=None
                     http.timeout=next_settings.direct_request_timeout
                     packet=None
-                    if active is not None:emit(status='config_reloaded',target=target_code,serverRefresh=server_changed)
+                    if active is not None:emit(status='config_reloaded',target=target_code,savedFormReload=server_changed)
                     active=candidate;binding=next_binding
                 if page is None:
-                    if plan:
+                    if not prepare_only:
                         if snapshot:
                             meta=json.loads(snapshot.with_suffix('.json').read_text())
                             http.check_destination(meta['url'])
                             if meta.get('serverKey')!=binding:raise ConfigPaused('Snapshot does not match the current server-dependent config.')
                             page=b.Page(meta['url'],meta['status'],snapshot.read_text(),complete=meta['complete'])
                         else:page=load_capsule(target_code,http,binding)
+                        if not plan:emit(status='saved_form_loaded',target=target_code)
                     else:
                         def check_config():
                             latest=reader.wait(target_code)
@@ -364,8 +365,8 @@ def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_
                         continue
                     prepared_binding=binding
                 if prepared_binding!=binding or not is_ready(page,settings,target):
-                    if plan:raise ConfigPaused('Prepared form no longer matches the current config.')
-                    page=None;packet=None;continue
+                    page=None;packet=None
+                    raise ConfigPaused('Saved form is incomplete or does not match the current config. Run --prepare-only explicitly to replace it.')
                 if packet is None:
                     packet=build_packet(settings,target,page)
                     if not plan:write_private(HERE/(target_code+'-request.multipart'),packet[0])
@@ -422,10 +423,10 @@ def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_
                 continue
             if response.complete and not response.redirects and any(x in response.body.lower() for x in b.VIEWSTATE_ERRORS):
                 request_progress.clear(request_phone)
-                emit(status='once_invalid_state' if limit==1 else 'refreshing_webforms_state',target=target_code)
+                emit(status='once_invalid_state' if limit==1 else 'retrying_invalid_saved_state',target=target_code,
+                     reason='Website rejected the saved form state. Stop this worker and run --prepare-only if you want to refresh it; automatic preparation is disabled.')
                 if limit and attempts>=limit:return 1
-                (HERE/(target_code+'-ready.json')).unlink(missing_ok=True)
-                page=None;prepared_binding=None;packet=None;continue
+                continue
             course,level,batch,state=desired_selection(request_page,request_settings,request_target)
             selection=b.Selection(course,level,batch,state,b.parse_server_number(request_page.value('txtAvailableSeat')),
                                   request_page.value('txtCourseFee'),request_page,b.observed_server_age(request_page))
@@ -435,8 +436,9 @@ def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_
                 emit(status='once_rejected' if limit==1 else 'retrying_rejection',target=target_code,reason=str(exc))
                 if is_ready(response,request_settings,request_target):
                     page=response;prepared_binding=request_binding;save_capsule(target_code,page,http,request_binding)
-                else:page=None;prepared_binding=None
-                packet=None
+                    packet=None
+                # A rejection can omit the dropdown options entirely. Keep the last
+                # complete saved form rather than restarting dropdown preparation.
                 if limit and attempts>=limit:return 1
                 continue
             except (b.Rejected,b.PhoneUsed) as exc:
@@ -459,10 +461,10 @@ def run(target_code,config,base_url,plan=False,limit=None,snapshot=None,prepare_
 
 
 def entry(target):
-    parser=argparse.ArgumentParser(description=f'Always-retrying direct final POST for {target}; --once makes a single attempt.')
+    parser=argparse.ArgumentParser(description=f'Direct final POST for {target} using saved form values; --once makes a single attempt.')
     parser.add_argument('--once',action='store_true',help='make one final-request attempt for manual inspection')
     parser.add_argument('--plan',action='store_true',help='inspect the prepared packet without submitting')
-    parser.add_argument('--prepare-only',action='store_true',help='capture server fee, seats, allocation ID and signed form state; never submit')
+    parser.add_argument('--prepare-only',action='store_true',help='explicitly replace saved server form state; never submit (normal runs make no preparation requests)')
     parser.add_argument('--prepare-seconds',type=float,default=None,help='optional preparation deadline; default is continuous retry')
     parser.add_argument('--snapshot',type=Path,help='private HTML snapshot with matching .json metadata, for offline packet inspection')
     args=parser.parse_args()

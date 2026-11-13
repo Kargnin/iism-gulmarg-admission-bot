@@ -38,13 +38,14 @@ def scenario(history=None,limit=3,crash=0,receipt=False,allow_duplicates=False,o
             else:native.state.save()
         finally:native.state.release()
         before=native.state.path.read_bytes()
-        code="import importlib.util,sys;from pathlib import Path;s=importlib.util.spec_from_file_location('direct',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);m.ROOT=Path(sys.argv[2]);m.HERE=m.ROOT/'capsules';raise SystemExit(m.run('G4',m.ROOT/'configs/me.jsonc',sys.argv[3],limit=int(sys.argv[4])))"
+        code="import importlib.util,sys;from pathlib import Path;s=importlib.util.spec_from_file_location('direct',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);m.ROOT=Path(sys.argv[2]);m.HERE=m.ROOT/'capsules';m.run('G4',m.ROOT/'configs/me.jsonc',sys.argv[3],prepare_only=True);raise SystemExit(m.run('G4',m.ROOT/'configs/me.jsonc',sys.argv[3],limit=int(sys.argv[4])))"
         try:
             result=subprocess.run([sys.executable,'-c',code,str(ENGINE),str(root),url,str(1 if once else limit)],capture_output=True,text=True,timeout=15)
             assert site.saw_attempt_status,result.stdout+result.stderr
             assert native.state.path.read_bytes()==before,'Direct retries modified historical native progress'
             expected=1 if once else limit
             assert site.post_counts.get('9000000011')==expected,(site.post_counts,result.stdout,result.stderr)
+            assert sum(r['method']=='GET' and r['page']=='admission_form.aspx' for r in site.request_log)==1,'Default run repeated server preparation'
             assert 'uncertain saved submission' not in result.stdout+result.stderr
             if allow_duplicates:assert len(site.applications)==limit and result.stdout.count('status: "confirmed"')==limit
             if crash or receipt:assert 'retrying_uncertain' in result.stdout and len(site.applications)==1

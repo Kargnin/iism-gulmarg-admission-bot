@@ -45,6 +45,10 @@ class Handler(fixture.ReadyHandler):
             data=json.loads((self.site.root/'capsules/G4-attempt-state.json').read_text())
             self.site.attempt_was_logged=data['status']=='submitting' and data['phone']==phone
             self.site.change()
+            if self.site.empty_rejection:
+                return self.send(200,self.form(phone,{'lblMsg':('Seat Not Available','Red')},['4']))
+            if self.site.invalid_final:
+                return self.ysod('Validation of viewstate MAC failed.')
             return self.send(503,fixture.mock_site.IIS_503 if self.site.uncertain else fixture.BUSY)
         return super().post_form(sess,query,values,files)
 
@@ -61,6 +65,7 @@ class ReloadTests(unittest.TestCase):
         self.site.prep_busy=0;self.site.selector_busy=0;self.site.change=lambda:None
         self.site.prep_change=None;self.site.uncertain=False;self.site.requests_seen=[]
         self.site.form_gets=0;self.site.prep_events=[];self.site.attempt_was_logged=False;self.site.page_seats=None;self.site.final_delay=0
+        self.site.empty_rejection=False;self.site.invalid_final=False
         ski=self.site.courses['4'];ski['levels']=[('4','Basic SSC'),('5','Intermediate SSC'),('28','Snow Boarding')]
         ski['batches'].append(('82','Course from 17 Jan to 30 Jan 2027',fixture.mock_site.date(2027,1,17),'Gulmarg'))
         self.site.seats={(cv,lv,batch[0]):3 for cv,c in self.site.courses.items() for lv,_ in c['levels'] for batch in c['batches']}
@@ -87,7 +92,8 @@ class ReloadTests(unittest.TestCase):
             if with_history:state.data['phones']['9000000013']={'status':'used','note':'known refused before this test'}
             state.save()
         finally:state.release()
-    def start(self,limit=2):
+    def start(self,limit=2,seed=True):
+        if seed and not (self.root/'capsules/G4-ready.json').exists():self.prepare_once()
         code="import importlib.util,sys;from pathlib import Path;s=importlib.util.spec_from_file_location('direct',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);m.ROOT=Path(sys.argv[2]);m.HERE=m.ROOT/'capsules';m.ALLOCATIONS={'G1':('synthetic-shared','synthetic-4-4-80'),'G4':('synthetic-shared','synthetic-4-4-83')};raise SystemExit(m.run('G4',m.ROOT/'configs/me.jsonc',sys.argv[3],limit=int(sys.argv[4])))"
         proc=subprocess.Popen([sys.executable,'-u','-c',code,str(ENGINE),str(self.root),self.url,str(limit)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
         self.processes.append(proc)
@@ -96,6 +102,15 @@ class ReloadTests(unittest.TestCase):
                 self.lines.append(line)
                 if 'config_paused' in line:self.paused.set()
         thread=threading.Thread(target=read,daemon=True);thread.start();self.read_threads.append(thread);return proc,thread
+    def refresh_after_edit(self,proc,thread):
+        self.assertTrue(self.paused.wait(3),''.join(self.lines))
+        self.assertEqual(len(self.site.requests_seen),1)
+        count=self.site.requests
+        threading.Event().wait(.1)
+        self.assertEqual(self.site.requests,count,'Config mismatch triggered automatic preparation')
+        proc.send_signal(signal.SIGINT);proc.wait(timeout=2);thread.join(timeout=2)
+        self.prepare_once()
+        return self.start(limit=1)
     def finish(self,proc,thread):
         try:proc.wait(timeout=10)
         except subprocess.TimeoutExpired:self.fail('Worker did not complete: '+''.join(self.lines[-25:]))
@@ -147,14 +162,14 @@ class ReloadTests(unittest.TestCase):
         cfg=copy.deepcopy(self.cfg);cfg['applicant']['email']='repaired@example.com';self.write(cfg)
         self.finish(proc,thread)
         self.assertEqual(self.site.requests_seen[-1]['fields']['txtEmailId'],'repaired@example.com')
-    def test_state_change_refreshes_server_state_once_and_uses_new_value(self):
+    def test_state_change_requires_explicit_refresh_before_using_new_value(self):
         self.site.change=lambda:self.edit(lambda cfg:cfg['address'].update(state='Karnataka'))
-        proc,thread=self.start();self.finish(proc,thread)
+        proc,thread=self.start();proc,thread=self.refresh_after_edit(proc,thread);self.finish(proc,thread)
         self.assertEqual(self.site.requests_seen[-1]['fields']['ddlState'],'29')
         self.assertEqual(self.site.form_gets,2);self.assertEqual(self.site.prep_events,['txtDateOfBirth'])
-    def test_dob_change_refreshes_and_logs_current_identity(self):
+    def test_dob_change_requires_explicit_refresh_and_logs_current_identity(self):
         self.site.change=lambda:self.edit(lambda cfg:cfg['applicant'].update(dateOfBirth='15/05/2005'))
-        proc,thread=self.start();self.finish(proc,thread)
+        proc,thread=self.start();proc,thread=self.refresh_after_edit(proc,thread);self.finish(proc,thread)
         self.assertEqual(self.site.requests_seen[-1]['fields']['txtDateOfBirth'],'15/05/2005')
         self.assertEqual(self.site.requests_seen[-1]['fields']['txtCourseFee'],'10000')
         self.assertEqual(self.site.form_gets,2)
@@ -163,7 +178,7 @@ class ReloadTests(unittest.TestCase):
     def test_phone_change_keeps_used_history_and_reprepares_mobile(self):
         self.seed_used()
         self.site.change=lambda:self.edit(lambda cfg:cfg['phoneNumbers'].__setitem__(0,'9000000099'))
-        proc,thread=self.start();self.finish(proc,thread)
+        proc,thread=self.start();proc,thread=self.refresh_after_edit(proc,thread);self.finish(proc,thread)
         self.assertEqual(self.site.applications[0]['mobile'],'9000000099')
         self.assertEqual(self.state()['phones']['9000000013']['status'],'used')
         self.assertEqual(self.site.form_gets,2)
@@ -177,20 +192,20 @@ class ReloadTests(unittest.TestCase):
         self.seed_used();state_path=next((self.root/'runs').glob('*/state.json'));before=state_path.read_bytes()
         self.site.uncertain=True
         self.site.change=lambda:self.edit(lambda cfg:cfg['phoneNumbers'].__setitem__(0,'9000000099'))
-        proc,thread=self.start();self.finish(proc,thread)
+        proc,thread=self.start();proc,thread=self.refresh_after_edit(proc,thread);self.finish(proc,thread)
         self.assertIn('retrying_uncertain',''.join(self.lines))
         self.assertEqual(self.site.requests_seen[0]['phone'],'9000000011')
         self.assertEqual(self.site.requests_seen[-1]['phone'],'9000000099')
         self.assertEqual(state_path.read_bytes(),before)
     def test_level_change_refreshes_allocation_and_sends_new_level(self):
         self.site.change=lambda:self.edit(lambda cfg:cfg['coursePriorities'].__setitem__(0,'G4 Intermediate'))
-        proc,thread=self.start();self.finish(proc,thread)
+        proc,thread=self.start();proc,thread=self.refresh_after_edit(proc,thread);self.finish(proc,thread)
         self.assertEqual(self.site.requests_seen[-1]['fields']['ddlCourseLevel'],'5')
         self.assertEqual(self.site.requests_seen[-1]['fields']['hdfCapacitySheetAllocationId'],'synthetic-4-5-83')
         self.assertEqual(self.site.form_gets,2)
     def test_date_override_selects_matching_server_batch(self):
         self.site.change=lambda:self.edit(lambda cfg:cfg['coursePriorities'].__setitem__(0,{'batch':'G4','course':'Snow Skiing','level':'Basic','from':'2027-01-17','to':'2027-01-30'}))
-        proc,thread=self.start();self.finish(proc,thread)
+        proc,thread=self.start();proc,thread=self.refresh_after_edit(proc,thread);self.finish(proc,thread)
         self.assertEqual(self.site.requests_seen[-1]['fields']['ddlScheduleCourse'],'82')
     def test_edit_during_preparation_discards_old_server_dependencies(self):
         self.site.cold=True
@@ -224,22 +239,44 @@ class ReloadTests(unittest.TestCase):
         self.assertEqual(self.site.form_gets,1)
     def test_course_kind_change_selects_its_own_live_level(self):
         self.site.change=lambda:self.edit(lambda cfg:cfg['coursePriorities'].__setitem__(0,'G4 Snowboarding'))
-        proc,thread=self.start();self.finish(proc,thread)
+        proc,thread=self.start();proc,thread=self.refresh_after_edit(proc,thread);self.finish(proc,thread)
         self.assertEqual(self.site.requests_seen[-1]['fields']['ddlCourseLevel'],'28')
         self.assertEqual(self.site.form_gets,2)
     def prepare_once(self):
         code="import importlib.util,sys;from pathlib import Path;s=importlib.util.spec_from_file_location('direct',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);m.ROOT=Path(sys.argv[2]);m.HERE=m.ROOT/'capsules';raise SystemExit(m.run('G4',m.ROOT/'configs/me.jsonc',sys.argv[3],prepare_only=True))"
         result=subprocess.run([sys.executable,'-c',code,str(ENGINE),str(self.root),self.url],capture_output=True,text=True,timeout=5)
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-    def test_new_live_session_refreshes_availability_even_with_matching_cache(self):
+    def test_restart_uses_saved_values_without_any_startup_preparation(self):
         self.site.page_seats=0;self.prepare_once()
         meta=json.loads((self.root/'capsules/G4-ready.json').read_text())
         old=b.Page(meta['url'],200,(self.root/'capsules/G4-ready.html').read_text())
         self.assertEqual(old.value('txtAvailableSeat'),'0')
         self.site.page_seats=3
         proc,thread=self.start();self.finish(proc,thread)
-        self.assertEqual(self.site.requests_seen[0]['fields']['txtAvailableSeat'],'3')
-        self.assertEqual(self.site.form_gets,2)
+        self.assertEqual(self.site.requests_seen[0]['fields']['txtAvailableSeat'],'0')
+        self.assertEqual(self.site.form_gets,1);self.assertEqual(self.site.prep_events,[])
+        self.assertIn('saved_form_loaded',''.join(self.lines))
+    def test_empty_dropdown_rejection_reuses_complete_saved_form(self):
+        self.site.empty_rejection=True
+        proc,thread=self.start();self.finish(proc,thread)
+        self.assertEqual(self.site.form_gets,1);self.assertEqual(self.site.prep_events,[])
+        first,last=self.site.requests_seen
+        self.assertEqual(last['fields']['ddlCourseLevel'],'4')
+        self.assertEqual(last['fields']['ddlScheduleCourse'],'83')
+        self.assertEqual(first['fields']['__VIEWSTATE'],last['fields']['__VIEWSTATE'])
+        self.assertIn('retrying_rejection',''.join(self.lines))
+    def test_invalid_viewstate_retries_without_preparation_or_deleting_cache(self):
+        self.prepare_once();self.site.invalid_final=True
+        saved=(self.root/'capsules/G4-ready.json').read_bytes()
+        proc,thread=self.start();self.finish(proc,thread)
+        self.assertIn('retrying_invalid_saved_state',''.join(self.lines))
+        self.assertEqual(self.site.form_gets,1);self.assertEqual(self.site.prep_events,[])
+        self.assertEqual((self.root/'capsules/G4-ready.json').read_bytes(),saved)
+    def test_missing_cache_does_not_make_any_preparation_request(self):
+        proc,thread=self.start(seed=False);proc.wait(timeout=3);thread.join(timeout=2)
+        self.assertNotEqual(proc.returncode,0)
+        self.assertIn('--prepare-only',''.join(self.lines))
+        self.assertEqual(self.site.requests,0)
     def test_plan_rejects_a_cache_for_different_server_config_without_http(self):
         self.prepare_once();count=self.site.requests
         self.edit(lambda cfg:cfg['address'].update(state='Karnataka'))
