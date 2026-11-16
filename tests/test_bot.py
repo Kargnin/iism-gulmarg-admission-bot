@@ -1059,6 +1059,21 @@ class DatesBackRush(unittest.TestCase):
             self.assertEqual(instance.hold_interval(), 30)
 
 
+class WakeOnDates(unittest.TestCase):
+    def test_choices_waiting_to_look_again_go_at_once_when_the_dates_come_back(self):
+        instance = offline_bot()
+        instance.opt.update(pollSec=30, pollIdleSec=30)  # a long wait, unless woken
+        instance.dates_missing()
+        waiter = threading.Thread(target=instance.poll_wait)
+        started = time.monotonic()
+        waiter.start()
+        time.sleep(0.2)
+        instance.saw_season()  # another choice sees the dates
+        waiter.join(2)
+        self.assertFalse(waiter.is_alive())
+        self.assertLess(time.monotonic() - started, 1.5)
+
+
 class RefusedBeforeProcessing(unittest.TestCase):
     @staticmethod
     def page(status, body, **headers):

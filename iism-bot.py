@@ -77,21 +77,21 @@ BOT_DEFAULTS = {
     # Booking day is a race: during the rush (1 minute before opening to 60 minutes after) every
     # pause below is kept as short as possible, like Kargnin's direct-POST loop; outside it the bot
     # looks and resends slowly.
-    "pollSec": 1,                # during the rush, a choice that is not listed yet is looked for this often ...
+    "pollSec": 0.5,              # during the rush, a choice that is not listed yet is looked for this often ...
     "pollIdleSec": 30,           # ... and this often at other times
     "requestTimeoutSec": 45,
     "submitTimeoutSec": 120,
-    "retryDelaySec": 0.5,        # first retry delay before a fresh visit; grows with repeated failures ...
-    "maxRetryDelaySec": 2.0,     # ... up to this
+    "retryDelaySec": 0.2,        # first retry delay before a fresh visit; grows with repeated failures ...
+    "maxRetryDelaySec": 1.0,     # ... up to this
     # A server error (503 busy, 5xx, error page, dropped/timed-out connection) on one step - the
     # course, level or seat reload, the mobile or terms page - sends that same step again with the
     # same session, keeping the steps already done, for up to this long before starting over.
     "stepRetrySec": 120,
-    "stepRetryDelaySec": 0.1,    # pause between those same-step retries
+    "stepRetryDelaySec": 0.02,   # pause between those same-step retries (just enough to never spin)
     # When the chosen dates show 0 seats, fill in the rest of the form anyway and keep sending it:
     # the site checks seats when the final form arrives, so one request is enough once seats open.
     "holdForm": True,
-    "holdResendSec": 0.1,        # pause between sends during the rush
+    "holdResendSec": 0.02,       # pause between sends during the rush
     "holdIdleResendSec": 30,     # pause between sends at other times (also keeps the session alive)
     # A fresh visit opens the admission form straight from its own address (admission_form.aspx?mobile=N,
     # which the site serves to a new session) - 1 request instead of the 5 that mobile verification and
@@ -3399,6 +3399,7 @@ class Bot:
         self.in_doubt = set()            # phones whose final form was redirected and is being confirmed
         self.dates_missing_since = None  # wall time this season's course dates were first found missing
         self.rush_started = None         # wall time they came back: a rush of its own starts then
+        self.dates_seen_count = 0        # bumped whenever the dates are seen after being missing (wakes pollers)
         self.attention_seen = {}
         self.refusals = {}
         self.parent_fallback = set()
@@ -3538,16 +3539,18 @@ class Bot:
         return min(60.0, self.opt["pollIdleSec"])
 
     def poll_wait(self):
-        """Wait before looking again for a choice that is not listed; re-evaluated every second, so
-        quick polling starts on time when the rush begins. A random spread keeps the choices from
-        looking all at once, so between them the site is looked at every few seconds."""
+        """Wait before looking again for a choice that is not listed; re-evaluated every 0.1 s, so quick
+        polling starts on time when the rush begins, and ended at once when another choice sees the
+        course dates come back. A random spread keeps the choices from looking all at once, so between
+        them the site is looked at every few seconds."""
         started = time.monotonic()
         spread = random.uniform(0.5, 1.5)
-        while not self.stop.is_set():
+        seen = self.dates_seen_count
+        while not self.stop.is_set() and self.dates_seen_count == seen:
             left = started + self.poll_delay() * spread - time.monotonic()
             if left <= 0:
                 return
-            self.sleep(min(left, 1.0))
+            self.sleep(min(left, 0.1))
 
     def note(self, who, message, every=60, warning=False):
         with self.lock:
@@ -3736,6 +3739,8 @@ class Bot:
                 self.season_seen = time.monotonic()
             missing = self.dates_missing_since
             self.dates_missing_since = None
+            if missing is not None:
+                self.dates_seen_count += 1  # the choices still waiting to look again go at once
             back = missing is not None and (now - missing).total_seconds() >= DATES_MISSING_MIN_SEC
             if back:
                 self.rush_started = now
