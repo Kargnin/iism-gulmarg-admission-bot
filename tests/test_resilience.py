@@ -464,7 +464,9 @@ class Resilience(unittest.TestCase):
         self.assertFalse(any(item["submit"] for item in site.request_log))
         self.assertEqual(site.applications, [])
 
-    def test_inflight_cancellation_preserves_pending_for_feedback(self):
+    def test_final_form_answered_while_stopping_is_settled_from_its_receipt(self):
+        """Stopping refuses new requests, but a final form already on its way is read to the end: its
+        receipt confirms the booking instead of leaving it for feedback (16 Nov 2026)."""
         site, url = self.local_site()
         settings = bot.parse_settings(make_config(self.root, PHONES[:1], ["G2 Basic"]), None)[0]
         out = self.root / "inflight-cancel"
@@ -491,9 +493,9 @@ class Resilience(unittest.TestCase):
         coordinator.join(1)
         self.assertTrue(entered.is_set())
         self.assertEqual(len(site.applications), 1)
-        self.assertEqual(instance.bookings, [])
-        self.assertEqual(instance.pending, {PHONES[0]: bot.target_key(instance.targets[0])})
-        self.assertEqual(instance.state.data["phones"][PHONES[0]]["status"], "submitting")
+        self.assertEqual([b["target"] for b in instance.bookings], ["G2 Basic"])
+        self.assertEqual(instance.pending, {})
+        self.assertEqual(instance.state.data["phones"][PHONES[0]]["status"], "booked")
 
     def test_transport_provenance_starts_only_at_first_write(self):
         started = []

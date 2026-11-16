@@ -8,7 +8,8 @@ Copied from the real site:
   * URLs and redirects: "/" answers 403.14; mobile verification 302s to
     /Admission_criteria.aspx?mobile=N; chkAccept + lnkbtnNext 302s to
     /admission_form.aspx?mobile=N; criteria/form without a session 302 back
-    to /Admission_instructions.aspx
+    to /Admission_instructions.aspx (23 Oct) - though on 12 Nov the form's own
+    address opened the form for a new session (Site.direct_form)
   * the admission form: the same 92 fields in the same order, multipart,
     ValidatorCallout ClientState fields without a value attribute, btnSubmit
     and btnReset, labels lblMsg / lblDOBMsg / lblCheckError (lblmsg on the
@@ -250,8 +251,23 @@ INSTRUCTIONS_TEXT = (  # short stand-ins for the real text; these two phrases mu
 YSOD = ("<html><head><title>Runtime Error</title></head><body><h1>Server Error in '/' Application.</h1>"
         "<h2><i>Runtime Error</i></h2><p>Timeout expired. The timeout period elapsed prior to obtaining a "
         "connection from the pool.</p></body></html>")
+# HTTP.sys's own reply when it cannot hand a request to the site (queue full, site restarting); the
+# real site gave it 5 times on 12 Nov 2026. The request never reached the site's code.
 IIS_503 = ("<html><head><title>Service Unavailable</title></head><body><h2>Service Unavailable</h2><hr>"
            "<p>HTTP Error 503. The service is unavailable.</p></body></html>")
+# a 503 from something in front of the site (gateway/proxy), which may come after the form was processed
+PROXY_503 = ("<html><head><title>503 Service Unavailable</title></head><body><h1>Service Unavailable</h1>"
+             "<p>The server is temporarily unable to service your request due to maintenance downtime or "
+             "capacity problems. Please try again later.</p></body></html>")
+# an IIS error raised before any handler ran (like the missing-module 500 seen on 2 Nov 2026)
+IIS_500_BEFORE_HANDLER = (
+    "<html><head><title>IIS 10.0 Detailed Error - 500.0 - Internal Server Error</title></head><body>"
+    "<h3>HTTP Error 500.0 - Internal Server Error</h3><h4>The page cannot be displayed because an internal "
+    "server error has occurred.</h4><fieldset><h4>Detailed Error Information:</h4><table>"
+    "<tr class=\"alt\"><th>Module</th><td>&nbsp;&nbsp;&nbsp;PleskModule</td></tr>"
+    "<tr><th>Notification</th><td>&nbsp;&nbsp;&nbsp;BeginRequest</td></tr>"
+    "<tr class=\"alt\"><th>Handler</th><td>&nbsp;&nbsp;&nbsp;Not yet determined</td></tr>"
+    "</table></fieldset></body></html>")
 # what the real site answered most requests with on 12 Nov 2026, 10:00-10:20
 IIS_503_2 = ("<html><head><title>IIS 10.0 Detailed Error - 503.2 - Service Unavailable</title></head><body>"
              "<h3>HTTP Error 503.2 - Service Unavailable</h3><h4>The serverRuntime@appConcurrentRequestLimit "
@@ -298,6 +314,7 @@ class Site:
         self.refuse_numbers = {}          # mobile -> message the first page answers it with (e.g. "invalid")
         self.hide_full = False            # take full batches (and fully booked courses) off the list
         self.check_used_at_start = True   # False: a used number gets through verification, refused at submit
+        self.direct_form = True           # admission_form.aspx?mobile=N opens the form for a new session (12 Nov)
         self.fail_success_page = 0        # this many success pages fail to load (503) after the redirect
         # The form asks for a parent/guardian signature "if participant is under 18", but its required check
         # stays on for adults too (seen on the real page); whether the server enforces it for adults is unknown.
@@ -804,6 +821,11 @@ class Handler(BaseHTTPRequestHandler):
         return "".join(out)
 
     def get_form(self, sess, query):
+        mobile = query.get("mobile", "")
+        if (self.site.direct_form and re.fullmatch(r"\d{10}", mobile)
+                and not (sess["accepted"] and sess["mobile"] == mobile)):
+            # 12 Nov 2026: the live site opened the form straight from its address for a new session
+            sess.update(mobile=mobile, accepted=True, courses=self.listed_now())
         if not sess["accepted"] or sess["mobile"] != query.get("mobile"):
             return self.redirect("/Admission_instructions.aspx")
         self.send(200, self.form(sess["mobile"], {}, sess.get("courses", [])))
@@ -910,7 +932,7 @@ class Handler(BaseHTTPRequestHandler):
             v["lblMsg"] = (text, "Red")
             return self.send(200, self.form(mobile, v, listed))
         if crash:
-            return self.send(503, IIS_503)
+            return self.send(503, PROXY_503)
         if mobile in site.receipt_redirects:
             return self.redirect(site.receipt_redirects[mobile])
         message = "Admission Form submitted successfully. Payment link has been sent to your email id."

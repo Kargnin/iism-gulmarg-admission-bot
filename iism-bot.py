@@ -74,22 +74,33 @@ BOT_DEFAULTS = {
     "notify": True,              # Mac notification + terminal bell on a booking
     "preventSleep": True,        # keep the Mac awake while the bot runs (caffeinate)
     "startEarlySec": 600,        # start looking this long before the published opening time
-    "pollSec": 2,                # each unfinished preference checks for its current date slot
+    # Booking day is a race: during the rush (1 minute before opening to 60 minutes after) every
+    # pause below is kept as short as possible, like Kargnin's direct-POST loop; outside it the bot
+    # looks and resends slowly.
+    "pollSec": 1,                # during the rush, a choice that is not listed yet is looked for this often ...
+    "pollIdleSec": 30,           # ... and this often at other times
     "requestTimeoutSec": 45,
     "submitTimeoutSec": 120,
-    "retryDelaySec": 1.0,        # first retry delay; grows with repeated failures ...
-    "maxRetryDelaySec": 10.0,    # ... up to this
+    "retryDelaySec": 0.5,        # first retry delay before a fresh visit; grows with repeated failures ...
+    "maxRetryDelaySec": 2.0,     # ... up to this
     # A server error (503 busy, 5xx, error page, dropped/timed-out connection) on one step - the
     # course, level or seat reload, the mobile or terms page - sends that same step again with the
     # same session, keeping the steps already done, for up to this long before starting over.
     "stepRetrySec": 120,
-    "stepRetryDelaySec": 1.0,    # pause between those same-step retries
+    "stepRetryDelaySec": 0.1,    # pause between those same-step retries
     # When the chosen dates show 0 seats, fill in the rest of the form anyway and keep sending it:
     # the site checks seats when the final form arrives, so one request is enough once seats open.
     "holdForm": True,
-    "holdResendSec": 1.0,        # pause between sends from 1 minute before opening to 30 minutes after
-    "holdIdleResendSec": 20,     # pause between sends at other times (also keeps the session alive)
+    "holdResendSec": 0.1,        # pause between sends during the rush
+    "holdIdleResendSec": 30,     # pause between sends at other times (also keeps the session alive)
+    # A fresh visit opens the admission form straight from its own address (admission_form.aspx?mobile=N,
+    # which the site serves to a new session) - 1 request instead of the 5 that mobile verification and
+    # the terms page take. false: go through those pages as a person would.
+    "directForm": True,
     "maxRejections": 3,          # site rejected the form this often for a choice -> move on
+    # 0: book every preference. N: once N bookings are confirmed, stop the other choices - all of them
+    # race for the first seat, but the institute cancels multiple entries by one student (16 Nov 2026).
+    "maxBookings": 0,
     "rejectedRetrySec": 5,       # pause after the site rejected the form
     # The form's own check asks for a parent/guardian signature even from adults. If the site
     # refuses an adult's form for that reason, resend with the applicant's signature in that slot.
@@ -97,11 +108,12 @@ BOT_DEFAULTS = {
     "statusEverySec": 30,
 }
 
-BOT_BOOLEAN_OPTIONS = {"parallel", "notify", "preventSleep", "parentSignatureFallback", "holdForm"}
-BOT_INTEGER_MINIMUMS = {"maxRejections": 1}
+BOT_BOOLEAN_OPTIONS = {"parallel", "notify", "preventSleep", "parentSignatureFallback", "holdForm", "directForm"}
+BOT_INTEGER_MINIMUMS = {"maxRejections": 1, "maxBookings": 0}
 BOT_NUMBER_MINIMUMS = {
     "startEarlySec": (0, True),
     "pollSec": (0, False),
+    "pollIdleSec": (0, False),
     "requestTimeoutSec": (0, False),
     "submitTimeoutSec": (0, False),
     "retryDelaySec": (0, False),
@@ -302,9 +314,15 @@ VIEWSTATE_ERRORS = [
 # A busy server or gateway: the request was turned away before the site's own code ran.
 SERVER_BUSY_STATUSES = (429, 502, 503, 504)
 STEP_APP_ERROR_TRIES = 3  # a step that hits the site's own error page this often starts the visit over
-HOLD_RUSH_BEFORE_SEC = 60        # a held form is sent every holdResendSec from this long before opening ...
-HOLD_RUSH_AFTER_SEC = 30 * 60    # ... until this long after it
-HOLD_REFRESH_SEC = 15 * 60       # after that window, fill a held form in afresh this often
+# A new connection (TLS included) that has not opened by then is given up and tried afresh. Nothing has
+# been sent yet, so this is always safe; the OS alone kept one trying for ~25 s at 10:00 on 13 Nov 2026.
+CONNECT_TIMEOUT_SEC = 5.0
+HOLD_RUSH_BEFORE_SEC = 60        # the rush: from this long before opening ...
+HOLD_RUSH_AFTER_SEC = 60 * 60    # ... until this long after it
+HOLD_REFRESH_SEC = 15 * 60       # outside the rush, a held form is filled in afresh (in the background) this often
+HOLD_PREOPEN_REFRESH_SEC = 5 * 60  # ... and once this long before opening, so it carries the latest values
+HOLD_RUSH_REFRESH_SEC = 2 * 60   # during the rush, while the site keeps saying "no seats", this often
+DATES_MISSING_MIN_SEC = 30       # course dates missing at least this long and then back start a rush of their own
 STEP_NAMES = {
     "ddlCourse": "choosing the course (loads the course levels)",
     "ddlCourseLevel": "choosing the course level (loads the course dates)",
@@ -1855,8 +1873,9 @@ class OriginRedirectHandler(urllib.request.HTTPRedirectHandler):
         self.history = []
 
     def redirect_request(self, request, response, code, message, headers, new_url):
-        if self.stop is not None and self.stop.is_set():
-            raise Cancelled()
+        # Followed even while stopping: the request was already sent, and its receipt settles it (17 Nov
+        # rehearsal: a second final form accepted at the moment bot.maxBookings stopped the run was otherwise
+        # left unresolved). New requests are still refused by Http.check_destination.
         self.history.append((code, request.get_method(), request.full_url, new_url))
         self.check_redirect(new_url)
         return super().redirect_request(request, response, code, message, headers, new_url)
@@ -1921,6 +1940,19 @@ class TransportStartMixin:
             return super()._tunnel()
         finally:
             self._in_tunnel = False
+
+    def connect(self):
+        """Open the connection within CONNECT_TIMEOUT_SEC, then give the request its full timeout."""
+        timeout = self.timeout
+        limited = isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+        if limited:
+            self.timeout = min(timeout, CONNECT_TIMEOUT_SEC)
+        try:
+            super().connect()
+        finally:
+            self.timeout = timeout
+        if limited and self.sock is not None:
+            self.sock.settimeout(timeout)
 
     def send(self, data):
         if self.sock is None:
@@ -2003,15 +2035,40 @@ class TrackedHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(factory, request, context=self._context)
 
 
+HTTPSYS_503_TEXT = "http error 503. the service is unavailable"
+DYNAMIC_IP_REFUSALS = ("403.501", "403.502", "403.503", "403.504", "dynamic ip restriction")
+
+
 def refused_before_processing(page):
-    """IIS's own "503.2" page - too many requests at once (serverRuntime appConcurrentRequestLimit),
-    the error the real site gave most often on 12 Nov 2026. IIS sends it before the site's code runs,
-    so a final form refused this way was never processed and is safe to send again. Any other 503
-    may come from a proxy after the form was processed, so it stays uncertain."""
-    if page.status != 503:
+    """A reply that Windows/IIS itself sends before the site's code runs, so a final form refused this
+    way was never processed and is safe to send again:
+      * IIS's "503.2" page - too many requests at once (serverRuntime appConcurrentRequestLimit), the
+        error the real site gave most often on 12 Nov 2026;
+      * HTTP.sys's own "Service Unavailable" (Server: Microsoft-HTTPAPI) - its queue for the site was
+        full or the site was restarting; the real site gave it 5 times on 12 Nov;
+      * an IIS detailed error page raised before any handler was chosen ("Handler: Not yet
+        determined"), such as the missing-module 500 seen on 2 Nov;
+      * IIS Dynamic IP Restrictions (403.501-403.504) - too many requests from this address.
+    Any other error may come from code that already processed the form, so it stays uncertain."""
+    if page.status < 400:
         return False
-    text = f"{page.title()} {page.body[:4000]}".lower()
-    return "503.2" in text or "appconcurrentrequestlimit" in text
+    text = f"{page.title()} {page.body[:30000]}".lower()
+    if page.status == 503:
+        if "503.2" in text or "appconcurrentrequestlimit" in text:
+            return True
+        if page.headers.get("server", "").lower().startswith("microsoft-httpapi") or HTTPSYS_503_TEXT in text:
+            return True
+    if page.status == 403 and has_any(text, DYNAMIC_IP_REFUSALS):
+        return True
+    return ("iis" in text and "detailed error" in text
+            and re.search(r"handler(?:<[^>]*>|&nbsp;|\s|:)*not yet determined", text) is not None)
+
+
+def refused_retry_after(page):
+    """Dynamic IP Restrictions count requests over a short window: back off a little longer."""
+    if page.status == 403:
+        return 2.0
+    return response_retry_after(page)
 
 
 def response_retry_after(page):
@@ -2150,8 +2207,14 @@ class Http:
         return self._read_response(response, self._request_deadline())
 
     def check_destination(self, url):
+        """Before contacting the site: no new request once stopping, and only the configured site."""
         if self.stop is not None and self.stop.is_set():
             raise Cancelled()
+        self.check_origin(url)
+
+    def check_origin(self, url):
+        """For a reply that already arrived: judged even while stopping, so a final form answered just
+        after Ctrl+C ("Seat Not Available") is settled instead of being left unresolved."""
         if origin(url) != self.origin:
             raise ConfigError("Blocked a form/request outside the configured admission site.")
 
@@ -2204,8 +2267,14 @@ class Http:
             return UploadInterrupted(f"{message} (before the request was fully sent)", retry_after)
         return Transient(message, retry_after)
 
-    def send(self, method, url, data=None, content_type=None, referer=None, timeout=None, on_start=None):
-        self.check_destination(url)
+    def send(self, method, url, data=None, content_type=None, referer=None, timeout=None, on_start=None,
+             settle=False):
+        """settle: a request that only reads the result of a form already sent (its receipt), allowed
+        even while stopping."""
+        if settle:
+            self.check_origin(url)
+        else:
+            self.check_destination(url)
         timeout = timeout or self.timeout
         deadline = time.monotonic() + timeout
         self.redirect_handler.history = []
@@ -2252,7 +2321,7 @@ class Http:
             self._deadline = previous_deadline
         redirects = tuple(self.redirect_handler.history)
         fresh = method == "GET" or bool(redirects)
-        self.check_destination(final)
+        self.check_origin(final)
         return Page(final, status, raw.decode("utf-8", errors="replace"), fresh=fresh,
                     headers=response_headers, redirects=redirects, complete=complete)
 
@@ -2279,10 +2348,14 @@ class Selection:
 
 
 class Session:
-    def __init__(self, bot, phone, who):
+    def __init__(self, bot, phone, who, cancel=None):
         self.bot, self.phone, self.who = bot, phone, who
+        self.cancel = cancel  # an Event that stops this session alone (a background refresh)
         self.http = None
         self.restart()
+
+    def cancelled(self):
+        return self.bot.stop.is_set() or (self.cancel is not None and self.cancel.is_set())
 
     def restart(self):
         verify = self.http.verified if self.http is not None else True
@@ -2299,8 +2372,10 @@ class Session:
                 raise SessionLost("the site rejected our page state")
             what = f"HTTP {page.status}" if page.status >= 400 else "error page"
             title = page.title()
-            busy = page.status in SERVER_BUSY_STATUSES
-            raise Transient(what + (f" ({title[:80]})" if title else ""), response_retry_after(page),
+            refused = refused_before_processing(page)
+            busy = page.status in SERVER_BUSY_STATUSES or refused
+            raise Transient(what + (f" ({title[:80]})" if title else ""),
+                            refused_retry_after(page) if refused else response_retry_after(page),
                             app_error=not busy)
         return page
 
@@ -2317,7 +2392,7 @@ class Session:
         started = time.monotonic()
         tries = app_errors = 0
         while True:
-            if bot.stop.is_set():
+            if self.cancelled():
                 raise Cancelled()
             try:
                 result = action()
@@ -2391,8 +2466,30 @@ class Session:
     # -- flow ----------------------------------------------------------------
 
     def open_form(self):
-        """Mobile verification + criteria; returns the admission form."""
-        page = self.step("opening the site", lambda: self.get("Admission_instructions.aspx"))
+        """Returns the admission form. With bot.directForm it is opened straight from the address the
+        terms page redirects to - one request instead of the five that mobile verification and the
+        terms take (Kargnin's shortcut; the live site served it to a new session on 12 Nov 2026, and
+        forms filled in that way got the site's "Seat Not Available" on 13 Nov) - else, or if the site
+        stops serving it that way, through mobile verification and the terms page."""
+        bot = self.bot
+        page = None
+        if bot.opt["directForm"] and bot.direct_form is not False:
+            address = FORM_PAGE + "?" + urllib.parse.urlencode({"mobile": self.phone})
+            page = self.step("opening the admission form", lambda: self.get(address))
+            if page.name == FORM_PAGE and page.value("txtMobileNo") == self.phone:
+                if bot.direct_form is None:
+                    bot.direct_form = True
+                    bot.note("", "The site opens the admission form directly: a fresh visit skips mobile "
+                                 "verification and the terms page")
+                self.verdict(page, full_ok=False)
+                return page
+            bot.direct_form = False
+            bot.note("", f"The site did not open the admission form directly (it answered with page "
+                         f"'{page.name}'); going through mobile verification and the terms page")
+            if page.name not in (INSTRUCTIONS_PAGE, CRITERIA_PAGE):
+                page = None
+        if page is None:
+            page = self.step("opening the site", lambda: self.get("Admission_instructions.aspx"))
         for _ in range(4):
             if page.name == FORM_PAGE:
                 self.verdict(page, full_ok=False)
@@ -2472,6 +2569,7 @@ class Session:
             if parse_server_number(candidate.value("txtAvailableSeat")) is None:
                 raise Transient("the selected schedule reported an invalid seat count", app_error=True)
 
+        dates_here = False   # whether this season's course dates were listed anywhere on the way
         while found is None:
             self.restart()
             page = self.open_form()
@@ -2511,6 +2609,7 @@ class Session:
                             break
                     batches = page.options("ddlScheduleCourse")
                     if any(is_season_batch(t, bot.s.batches) for _, t in real_options(batches)):
+                        dates_here = True
                         bot.saw_season()
                     season_list = clearly_this_season(batches, bot.s.batches)
                     batch_list = [option for option in batch_candidates(batches, target, season_list)
@@ -2557,6 +2656,8 @@ class Session:
                 continue
             break
         if not found:
+            if not dates_here:
+                bot.dates_missing()
             if bot.season_seen is None:
                 raise NotOpen("the snow courses are not listed yet" + listing(page, "ddlCourse"))
             if no_seats:
@@ -2711,22 +2812,36 @@ class Session:
         return values, files
 
     def submit(self, target, sel, values, files):
+        """Send the final form. A confirmed booking keeps the others holding (booking_in_doubt) until
+        record_booking has settled it; any other outcome lets them go on at once."""
+        try:
+            return self._submit(target, sel, values, files)
+        except BaseException:
+            self.bot.booking_in_doubt(self.phone, False)
+            raise
+
+    def _submit(self, target, sel, values, files):
         bot = self.bot
         page = sel.page
 
         request_started = False
 
         def note_request_started():
+            # also called when a redirect of the sent form opens a new connection: once the form is on its
+            # way, stopping no longer blocks reading its receipt
             nonlocal request_started
-            if bot.stop.is_set():
+            if bot.stop.is_set() and not request_started:
                 raise Cancelled()
             request_started = True
 
         bot.mark_submitting(self.phone, target)
         try:
-            bot.log.info(f"{self.who}SUBMITTING {target.label}: {sel}")
+            # a held form goes out several times a second during the rush: say so at most every 30 s
+            bot.note(self.who, f"SUBMITTING {target.label}: {sel}", every=30)
             resp = self.postback(page, "", values, files=files, timeout=bot.opt["submitTimeoutSec"],
                                  on_start=note_request_started)
+            if resp.redirects:  # the site's sign of success: the others hold their next form (maxBookings)
+                bot.booking_in_doubt(self.phone, True)
             resp = self.reload_receipt(resp)
             saved = bot.save_page(self.who, f"submit-{target.label}", resp,
                                   keep=20 if bot.opt["holdForm"] else None)
@@ -2751,6 +2866,13 @@ class Session:
         except UploadInterrupted as exc:
             bot.clear_submitting(self.phone)
             raise NotSent(f"the final form did not finish uploading: {exc}") from exc
+        except SessionLost:
+            # The site answered the final form itself (no redirect) by rejecting its page state - viewstate
+            # MAC, event validation or corrupt state, which ASP.NET checks before any of the page's own
+            # code runs (an app restart overnight invalidates held forms this way) - or the form was
+            # never sent. Either way nothing was processed: fill the form in afresh.
+            bot.clear_submitting(self.phone)
+            raise
         except Exception as exc:
             if not request_started:
                 bot.clear_submitting(self.phone)
@@ -2768,14 +2890,18 @@ class Session:
         if not (resp.redirects and resp.complete and receipt_failed):
             return resp
         started = time.monotonic()
-        while time.monotonic() - started < bot.opt["stepRetrySec"] and not bot.stop.is_set():
+        # Kept up even while stopping (Ctrl+C, or bot.maxBookings reached by another choice): it only reads
+        # the result of a form already sent. A second Ctrl+C still quits at once.
+        while time.monotonic() - started < bot.opt["stepRetrySec"]:
             bot.note(self.who, f"the final form was taken, but its receipt page failed to load "
                      f"(HTTP {resp.status}); loading the receipt again")
-            bot.sleep(bot.step_delay())
+            delay = bot.step_delay()
             if bot.stop.is_set():
-                break
+                time.sleep(delay)
+            else:
+                bot.sleep(delay)
             try:
-                again = self.http.send("GET", resp.url)
+                again = self.http.send("GET", resp.url, settle=True)
             except Transient:
                 continue
             if again.complete and again.status < 500 and again.status not in SERVER_BUSY_STATUSES:
@@ -2784,7 +2910,7 @@ class Session:
         return resp
 
     def judge_submit(self, resp, target, sel, saved, sent_files):
-        self.http.check_destination(resp.url)
+        self.http.check_origin(resp.url)
         if not resp.complete:
             raise Uncertain("the final HTTP error response ended before its body could be verified")
         parsed = urllib.parse.urlparse(resp.url)
@@ -2861,8 +2987,8 @@ class Session:
             raise RateLimited("submit was rate limited: HTTP 429", response_retry_after(resp))
         if refused_before_processing(resp):
             title = resp.title()
-            raise RateLimited("the site was too busy to take the final form: HTTP 503"
-                              + (f" ({title[:80]})" if title else ""), response_retry_after(resp))
+            raise RateLimited(f"the site was too busy to take the final form: HTTP {resp.status}"
+                              + (f" ({title[:80]})" if title else ""), refused_retry_after(resp))
         if resp.status >= 400 or not resp.is_aspx:
             if has_any(resp.body.lower(), VIEWSTATE_ERRORS):
                 raise SessionLost("the site rejected our page state on submit")
@@ -2895,44 +3021,111 @@ class Session:
         # The site turning the final form away unprocessed (IIS 503.2 "too busy", 429) or a failure
         # before any of it was sent: send the same filled form again rather than redoing every step.
         # holdForm: a "no seats" answer to the final form also keeps the filled form and sends it again
-        # (the site checks seats when the form arrives), at bot.hold_interval() - fast around opening.
-        prepared = time.monotonic()
+        # (the site checks seats when the form arrives), at bot.hold_interval() - fast during the rush.
+        # Meanwhile a FormRefresher fills the form in afresh on a separate session when
+        # bot.hold_refresh_due() says so; the held form is replaced only by a complete fresh one.
+        filled_at = now_ist()
+        refresher = FormRefresher(self, target) if hold else None
         busy_since = last_sent = retry_at = None
         jitter = 1.0
-        while True:
-            while not bot.stop.is_set():  # re-evaluated every second, so the fast phase starts on time
-                if retry_at is not None:
-                    left = retry_at - time.monotonic()
-                elif last_sent is None:
-                    left = 0
-                else:
-                    left = last_sent + bot.hold_interval() * jitter - time.monotonic()
-                if left <= 0:
-                    break
-                bot.sleep(min(left, 1.0))
-            if bot.stop.is_set():
-                raise Cancelled()
-            last_sent, retry_at = time.monotonic(), None
-            try:
-                return self.submit(target, sel, values, files)
-            except (RateLimited, NotSent) as exc:
-                busy_since = busy_since if busy_since is not None else last_sent
-                budget = bot.opt["stepRetrySec"]
-                if not hold and (budget <= 0 or time.monotonic() - busy_since >= budget):
-                    raise
-                bot.note(self.who, f"{target.label}: {exc}; sending the same final form again")
-                retry_at = time.monotonic() + bot.step_delay(exc)
-            except (TargetFull, NotOpen) as exc:
-                if not hold:
-                    raise
-                busy_since = None
-                why = f"{target.when()} has no seats right now ({exc}); the filled form is kept and sent again"
-                with bot.lock:
-                    bot.blocked[target.index] = {"why": why, "kind": "pending"}
-                bot.note(self.who, f"{target.label}: {why}")
-                if bot.hold_refresh_allowed() and time.monotonic() - prepared >= HOLD_REFRESH_SEC:
-                    raise TargetFull(f"{target.when()}: filling the held form in afresh")
-                jitter = random.uniform(0.85, 1.15)
+        try:
+            while True:
+                while not bot.stop.is_set():  # re-evaluated every second, so the fast phase starts on time
+                    if retry_at is not None:
+                        left = retry_at - time.monotonic()
+                    elif last_sent is None:
+                        left = 0
+                    else:
+                        left = last_sent + bot.hold_interval() * jitter - time.monotonic()
+                    if left <= 0:
+                        break
+                    bot.sleep(min(left, 1.0))
+                if bot.stop.is_set():
+                    raise Cancelled()
+                if refresher is not None:
+                    fresh = refresher.take()
+                    if fresh is not None:
+                        session, sel, values, files, filled_at = fresh
+                        self.http, self.static = session.http, session.static
+                        bot.note(self.who, f"{target.label}: now sending a freshly filled form ({sel})")
+                    elif not refresher.running() and bot.hold_refresh_due(filled_at):
+                        filled_at = now_ist()
+                        refresher.start()
+                bot.wait_while_in_doubt(self.phone)  # another choice's form is probably booked (maxBookings)
+                if bot.stop.is_set():
+                    raise Cancelled()
+                last_sent, retry_at = time.monotonic(), None
+                try:
+                    return self.submit(target, sel, values, files)
+                except (RateLimited, NotSent) as exc:
+                    busy_since = busy_since if busy_since is not None else last_sent
+                    budget = bot.opt["stepRetrySec"]
+                    if not hold and (budget <= 0 or time.monotonic() - busy_since >= budget):
+                        raise
+                    bot.note(self.who, f"{target.label}: {exc}; sending the same final form again")
+                    retry_at = time.monotonic() + bot.step_delay(exc)
+                except (TargetFull, NotOpen) as exc:
+                    if not hold:
+                        raise
+                    busy_since = None
+                    why = f"{target.when()} has no seats right now ({exc}); the filled form is kept and sent again"
+                    with bot.lock:
+                        bot.blocked[target.index] = {"why": why, "kind": "pending"}
+                    bot.note(self.who, f"{target.label}: {why}")
+                    jitter = random.uniform(0.85, 1.15)
+        finally:
+            if refresher is not None:
+                refresher.cancel()
+
+
+class FormRefresher:
+    """Fills a held form in afresh on a separate session in the background, so the held form keeps
+    being sent meanwhile. The fresh form is handed over only once it is complete and ready to send;
+    if the fresh fill-in fails for any reason the held form simply stays in use."""
+
+    def __init__(self, owner, target):
+        self.owner, self.target = owner, target
+        self.lock = threading.Lock()
+        self.cancelled = threading.Event()
+        self.thread = None
+        self.result = None
+
+    def running(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def start(self):
+        if self.running() or self.cancelled.is_set():
+            return
+        self.thread = threading.Thread(target=self._run, name=f"{threading.current_thread().name}-refresh",
+                                       daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        owner, bot, target = self.owner, self.owner.bot, self.target
+        try:
+            fresh = Session(bot, owner.phone, owner.who, cancel=self.cancelled)
+            sel = fresh.cascade(target)
+            if fresh.cancelled():
+                return
+            values, files = fresh.prepare_submit(target, sel)
+        except Cancelled:
+            return
+        except Exception as exc:  # the held form stays in use
+            if not (self.cancelled.is_set() or bot.stop.is_set()):
+                bot.note(owner.who, f"{target.label}: filling the form in afresh did not work this time "
+                                    f"({exc}); the held form stays in use")
+            return
+        with self.lock:
+            if not self.cancelled.is_set():
+                self.result = (fresh, sel, values, files, now_ist())
+
+    def take(self):
+        with self.lock:
+            result, self.result = self.result, None
+        return result
+
+    def cancel(self):
+        self.cancelled.set()
 
 
 # ---------------------------------------------------------------------------
@@ -3193,6 +3386,7 @@ class Bot:
         self.log = log or Log()
         self.targets, self.phones = settings.targets, settings.phones
         self.opens_at = settings.opens_at or now_ist()
+        self.direct_form = None  # whether the site serves the admission form straight from its address
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.state = State(self.out_dir / "state.json", enabled=not dry_run)
@@ -3202,6 +3396,9 @@ class Bot:
         self.pending_questions = {}
         self.failures = []
         self.season_seen = None
+        self.in_doubt = set()            # phones whose final form was redirected and is being confirmed
+        self.dates_missing_since = None  # wall time this season's course dates were first found missing
+        self.rush_started = None         # wall time they came back: a rush of its own starts then
         self.attention_seen = {}
         self.refusals = {}
         self.parent_fallback = set()
@@ -3284,24 +3481,49 @@ class Bot:
             delay = max(delay, min(10.0, error.retry_after))
         return min(10.0, delay)
 
-    def hold_interval(self):
-        """Pause between sends of a held form: holdResendSec from HOLD_RUSH_BEFORE_SEC before the
-        announced opening until HOLD_RUSH_AFTER_SEC after it (or always, with no opening time),
-        holdIdleResendSec otherwise."""
-        opens = self.s.opens_at
-        if opens is not None:
-            now = now_ist()
-            if not (opens - timedelta(seconds=HOLD_RUSH_BEFORE_SEC) <= now
-                    <= opens + timedelta(seconds=HOLD_RUSH_AFTER_SEC)):
-                return self.opt["holdIdleResendSec"]
-        return self.opt["holdResendSec"]
+    def in_dates_rush(self):
+        """The HOLD_RUSH_AFTER_SEC after this season's course dates came back on the site (saw_season)."""
+        started = self.rush_started
+        return started is not None and started <= now_ist() <= started + timedelta(seconds=HOLD_RUSH_AFTER_SEC)
 
-    def hold_refresh_allowed(self):
-        """A held form is filled in afresh only after the fast window around opening has passed, so a
-        form filled in before opening is never dropped (the site emptied its course list before the
-        12 Nov opening, and a fresh fill-in might then find nothing)."""
+    def in_rush(self):
+        """The rush: from HOLD_RUSH_BEFORE_SEC before the announced opening until HOLD_RUSH_AFTER_SEC
+        after it, or after the course dates came back on the site - or always, when there is no
+        announced opening time."""
+        if self.in_dates_rush():
+            return True
         opens = self.s.opens_at
-        return opens is None or now_ist() > opens + timedelta(seconds=HOLD_RUSH_AFTER_SEC)
+        if opens is None:
+            return True
+        return (opens - timedelta(seconds=HOLD_RUSH_BEFORE_SEC) <= now_ist()
+                <= opens + timedelta(seconds=HOLD_RUSH_AFTER_SEC))
+
+    def hold_interval(self):
+        """Pause between sends of a held form: holdResendSec during the rush, holdIdleResendSec otherwise."""
+        return self.opt["holdResendSec"] if self.in_rush() else self.opt["holdIdleResendSec"]
+
+    def hold_refresh_due(self, filled_at):
+        """Whether a held form - filled in, or last refreshed, at wall time `filled_at` - should be filled
+        in afresh in the background. The held form keeps being sent meanwhile and is replaced only by a
+        complete fresh one, so a refresh that finds nothing (the site emptied its course list before
+        the 12 Nov opening) loses nothing. Refreshed once HOLD_PREOPEN_REFRESH_SEC before opening, every
+        HOLD_RUSH_REFRESH_SEC during the rush after opening, every HOLD_REFRESH_SEC after the rush (or
+        always, with no opening time), and never earlier before opening."""
+        now = now_ist()
+        age = (now - filled_at).total_seconds()
+        if self.in_dates_rush():
+            return age >= HOLD_RUSH_REFRESH_SEC
+        opens = self.s.opens_at
+        if opens is None:
+            return age >= HOLD_REFRESH_SEC
+        preopen = opens - timedelta(seconds=HOLD_PREOPEN_REFRESH_SEC)
+        if now < preopen:
+            return False
+        if now < opens:
+            return filled_at < preopen and age >= 60
+        if now <= opens + timedelta(seconds=HOLD_RUSH_AFTER_SEC):
+            return age >= HOLD_RUSH_REFRESH_SEC
+        return age >= HOLD_REFRESH_SEC
 
     def step_delay(self, error=None):
         """Pause before resending one failed step: short and steady, or the server's Retry-After (capped)."""
@@ -3311,7 +3533,21 @@ class Bot:
         return min(10.0, delay)
 
     def poll_delay(self):
-        return min(10.0, self.opt["pollSec"])
+        if self.in_rush():
+            return min(10.0, self.opt["pollSec"])
+        return min(60.0, self.opt["pollIdleSec"])
+
+    def poll_wait(self):
+        """Wait before looking again for a choice that is not listed; re-evaluated every second, so
+        quick polling starts on time when the rush begins. A random spread keeps the choices from
+        looking all at once, so between them the site is looked at every few seconds."""
+        started = time.monotonic()
+        spread = random.uniform(0.5, 1.5)
+        while not self.stop.is_set():
+            left = started + self.poll_delay() * spread - time.monotonic()
+            if left <= 0:
+                return
+            self.sleep(min(left, 1.0))
 
     def note(self, who, message, every=60, warning=False):
         with self.lock:
@@ -3377,7 +3613,39 @@ class Bot:
             return " | ".join([f"booked {len(self.booked)}/{len(self.targets)}"] +
                               [f"{key}: {value}" for key, value in sorted(self.status.items())])
 
+    def booking_in_doubt(self, phone, doubt):
+        """A choice's final form was redirected - the site's sign of success - and its receipt is being
+        confirmed. With bot.maxBookings the other choices hold their next final form meanwhile, so one
+        booking does not become several while its receipt loads (17 Nov rehearsal at 95% "too busy":
+        up to 5 bookings landed in the seconds the first receipt took)."""
+        if not self.opt["maxBookings"]:
+            return
+        with self.lock:
+            if doubt:
+                self.in_doubt.add(phone)
+            else:
+                self.in_doubt.discard(phone)
+
+    def wait_while_in_doubt(self, phone, limit=60.0):
+        """Hold this choice's next final form while another choice's redirected form is being confirmed
+        (at most `limit` seconds: a receipt that never confirms must not stall the others for good)."""
+        started = time.monotonic()
+        while not self.stop.is_set() and time.monotonic() - started < limit:
+            with self.lock:
+                others = bool(self.in_doubt - {phone})
+            if not others:
+                return
+            self.sleep(0.05)
+
+    def enough_booked(self):
+        """bot.maxBookings bookings are confirmed (never in a dry run, which checks every choice)."""
+        limit = self.opt["maxBookings"]
+        with self.lock:
+            return not self.dry_run and limit > 0 and len(self.booked) >= limit
+
     def finished(self):
+        if self.enough_booked():
+            return True
         with self.lock:
             return all(target.index in self.booked for target in self.targets)
 
@@ -3459,9 +3727,27 @@ class Bot:
             self.guardian_required.add(target.index)
 
     def saw_season(self):
+        """This season's course dates are listed. If they had been missing for a while, treat this as the
+        release: on 12 Nov 2026 the dates appeared together with the seats at 10:00, and between releases
+        (13 Nov onwards) the site lists the courses with no dates at all."""
+        now = now_ist()
         with self.lock:
             if self.season_seen is None:
                 self.season_seen = time.monotonic()
+            missing = self.dates_missing_since
+            self.dates_missing_since = None
+            back = missing is not None and (now - missing).total_seconds() >= DATES_MISSING_MIN_SEC
+            if back:
+                self.rush_started = now
+        if back:
+            self.log.banner([f"The course dates are back on the site ({now:%H:%M:%S}) - going full speed for "
+                             f"{HOLD_RUSH_AFTER_SEC // 60} minutes."])
+
+    def dates_missing(self):
+        """No course dates of this season are listed at all."""
+        with self.lock:
+            if self.dates_missing_since is None:
+                self.dates_missing_since = now_ist()
 
     def saw_seats(self, target):
         with self.lock:
@@ -3483,6 +3769,33 @@ class Bot:
             self.log.warn("Please answer 'booked' or 'not booked'.")
         return None
 
+    def confirm_saved_submissions(self):
+        """Ask right at startup - while the person is at the terminal - about final forms an earlier run
+        left without a confirmed reply (for example when it was stopped while they were on their way),
+        instead of when the workers start, which may be an hour later. Unanswered ones stay saved."""
+        if self.dry_run or not self.state.enabled:
+            return
+        self.state.acquire()
+        try:
+            self._restore()
+            if not self.pending:
+                return
+            lookup = {target_key(t): t for t in self.targets}
+            self.log.warn(f"{len(self.pending)} final form(s) sent before the last stop have no confirmed reply. "
+                          "Check the applicant's email for a payment link, then answer for each.")
+            for phone, key in list(self.pending.items()):
+                target = lookup.get(key)
+                if target is None or target.index in self.booked:
+                    continue
+                answer = self.confirmation_handler(phone, target,
+                                                   "a final form sent before the last stop has no confirmed reply")
+                if answer == "booked":
+                    self.record_booking(phone, target, {"userConfirmed": True, "message": "User verified the booking."})
+                elif answer == "not-booked":
+                    self.clear_submitting(phone)
+        finally:
+            self.state.release()
+
     def confirm_uncertain(self, phone, target, reason):
         question = {"phone": phone, "target": target, "reason": reason,
                     "event": threading.Event(), "answer": None}
@@ -3501,6 +3814,12 @@ class Bot:
         return question["answer"]
 
     def record_booking(self, phone, target, info):
+        try:
+            self._record_booking(phone, target, info)
+        finally:
+            self.booking_in_doubt(phone, False)  # after any stop for bot.maxBookings is set
+
+    def _record_booking(self, phone, target, info):
         with self.lock:
             key = target_key(target)
             if target.index in self.booked:
@@ -3529,6 +3848,11 @@ class Bot:
                          "Watch the applicant's email for the payment link." if not self.dry_run else "Nothing submitted."])
         if not self.dry_run and self.opt["notify"]:
             threading.Thread(target=notify, args=("IISM booking", target.label), daemon=True).start()
+        if self.enough_booked() and not self.stop.is_set():
+            self.log.banner([f"{len(self.booked)} booking(s) confirmed - stopping the other choices "
+                             f"(bot.maxBookings = {self.opt['maxBookings']}).",
+                             "Pay through the email link within 12 hours."])
+            self.stop.set()
 
     def run(self):
         workers = []
@@ -3545,6 +3869,10 @@ class Bot:
         try:
             self.state.acquire()
             self._restore()
+            if self.enough_booked():
+                self.log.info(f"{len(self.booked)} booking(s) already confirmed - bot.maxBookings is "
+                              f"{self.opt['maxBookings']}, so nothing more is tried.")
+                return self.bookings
             todo = [t for t in self.targets if t.index not in self.booked]
             waiting = list(todo)
             if self.opt["parallel"]:
@@ -3593,7 +3921,8 @@ class Bot:
                     last_status = time.monotonic()
                     self.log.info("status: " + self.status_line())
         except KeyboardInterrupt:
-            self.log.warn("Stopping; pending submissions remain saved for confirmation on restart.")
+            self.log.warn("Stopping: waiting for the replies to forms already on their way (press Ctrl+C again "
+                          "to quit at once; any still unanswered stay saved and are asked about on restart).")
             self.stop.set()
         except ConfigError as exc:
             self.failures.append(str(exc))
@@ -3650,7 +3979,7 @@ class Worker(threading.Thread):
                     with bot.lock:
                         bot.blocked[target.index] = {"why": str(exc), "kind": "pending"}
                     bot.note(session.who, f"{target.label}: {exc}; keeping this preference pending")
-                    bot.sleep(bot.poll_delay())
+                    bot.poll_wait()
                 except Refused as exc:
                     failures += 1
                     if bot.number_refused(phone, exc.what):
@@ -3751,6 +4080,8 @@ def print_summary(bot):
     for t in bot.targets:
         if t.index not in bot.booked:
             why = bot.blocked.get(t.index, {}).get("why", "")
+            if bot.enough_booked():
+                why = f"not tried further: bot.maxBookings is {bot.opt['maxBookings']}"
             lines.append(f"{'not booked':<16} {t.label:<16} {t.when():<28} {why[:60]}")
     used = [mask(p) for p, st in bot.phone_state.items() if st == "used"]
     unused = [mask(p) for p, st in bot.phone_state.items() if st in ("free", "busy")]
@@ -3925,6 +4256,7 @@ def main(argv=None):
         if settings.opt["preventSleep"]:
             awake = keep_awake()
         describe_plan(settings, log, args.dry_run)
+        bot.confirm_saved_submissions()
         if not bot.finished() and not args.now:
             wait_for_opening(settings, log, bot.stop)
         if not bot.finished():
