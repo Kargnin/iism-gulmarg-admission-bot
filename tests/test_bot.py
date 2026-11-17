@@ -9,18 +9,21 @@ a copy of the real site's pages and flow.
 import contextlib
 import copy
 import hashlib
+import http.client
 import importlib.util
 import io
 import json
 import os
+import random
 import re
 import shutil
+import socket
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -34,6 +37,8 @@ spec.loader.exec_module(bot)
 
 FAST = {"parallel": True, "notify": False, "preventSleep": False, "startEarlySec": 0, "pollSec": 0.1,
         "requestTimeoutSec": 2, "submitTimeoutSec": 2, "retryDelaySec": 0.01, "maxRetryDelaySec": 0.05,
+        "stepRetrySec": 1.0, "stepRetryDelaySec": 0.01, "holdResendSec": 0.05, "holdIdleResendSec": 0.05,
+        "pollIdleSec": 0.1, "directForm": False,  # most tests follow mobile verification and the terms page
         "maxRejections": 3, "rejectedRetrySec": 0.05, "statusEverySec": 999}
 PHONES = ["9000000011", "9000000012", "9000000013"]
 
@@ -102,6 +107,26 @@ class Matching(unittest.TestCase):
     def test_prefers_day_first_reading(self):
         options = [("1", "01/03/2027 To 14/03/2027"), ("2", "03/01/2027 To 16/01/2027")]
         self.assertEqual(bot.match_batch(options, target("G2 Basic"))[0], "2")
+
+    def test_one_wrong_year_in_this_seasons_list_is_a_typo(self):
+        """12 Nov 2026: the live list showed the 2027 G4 batch as "31 Jan to 13 Feb 2026"."""
+        batches = bot.load_season({}, Path("."))[0]
+        live = ["1st course from 20 Dec 2026 to 02 Jan 2027", "2nd course from 03rd Jan to 16 Jan 2027",
+                "3rd course from 17 Jan to 30 Jan 2027", "4th course from 31 Jan to 13 Feb 2026",
+                "5th course from 14 Feb to 27 Feb 2027", "7th course from 28 Feb to 13 Mar 2027"]
+        options = [("0", "Select Schedule Course")] + [(str(n), text) for n, text in enumerate(live, 1)]
+        self.assertTrue(bot.clearly_this_season(options, batches))
+        for n, label in enumerate(["G1 Basic", "G2 Basic", "G3 Basic", "G4 Basic", "G5 Basic", "G6 Basic"], 1):
+            self.assertEqual(bot.match_batch(options, target(label), season_list=True), (str(n), live[n - 1]))
+        self.assertIsNone(bot.match_batch(options, target("G4 Basic")))  # without the season context
+        # last season's list holds the very same "31 Jan to 13 Feb 2026" text, and must not match
+        last_season = ["1st course from 20 Dec 2025 to 02 Jan 2026", "2nd course from 03rd Jan to 16 Jan 2026",
+                       "3rd course from 17 Jan to 30 Jan 2026", "4th course from 31 Jan to 13 Feb 2026",
+                       "5th course from 14 Feb to 27 Feb 2026", "7th course from 28 Feb to 13 Mar 2026"]
+        old = [("0", "Select Schedule Course")] + [(str(n), text) for n, text in enumerate(last_season, 1)]
+        self.assertFalse(bot.clearly_this_season(old, batches))
+        for label in ("G1 Basic", "G3 Basic", "G4 Basic", "G6 Basic"):
+            self.assertIsNone(bot.match_batch(old, target(label), season_list=False), label)
 
     def test_explicit_end_date_uses_parsed_written_date_spans(self):
         g1 = target("G1 Basic")
@@ -962,6 +987,143 @@ def offline_bot():
                    log=bot.Log(echo=False))
 
 
+class HeldFormTiming(unittest.TestCase):
+    def test_rush_window_pacing_and_background_refresh_schedule(self):
+        instance = offline_bot()
+        instance.opt.update(holdResendSec=0.1, holdIdleResendSec=30, pollSec=1, pollIdleSec=30)
+        opens = datetime(2026, 11, 13, 10, 0, tzinfo=bot.IST)
+        instance.s.opens_at = opens
+        pacing = [  # (time, pause between sends of a held form, pause between looks for an unlisted choice)
+            (opens - timedelta(minutes=10), 30, 30),
+            (opens - timedelta(seconds=59), 0.1, 1),
+            (opens + timedelta(minutes=59), 0.1, 1),
+            (opens + timedelta(minutes=61), 30, 30),
+        ]
+        for moment, pause, look in pacing:
+            with self.subTest(moment=moment.time()), mock.patch.object(bot, "now_ist", return_value=moment):
+                self.assertEqual(instance.in_rush(), pause == 0.1)
+                self.assertEqual(instance.hold_interval(), pause)
+                self.assertEqual(instance.poll_delay(), look)
+        refresh = [  # (time, held form filled in or last refreshed at, background refresh due)
+            (opens - timedelta(minutes=30), opens - timedelta(hours=2), False),   # long before opening: never
+            (opens - timedelta(minutes=4), opens - timedelta(minutes=50), True),  # once, 5 minutes before
+            (opens - timedelta(minutes=4), opens - timedelta(minutes=4, seconds=30), False),  # filled just now
+            (opens - timedelta(minutes=1), opens - timedelta(minutes=4), False),  # already refreshed
+            (opens + timedelta(minutes=1), opens - timedelta(minutes=4), True),   # rush: every 2 minutes
+            (opens + timedelta(minutes=1), opens - timedelta(seconds=30), False),
+            (opens + timedelta(minutes=70), opens + timedelta(minutes=58), False),  # after it: every 15
+            (opens + timedelta(minutes=70), opens + timedelta(minutes=54), True),
+        ]
+        for moment, filled, due in refresh:
+            with self.subTest(moment=moment.time(), filled=filled.time()), \
+                    mock.patch.object(bot, "now_ist", return_value=moment):
+                self.assertEqual(instance.hold_refresh_due(filled), due)
+        instance.s.opens_at = None
+        self.assertTrue(instance.in_rush())
+        self.assertEqual(instance.hold_interval(), 0.1)
+        self.assertEqual(instance.poll_delay(), 1)
+
+
+class MaxBookingsOption(unittest.TestCase):
+    def test_max_bookings_must_be_a_whole_number_of_zero_or_more(self):
+        for value, ok in ((0, True), (1, True), (3, True), (-1, False), (1.5, False), ("1", False), (True, False)):
+            with self.subTest(value=value):
+                cfg = make_config(Path(tempfile.mkdtemp()), PHONES[:1], ["G2 Basic"], bot={"maxBookings": value})
+                _, errors, _ = bot.parse_settings(cfg, None)
+                self.assertEqual(not any("maxBookings" in e for e in errors), ok, errors)
+
+
+class DatesBackRush(unittest.TestCase):
+    def test_dates_back_after_being_missing_start_a_rush_of_their_own(self):
+        instance = offline_bot()
+        instance.opt.update(holdResendSec=0.1, holdIdleResendSec=30)
+        instance.s.opens_at = datetime(2026, 11, 16, 10, 0, tzinfo=bot.IST)
+        now = datetime(2026, 11, 15, 14, 0, tzinfo=bot.IST)
+        with mock.patch.object(bot, "now_ist", return_value=now):
+            instance.dates_missing()
+            self.assertFalse(instance.in_rush())
+        with mock.patch.object(bot, "now_ist", return_value=now + timedelta(seconds=10)):
+            instance.saw_season()  # back after 10 s: a blip, not a release
+            self.assertIsNone(instance.rush_started)
+            instance.dates_missing()
+        later = now + timedelta(hours=3)
+        with mock.patch.object(bot, "now_ist", return_value=later):
+            instance.saw_season()
+            self.assertEqual(instance.rush_started, later)
+            self.assertTrue(instance.in_rush())
+            self.assertEqual(instance.hold_interval(), 0.1)
+        with mock.patch.object(bot, "now_ist", return_value=later + timedelta(minutes=3)):
+            self.assertTrue(instance.hold_refresh_due(later))
+        with mock.patch.object(bot, "now_ist", return_value=later + timedelta(minutes=61)):
+            self.assertFalse(instance.in_rush())
+            self.assertEqual(instance.hold_interval(), 30)
+
+
+class WakeOnDates(unittest.TestCase):
+    def test_choices_waiting_to_look_again_go_at_once_when_the_dates_come_back(self):
+        instance = offline_bot()
+        instance.opt.update(pollSec=30, pollIdleSec=30)  # a long wait, unless woken
+        instance.dates_missing()
+        waiter = threading.Thread(target=instance.poll_wait)
+        started = time.monotonic()
+        waiter.start()
+        time.sleep(0.2)
+        instance.saw_season()  # another choice sees the dates
+        waiter.join(2)
+        self.assertFalse(waiter.is_alive())
+        self.assertLess(time.monotonic() - started, 1.5)
+
+
+class RefusedBeforeProcessing(unittest.TestCase):
+    @staticmethod
+    def page(status, body, **headers):
+        return bot.Page("https://admission.iismgulmarg.in/admission_form.aspx", status, body, headers=headers)
+
+    def test_only_replies_sent_before_the_sites_code_ran_count(self):
+        handled_by_page = mock_site.IIS_500_BEFORE_HANDLER.replace("Not yet determined",
+                                                                   "PageHandlerFactory-Integrated-4.0")
+        cases = [
+            (self.page(503, mock_site.IIS_503_2), True),           # IIS concurrent request limit
+            (self.page(503, mock_site.IIS_503), True),             # HTTP.sys's own page (seen 5 times on 12 Nov)
+            (self.page(503, "<html><body>busy</body></html>", Server="Microsoft-HTTPAPI/2.0"), True),
+            (self.page(500, mock_site.IIS_500_BEFORE_HANDLER), True),
+            (self.page(403, "<html><head><title>IIS 10.0 Detailed Error - 403.502 - Forbidden</title></head>"
+                            "<body>Dynamic IP Restriction limit reached.</body></html>"), True),
+            (self.page(503, mock_site.PROXY_503), False),          # may come after processing
+            (self.page(500, mock_site.YSOD), False),               # the site's own code failed
+            (self.page(500, handled_by_page), False),
+            (self.page(403, mock_site.IIS_403), False),
+            (self.page(200, mock_site.IIS_503), False),
+        ]
+        for page, expected in cases:
+            with self.subTest(status=page.status, title=page.title()):
+                self.assertEqual(bot.refused_before_processing(page), expected)
+        self.assertEqual(bot.refused_retry_after(cases[4][0]), 2.0)
+
+
+class ConnectTimeout(unittest.TestCase):
+    def test_a_new_connection_gets_a_short_timeout_and_the_request_its_full_one(self):
+        """13 Nov 2026, 10:00: opening a connection hung for ~25 s before the OS gave up."""
+        server, url = mock_site.start(mock_site.Site(seed=3))
+        seen = []
+        real = socket.create_connection
+
+        def record(address, timeout=None, *args, **kwargs):
+            sock = real(address, timeout, *args, **kwargs)
+            seen.append(timeout)
+            return sock
+
+        try:
+            with mock.patch.object(socket, "create_connection", record):
+                page = bot.Http(url, 30, bot.Log(echo=False), threading.Event()).get("Admission_instructions.aspx")
+                bot.Http(url, 2, bot.Log(echo=False), threading.Event()).get("Admission_instructions.aspx")
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(page.status, 200)
+        self.assertEqual(seen, [bot.CONNECT_TIMEOUT_SEC, 2])
+
+
 class EndToEnd(unittest.TestCase):
     layout = "levels"
 
@@ -1018,6 +1180,355 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual({x["target"]: x["phone"] for x in instance.bookings},
                          {"G2 Basic": PHONES[0], "G3 Basic": PHONES[1]})
         self.assertNotIn(PHONES[2], self.site.used)
+
+    def busy_route(self, should_fail, body=mock_site.IIS_503_2):
+        """A _route that answers IIS 503.2 (too busy) whenever should_fail(method, page, values) says so."""
+        original = mock_site.Handler._route
+
+        def route(handler, method, page, query, values, files, url):
+            if page.endswith(".aspx") and should_fail(method, page, values):
+                return handler.send(503, body)
+            return original(handler, method, page, query, values, files, url)
+        return route
+
+    def test_server_errors_resend_only_the_failed_step(self):
+        """12 Nov 2026: the site answered most requests with 503 for 20 minutes. Every step - mobile,
+        terms, course, level, seats, state, date of birth and the final form - is sent again in the
+        same session instead of starting over at mobile verification."""
+        failed = {}
+
+        def twice_per_step(method, page, values):
+            if page == "admissionformsuccess.aspx":
+                return False
+            key = (method, page, values.get("__EVENTTARGET", ""), bool(values.get("btnSubmit")))
+            failed[key] = failed.get(key, 0) + 1
+            return failed[key] <= 2
+
+        with mock.patch.object(mock_site.Handler, "_route", self.busy_route(twice_per_step)):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(self.site.applications), 1)
+        self.assertEqual(len({item["sid"] for item in self.site.request_log}), 1)  # one visit: never started over
+        steps_failed = {key[2] for key, count in failed.items() if count > 2}
+        self.assertTrue({"ddlCourse", "ddlCourseLevel", "ddlScheduleCourse"} <= steps_failed, failed)
+        self.assertGreaterEqual(failed[("POST", "admission_form.aspx", "", True)], 3)  # final form resent
+
+    def test_held_form_is_sent_again_until_seats_open(self):
+        """Kargnin's finding, 12 Nov 2026: the site checks seats when the final form arrives. With no
+        seats shown, the form is filled in anyway and sent again, so one request books once seats open."""
+        key = self.key("G2")
+        self.site.seats[key] = 0
+        timer = threading.Timer(0.6, lambda: self.site.seats.__setitem__(key, 2))
+        timer.start()
+        try:
+            instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        finally:
+            timer.cancel()
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(self.site.applications), 1)
+        submits = [item for item in self.site.request_log if item["submit"]]
+        self.assertGreater(len(submits), 2)  # "seat not available" answers before the booking
+        self.assertEqual(len({item["sid"] for item in submits}), 1)  # the same filled form was kept
+
+    def test_final_form_refused_before_the_sites_code_ran_is_resent_without_asking(self):
+        """12 Nov 2026: besides IIS's 503.2 page the site gave HTTP.sys's own "Service Unavailable" 5
+        times. Neither that nor an IIS error raised before any handler ran means the form was processed."""
+        replies = [(503, mock_site.IIS_503), (500, mock_site.IIS_500_BEFORE_HANDLER), (503, mock_site.IIS_503)]
+        original = mock_site.Handler._route
+
+        def route(handler, method, page, query, values, files, url):
+            if method == "POST" and values.get("btnSubmit") and replies:
+                status, body = replies.pop(0)
+                return handler.send(status, body)
+            return original(handler, method, page, query, values, files, url)
+
+        def no_feedback(*args):
+            self.fail("a final form refused before the site's code ran must not need feedback")
+
+        with mock.patch.object(mock_site.Handler, "_route", route):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"], confirmation_handler=no_feedback)
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(replies, [])
+        self.assertEqual(len(self.site.applications), 1)
+
+    def test_visit_opens_the_form_straight_from_its_address(self):
+        """Kargnin's shortcut: a fresh visit opens admission_form.aspx?mobile=N directly (the live site
+        served it to a new session on 12 Nov, and forms filled in that way got "Seat Not Available" on
+        13 Nov) - 1 request instead of 5."""
+        instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], bot={"directForm": True})
+        self.assertEqual(len(instance.bookings), 2)
+        pages = {item["page"] for item in self.site.request_log}
+        self.assertNotIn("admission_instructions.aspx", pages)
+        self.assertNotIn("admission_criteria.aspx", pages)
+        self.assertTrue(instance.direct_form)
+
+    def test_form_not_served_directly_falls_back_to_mobile_and_terms(self):
+        self.site.direct_form = False
+        instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], bot={"directForm": True})
+        self.assertEqual(len(instance.bookings), 2)
+        self.assertIs(instance.direct_form, False)
+        self.assertIn("admission_criteria.aspx", {item["page"] for item in self.site.request_log})
+
+    def test_direct_form_off_goes_through_mobile_and_terms(self):
+        instance = self.run_with(PHONES[:1], ["G2 Basic"], bot={"directForm": False})
+        self.assertEqual(len(instance.bookings), 1)
+        self.assertIsNone(instance.direct_form)
+        self.assertIn("admission_criteria.aspx", {item["page"] for item in self.site.request_log})
+
+    def test_dates_coming_back_on_the_site_start_a_rush(self):
+        """Since 13 Nov 2026 the site lists the courses with no dates between releases; on 12 Nov the dates
+        appeared together with the seats. Dates that come back after being missing start a rush."""
+        hidden_until = time.time() + 1.0
+        for course in self.site.courses.values():
+            for batch in course["batches"]:
+                self.site.batch_opens[batch[0]] = hidden_until
+        with mock.patch.object(bot, "DATES_MISSING_MIN_SEC", 0.3):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"], bot={"directForm": True})
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertIsNotNone(instance.rush_started)
+        self.assertTrue(instance.in_rush())
+        self.assertIn("The course dates are back on the site", (self.out / "bot.log").read_text())
+
+    def test_held_form_is_refreshed_in_the_background_and_sent_meanwhile(self):
+        key = self.key("G2")
+        self.site.seats[key] = 0
+        sids = []
+        original = mock_site.Handler._route
+
+        def route(handler, method, page, query, values, files, url):
+            if method == "POST" and values.get("btnSubmit"):
+                sids.append(handler.sid)
+                if len(set(sids)) > 1:  # seats open once a freshly filled form is being sent
+                    self.site.seats[key] = 2
+            return original(handler, method, page, query, values, files, url)
+
+        with mock.patch.object(mock_site.Handler, "_route", route), \
+                mock.patch.object(bot, "HOLD_REFRESH_SEC", 0.3):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(self.site.applications), 1)
+        submit_sids = [item["sid"] for item in self.site.request_log if item["submit"]]
+        self.assertGreater(len(set(submit_sids)), 1)  # a freshly filled form took over
+        self.assertIn("now sending a freshly filled form", (self.out / "bot.log").read_text())
+
+    def test_a_refresh_that_finds_nothing_keeps_the_held_form(self):
+        """Before the 12 Nov opening the site emptied its course list; a refresh then finds nothing,
+        and the held form must stay in use."""
+        key = self.key("G2")
+        self.site.seats[key] = 0
+        submits = []
+        original = mock_site.Handler._route
+
+        def route(handler, method, page, query, values, files, url):
+            if method == "POST" and values.get("btnSubmit"):
+                submits.append(1)
+                if len(submits) == 1:
+                    self.site.opens_at = time.time() + 3600  # new visits find no snow courses
+                elif len(submits) == 30:
+                    self.site.opens_at = 0.0
+                    self.site.seats[key] = 2
+            return original(handler, method, page, query, values, files, url)
+
+        with mock.patch.object(mock_site.Handler, "_route", route), \
+                mock.patch.object(bot, "HOLD_REFRESH_SEC", 0.1):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(self.site.applications), 1)
+        submit_sids = {item["sid"] for item in self.site.request_log if item["submit"]}
+        self.assertEqual(len(submit_sids), 1)  # the held form was never replaced
+        self.assertIn("did not work this time", (self.out / "bot.log").read_text())
+
+    def test_max_bookings_stops_the_other_choices_after_the_first_booking(self):
+        """16 Nov 2026: the institute cancels multiple entries by one student. With bot.maxBookings 1 every
+        choice races for a seat and the first booking stops the rest."""
+        self.site.seats[self.key("G3")] = 0  # G3's form would be held and resent until the run stops
+        started = time.monotonic()
+        instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], bot={"maxBookings": 1})
+        self.assertLess(time.monotonic() - started, 5)  # stopped by the booking, not by the 8 s guard
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertTrue(instance.finished())
+        requests = self.site.requests
+        again = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], bot={"maxBookings": 1})
+        self.assertTrue(again.finished())
+        self.assertEqual(self.site.requests, requests)  # nothing more is tried once the limit is met
+
+    def test_redirected_final_form_holds_the_other_choices_while_its_receipt_loads(self):
+        """17 Nov rehearsal: while the first booking's receipt kept failing ("too busy"), other choices booked
+        too. With bot.maxBookings the others hold their next final form until that receipt settles."""
+        g3 = self.key("G3")
+        self.site.seats[g3] = 0  # G3's form is held and resent
+        self.site.fail_success_page = 25  # the receipt of G2's booking takes a while to load
+        receipts = []
+        original = mock_site.Handler._route
+
+        def route(handler, method, page, query, values, files, url):
+            if page == "admissionformsuccess.aspx":
+                receipts.append(1)
+                if len(receipts) == 3:  # G2's form was taken: now G3 could book too, if it kept sending
+                    self.site.seats[g3] = 2
+            return original(handler, method, page, query, values, files, url)
+
+        with mock.patch.object(mock_site.Handler, "_route", route):
+            instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], bot={"maxBookings": 1})
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(self.site.applications), 1)
+        self.assertGreater(len(receipts), 3)
+
+    def test_dry_run_checks_every_choice_whatever_max_bookings_says(self):
+        instance = run_bot(make_config(self.tmp, PHONES[:2], ["G2 Basic", "G3 Basic"], bot={"maxBookings": 1}),
+                           self.url, self.out, dry_run=True, timeout=8)
+        self.assertEqual(sorted(b["target"] for b in instance.bookings), ["G2 Basic", "G3 Basic"])
+
+    def saved_statuses(self):
+        return {item["status"] for item in json.loads((self.out / "state.json").read_text())["phones"].values()}
+
+    def test_stopping_while_a_final_form_is_on_its_way_keeps_its_reply(self):
+        """13 Nov 2026: Ctrl+C during the rush left 5 final forms unresolved although the site had answered
+        them "Seat Not Available". A reply that arrives while stopping is judged and settles the form."""
+        self.site.seats[self.key("G2")] = 0
+        holder = {}
+        original_init = bot.Bot.__init__
+        original_route = mock_site.Handler._route
+
+        def init(instance, *args, **kwargs):
+            original_init(instance, *args, **kwargs)
+            holder["bot"] = instance
+
+        def route(handler, method, page, query, values, files, url):
+            if method == "POST" and values.get("btnSubmit"):
+                holder["bot"].stop.set()  # Ctrl+C while this final form is on its way
+            return original_route(handler, method, page, query, values, files, url)
+
+        with mock.patch.object(bot.Bot, "__init__", init), mock.patch.object(mock_site.Handler, "_route", route):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertTrue(any(item["submit"] for item in self.site.request_log))
+        self.assertEqual(instance.pending, {})
+        self.assertNotIn("submitting", self.saved_statuses())
+
+    def later_run(self, answer, asked):
+        settings, errors, _ = bot.parse_settings(make_config(self.tmp, PHONES[:1], ["G2 Basic"]), None)
+        self.assertEqual(errors, [])
+        return bot.Bot(settings, self.out, base_url=self.url, log=bot.Log(echo=False),
+                       confirmation_handler=lambda phone, target, reason: asked.append(target.label) or answer)
+
+    def leave_a_send_unanswered(self):
+        self.site.crash_after_commit = 1
+        first = self.run_with(PHONES[:1], ["G2 Basic"], timeout=0.8, confirmation_handler=lambda *args: None)
+        self.assertEqual(len(first.pending), 1)
+
+    def test_unanswered_send_from_the_last_run_is_asked_about_at_startup(self):
+        """Asked when the bot starts (the person is at the terminal), not when its workers start an hour
+        later - an unanswered question then would hold that choice through the rush."""
+        self.leave_a_send_unanswered()
+        asked, requests = [], self.site.requests
+        later = self.later_run("not-booked", asked)
+        later.confirm_saved_submissions()
+        self.assertEqual(asked, ["G2 Basic"])
+        self.assertEqual(self.site.requests, requests)  # asked before anything is sent
+        self.assertEqual(later.pending, {})
+        self.assertNotIn("submitting", self.saved_statuses())
+        self.assertEqual(later.bookings, [])
+
+    def test_unanswered_send_confirmed_at_startup_is_recorded_as_booked(self):
+        self.leave_a_send_unanswered()
+        asked = []
+        later = self.later_run("booked", asked)
+        later.confirm_saved_submissions()
+        self.assertEqual(asked, ["G2 Basic"])
+        self.assertEqual([b["status"] for b in later.bookings], ["user-confirmed"])
+        self.assertTrue(later.finished())
+
+    def test_connection_broken_while_uploading_the_final_form_resends_it(self):
+        original_send = http.client.HTTPConnection.send
+        broken = []
+
+        def break_first_final_upload(connection, data):
+            if not broken and isinstance(data, (bytes, bytearray)) and b'name="btnSubmit"' in data:
+                broken.append(len(data))
+                raise BrokenPipeError(32, "Broken pipe")
+            return original_send(connection, data)
+
+        def no_feedback(*args):
+            self.fail("a final form that never finished uploading must not need feedback")
+
+        with mock.patch.object(http.client.HTTPConnection, "send", break_first_final_upload):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"], confirmation_handler=no_feedback)
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(broken), 1)
+        self.assertEqual(len(self.site.applications), 1)
+
+    def test_held_form_is_not_used_when_hold_is_off(self):
+        self.site.seats[self.key("G2")] = 0
+        instance = self.run_with(PHONES[:1], ["G2 Basic"], timeout=1.0, bot={"holdForm": False})
+        self.assertEqual(instance.bookings, [])
+        self.assertFalse(any(item["submit"] for item in self.site.request_log))
+
+    def test_dry_run_with_no_seats_fills_the_form_in_without_sending_it(self):
+        self.site.seats[self.key("G2")] = 0
+        instance = run_bot(make_config(self.tmp, PHONES[:1], ["G2 Basic"]), self.url, self.out, dry_run=True,
+                           timeout=8)
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "dry-run")])
+        events = [item["event"] for item in self.site.request_log]
+        self.assertIn("txtDateOfBirth", events)
+        self.assertFalse(any(item["submit"] for item in self.site.request_log))
+
+    def test_schedule_wise_capacity_with_allocation_zero_is_sent(self):
+        """The live G1 schedule carries hdfTypeOfCapacitySheet ScheduleCourseWise with allocation 0."""
+        original_form, original_submit = mock_site.Handler.form, mock_site.Handler.submit
+        sent = []
+
+        def live_g1_allocation(handler, mobile, values, listed, invalid=(), alert=None):
+            body = original_form(handler, mobile, values, listed, invalid=invalid, alert=alert)
+            if values.get("__EVENTTARGET") not in ("ddlScheduleCourse", "ddlState", "txtDateOfBirth"):
+                return body
+            for name, replacement in (("hdfTypeOfCapacitySheet", "ScheduleCourseWise"),
+                                      ("hdfCapacitySheetAllocationId", "0")):
+                pattern = rf'(<input\b[^>]*\bname="{name}"[^>]*\bvalue=")[^"]*(")'
+                body = re.sub(pattern, rf'\g<1>{replacement}\2', body, count=1, flags=re.I)
+            return body
+
+        def accept(handler, mobile, v, files, listed, course, level, batch):
+            sent.append((v.get("hdfTypeOfCapacitySheet"), v.get("hdfCapacitySheetAllocationId")))
+            key = (v["ddlCourse"], v["ddlCourseLevel"], v["ddlScheduleCourse"])
+            v = dict(v, hdfTypeOfCapacitySheet="synthetic-shared",
+                     hdfCapacitySheetAllocationId="synthetic-" + "-".join(key))
+            return original_submit(handler, mobile, v, files, listed, course, level, batch)
+
+        with mock.patch.object(mock_site.Handler, "form", live_g1_allocation), \
+                mock.patch.object(mock_site.Handler, "submit", accept):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"])
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(sent, [("ScheduleCourseWise", "0")])
+
+    def test_listed_batch_without_seats_is_reported_as_full_not_unlisted(self):
+        self.site.seats[self.key("G2")] = 0
+        instance = self.run_with(PHONES[:1], ["G2 Basic"], timeout=1.5)
+        self.assertEqual(instance.bookings, [])
+        why = instance.blocked[0]["why"]
+        self.assertIn("has no seats right now", why)
+        self.assertNotIn("is not listed", why)
+
+    def test_site_typo_in_one_batch_year_still_books_that_batch(self):
+        for course in self.site.courses.values():
+            course["batches"] = [(value, text.replace("13 Feb 2027", "13 Feb 2026"), start, place)
+                                 for value, text, start, place in course["batches"]]
+        instance = self.run_with(PHONES[:1], ["G4 Basic"])
+        self.assertEqual(self.booked(instance), [("G4 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(self.applied(), [self.key("G4")])
+
+    def test_books_through_a_503_storm(self):
+        storm = random.Random(11)
+
+        def mostly_busy(method, page, values):
+            return storm.random() < 0.6
+
+        with mock.patch.object(mock_site.Handler, "_route", self.busy_route(mostly_busy)):
+            instance = self.run_with(PHONES[:2], ["G2 Basic", "G3 Basic"], timeout=40,
+                                     confirmation_handler=self.feedback_from_receipts)
+        self.assertEqual({x["target"]: x["phone"] for x in instance.bookings},
+                         {"G2 Basic": PHONES[0], "G3 Basic": PHONES[1]})
+        self.assertEqual(len(self.site.applications), 2)
+        self.assertTrue(instance.finished())
 
     def test_full_hinted_course_continues_to_later_compatible_course(self):
         original_id = self.key("G2")[0]
@@ -1170,6 +1681,15 @@ class EndToEnd(unittest.TestCase):
         self.assertNotIn(PHONES[2], self.site.used)
 
     def test_disappearing_slot_returns_with_its_primary_while_sibling_books(self):
+        g2_attempts = self._disappearing_slot_returns(hold=False)
+        self.assertEqual(g2_attempts, [PHONES[0], PHONES[0]])
+
+    def test_held_form_of_a_disappearing_slot_keeps_its_primary_while_sibling_books(self):
+        g2_attempts = self._disappearing_slot_returns(hold=True)
+        self.assertGreaterEqual(len(g2_attempts), 2)
+        self.assertEqual(set(g2_attempts), {PHONES[0]})
+
+    def _disappearing_slot_returns(self, hold):
         g2 = self.key("G2")
         self.site.seats[g2] = 0
         self.site.shown_seats[g2] = 4
@@ -1201,14 +1721,14 @@ class EndToEnd(unittest.TestCase):
 
         try:
             with mock.patch.object(mock_site.Handler, "submit", submit_then_hide):
-                instance = self.run_with(PHONES, ["G2 Basic", "G3 Basic"])
+                instance = self.run_with(PHONES, ["G2 Basic", "G3 Basic"], bot={"holdForm": hold})
         finally:
             if timer:
                 timer.cancel()
         self.assertEqual({x["target"]: x["phone"] for x in instance.bookings},
                          {"G2 Basic": PHONES[0], "G3 Basic": PHONES[1]})
-        self.assertEqual(g2_attempts, [PHONES[0], PHONES[0]])
         self.assertEqual(sibling_finished_before_return, [True])
+        return g2_attempts
         self.assertNotIn(PHONES[2], self.site.used)
 
     def test_seat_race_at_submit_keeps_retrying_same_number(self):
@@ -1261,7 +1781,8 @@ class EndToEnd(unittest.TestCase):
                 self.assertTrue(instance.finished())
                 self.assertEqual(self.site.applications[0]["mobile"], PHONES[0])
                 submit = next(item for item in self.site.request_log if item["submit"])
-                if name == "dob-format":
+                # holdForm sends a form that shows 0 seats anyway and lets the site decide
+                if name in ("dob-format", "seats"):
                     self.assertEqual(submit["sid"], changed_sid[0])
                 else:
                     self.assertNotEqual(submit["sid"], changed_sid[0])
@@ -1407,12 +1928,12 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
         self.assertEqual(len(attempts), 2)
         self.assertNotIn(PHONES[1], self.site.used)
+        # the refused final form is sent again as it is, in the same visit - no redoing every step
         submits = [(index, item) for index, item in enumerate(self.site.request_log) if item["submit"]]
         first_index, first_submit = submits[0]
         next_request = self.site.request_log[first_index + 1]
-        self.assertEqual((next_request["method"], next_request["page"]),
-                         ("GET", "admission_instructions.aspx"))
-        self.assertNotEqual(next_request["sid"], first_submit["sid"])
+        self.assertTrue(next_request["submit"])
+        self.assertEqual(next_request["sid"], first_submit["sid"])
 
     def test_used_primary_is_replaced_by_a_reserve(self):
         for style in ("label", "alert"):
@@ -1525,12 +2046,24 @@ class EndToEnd(unittest.TestCase):
                 self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
                 self.assertEqual(len(self.site.applications), 1)
 
-    def test_failed_success_page_requires_feedback(self):
-        self.site.fail_success_page = 1
+    def test_receipt_that_failed_to_load_is_loaded_again_without_resending_the_form(self):
+        self.site.fail_success_page = 2
+
+        def no_feedback(*args):
+            self.fail("a receipt that loads on a later try must not need feedback")
+
+        instance = self.run_with(PHONES[:1], ["G2 Basic"], confirmation_handler=no_feedback)
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(self.site.applications), 1)
+        self.assertEqual(sum(item["submit"] for item in self.site.request_log), 1)
+
+    def test_receipt_that_never_loads_requires_feedback(self):
+        self.site.fail_success_page = 10 ** 6
         instance = self.run_with(PHONES[:1], ["G2 Basic"],
                                  confirmation_handler=self.feedback_from_receipts)
         self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "user-confirmed")])
         self.assertEqual(len(self.site.applications), 1)
+        self.assertEqual(sum(item["submit"] for item in self.site.request_log), 1)
 
     def test_mixed_success_and_rejection_evidence_requires_feedback(self):
         cases = {
@@ -1610,11 +2143,13 @@ class EndToEnd(unittest.TestCase):
         def fail_once(handler, *args, **kwargs):
             attempts.append(1)
             if len(attempts) == 1:
-                return handler.send(503, mock_site.IIS_503)
+                return handler.send(503, mock_site.PROXY_503)
             return original(handler, *args, **kwargs)
+        asked = []
         with mock.patch.object(mock_site.Handler, "submit", fail_once):
             instance = self.run_with(PHONES[:2], ["G2 Basic"],
-                                     confirmation_handler=lambda *args: "not-booked")
+                                     confirmation_handler=lambda *args: asked.append(1) or "not-booked")
+        self.assertEqual(asked, [1])
         self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
         self.assertEqual(len(attempts), 2)
         self.assertNotIn(PHONES[1], self.site.used)
@@ -1691,38 +2226,28 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.site.requests, requests)
         self.assertEqual(len(self.site.applications), 1)
 
-    def test_direct_viewstate_error_after_commit_stays_pending_with_sibling_progress(self):
+    def test_direct_page_state_rejection_of_the_final_form_is_filled_in_again(self):
+        """ASP.NET checks the viewstate MAC and event validation before any of the page's own code runs,
+        so a final form answered directly with such an error was not processed - for example a form held
+        across an overnight app restart. It is filled in afresh instead of holding the choice for feedback."""
         original = mock_site.Handler.submit
-        attempts = []
+        rejected = []
 
-        def commit_then_viewstate_error(handler, mobile, values, files, listed, course, level, batch):
-            if mobile != PHONES[0]:
-                return original(handler, mobile, values, files, listed, course, level, batch)
-            attempts.append(mobile)
-            site = handler.site
-            key = (values["ddlCourse"], values["ddlCourseLevel"], values["ddlScheduleCourse"])
-            with site.lock:
-                site.seats[key] -= 1
-                site.used.add(mobile)
-                site.applications.append({"mobile": mobile, "course": key[0], "level": key[1],
-                                          "schedule": key[2], "files": [], "fileHashes": {}})
-            return handler.ysod("Validation of viewstate MAC failed.")
+        def reject_first_page_state(handler, mobile, values, files, listed, course, level, batch):
+            if not rejected:
+                rejected.append(handler.sid)
+                return handler.ysod("Validation of viewstate MAC failed.")
+            return original(handler, mobile, values, files, listed, course, level, batch)
 
-        with mock.patch.object(mock_site.Handler, "submit", commit_then_viewstate_error):
-            first = self.run_with(PHONES, ["G2 Basic", "G3 Basic"], timeout=0.8,
-                                  confirmation_handler=lambda *args: None)
-        self.assertEqual(self.booked(first), [("G3 Basic", PHONES[1], "confirmed")])
-        self.assertEqual(first.pending, {PHONES[0]: bot.target_key(first.targets[0])})
-        self.assertEqual(attempts, [PHONES[0]])
-        self.assertEqual(len(self.site.applications), 2)
-        self.assertNotIn(PHONES[2], self.site.used)
+        def no_feedback(*args):
+            self.fail("a rejected page state must not need feedback")
 
-        requests = self.site.requests
-        resumed = self.run_with(PHONES, ["G2 Basic", "G3 Basic"],
-                                confirmation_handler=lambda *args: "booked")
-        self.assertTrue(resumed.finished())
-        self.assertEqual(self.site.requests, requests)
-        self.assertEqual(len(self.site.applications), 2)
+        with mock.patch.object(mock_site.Handler, "submit", reject_first_page_state):
+            instance = self.run_with(PHONES[:1], ["G2 Basic"], confirmation_handler=no_feedback)
+        self.assertEqual(self.booked(instance), [("G2 Basic", PHONES[0], "confirmed")])
+        self.assertEqual(len(self.site.applications), 1)
+        booked_sid = [item["sid"] for item in self.site.request_log if item["submit"]][-1]
+        self.assertNotEqual(booked_sid, rejected[0])  # booked from a freshly filled form
 
     def test_repeated_viewstate_failures_restart_from_mobile_and_grow_backoff(self):
         original = mock_site.Handler.post_form
@@ -1755,23 +2280,26 @@ class EndToEnd(unittest.TestCase):
             self.assertNotEqual(next_request["sid"], failed_sid)
             cursor = index + 1
 
-    def test_discover_restarts_from_mobile_after_postback_failure(self):
+    def test_discover_resends_a_failed_postback_then_restarts_from_mobile_if_it_keeps_failing(self):
         original = mock_site.Handler.post_form
         failed = []
 
-        def fail_course_once(handler, session, query, values, files):
-            if values.get("__EVENTTARGET") == "ddlCourse" and not failed:
+        def fail_course_in_first_visit(handler, session, query, values, files):
+            if values.get("__EVENTTARGET") == "ddlCourse" and (not failed or handler.sid == failed[0]):
                 failed.append(handler.sid)
                 return handler.send(500, mock_site.YSOD)
             return original(handler, session, query, values, files)
 
         settings = bot.parse_settings(make_config(self.tmp, PHONES[:1], ["G2 Basic"]), None)[0]
         instance = bot.Bot(settings, self.out, base_url=self.url, dry_run=True, log=bot.Log(echo=False))
-        with mock.patch.object(mock_site.Handler, "post_form", fail_course_once):
+        with mock.patch.object(mock_site.Handler, "post_form", fail_course_in_first_visit):
             self.assertEqual(bot.run_discover(instance, PHONES[0]), 0)
-        failed_index = next(i for i, item in enumerate(self.site.request_log)
-                            if item["event"] == "ddlCourse" and item["sid"] == failed[0])
-        next_request = self.site.request_log[failed_index + 1]
+        # the site's own error page: the same postback is resent in the same visit a few times ...
+        self.assertEqual(failed, [failed[0]] * bot.STEP_APP_ERROR_TRIES)
+        last_failed = max(i for i, item in enumerate(self.site.request_log)
+                          if item["event"] == "ddlCourse" and item["sid"] == failed[0])
+        # ... and only then does the visit start over at mobile verification with a fresh cookie
+        next_request = self.site.request_log[last_failed + 1]
         self.assertEqual((next_request["method"], next_request["page"]),
                          ("GET", "admission_instructions.aspx"))
         self.assertNotEqual(next_request["sid"], failed[0])
@@ -2299,7 +2827,9 @@ class EndToEnd(unittest.TestCase):
                 self.site.sessions.clear()
                 self.site.viewstates.clear()
                 applicant = {"dateOfBirth": "15/05/2010"} if case == "minor-guardian" else {}
-                cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"], applicant=applicant)
+                # with holdForm a 0-seat form is ready to hold (test_dry_run_with_no_seats_...); without it, not
+                hold_off = {"bot": {"holdForm": False}} if case == "seats" else {}
+                cfg = make_config(self.tmp, PHONES[:1], ["G2 Basic"], applicant=applicant, **hold_off)
                 if case == "minor-guardian":
                     cfg["documents"]["parentSignature"] = "sign.jpg"
                 out = self.tmp / f"dry-unready-{case}"
