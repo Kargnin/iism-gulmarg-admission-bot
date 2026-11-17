@@ -48,6 +48,14 @@ The [official 2026–27 schedule](https://www.iismgulmarg.in/Courses_By_IISM.htm
 - IISM announced (Instagram) that online booking reopens on 17 November 2026 at 10:00 AM for a few seats vacated "due to non payment on time and multiple entries by some students"; first come, first served; payment within 12 hours of booking.
 - At 17:33 the admission form listed no courses at all, as before the 12 Nov opening.
 
+## Observed on 17 November 2026 (reopening)
+
+- The reopening was about 10 minutes late. The course list stayed empty until 10:07, then listed the Gulmarg course and its levels with no dates. From 10:10 the batches appeared one at a time (G1, then G2, G3, G4, G5 and G6 by 10:14), and every listed batch already showed its seats.
+- All of them were gone by 10:34. Snowboarding was offered in G1 and G4 only; in G2, G3, G5 and G6 the Snow Boarding level leaves `hdfCapacitySheetAllocationId` empty, so no final form can be built.
+- The success receipt is `AdmissionFormSuccess.aspx?Resp=Admission Form Submitted Successfully.`, reached by a redirect from the final POST, with the label "Admission Form submitted successfully, Payment details have been sent on your registered email. Please finish the payment process within 12 hours.!". The bot now accepts that wording; before, it held the booking as uncertain.
+- Several final forms came back as the unchanged form with only "Please change the mobile number." and `hdfAdmissionFormId` 0, so no application was created. A form opened the same way with another number booked at the same time, so the shortcut is not the cause. The site refuses those numbers, and the bot now treats the message as a used number and moves on to a reserve.
+- The server saves uploads as a timestamp to the second plus the uploaded file name. Two final forms uploading the same file name in the same second crashed one of them with HTTP 500 ("The process cannot access the file ... because it is being used by another process"). The bot judges that reply as uncertain.
+
 ## Unverified boundaries
 
 No real application or payment was submitted. A historical response supports accepting explicit successful-submission messaging without an application ID; exact current production success/duplicate/full responses remain unverified. Mock outcomes test possibilities and do not prove live behavior.

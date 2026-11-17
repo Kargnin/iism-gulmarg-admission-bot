@@ -1603,6 +1603,8 @@ class Resilience(unittest.TestCase):
 
         pure = {
             "used": ("This Mobile No. is already registered.", bot.PhoneUsed),
+            # live 17 Nov 2026: the unchanged form came back with only this message (hdfAdmissionFormId 0)
+            "change-mobile": ("Please change the mobile number.", bot.PhoneUsed),
             "full": ("Seat not available.", bot.TargetFull),
             "closed": ("Registration is closed.", bot.NotOpen),
         }
@@ -1643,6 +1645,25 @@ class Resilience(unittest.TestCase):
         result = session.judge_submit(page, instance.targets[0], None, None, set())
         self.assertEqual(result["applicationId"], "")
         self.assertIn("submitted successfully", result["message"])
+
+    def test_live_success_page_with_payment_deadline_is_a_booking(self):
+        """The receipt the live site served on 17 Nov 2026 after the final POST redirected to it - the bot
+        held it as uncertain because of the trailing payment-deadline sentence."""
+        instance = offline_bot()
+        session = bot.Session(instance, PHONES[0], "")
+        page = bot.Page(
+            "http://127.0.0.1:9/AdmissionFormSuccess.aspx?Resp=Admission%20Form%20Submitted%20Successfully.", 200,
+            '<form><input name="__VIEWSTATE" value="a"><span id="lblMsg" class="success_msg">'
+            'Admission Form submitted successfully, Payment details have been sent on your registered email. '
+            'Please finish the payment process within 12 hours.!</span>'
+            '<span class="text-success d-none">Payment details have been sent to your registered mail id. '
+            'Please finish the payment process within 24 hours.</span></form>',
+            redirects=("http://127.0.0.1:9/admission_form.aspx",))
+        result = session.judge_submit(page, instance.targets[0], None, None, set())
+        self.assertIn("submitted successfully", result["message"])
+        self.assertIsNone(bot.affirmative_success(
+            "admission form not submitted successfully, payment details have been sent on your registered email. "
+            "please finish the payment process within 12 hours.!"))
 
     def test_cancelled_http_client_starts_no_request(self):
         event = threading.Event()

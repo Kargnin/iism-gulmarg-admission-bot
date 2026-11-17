@@ -212,6 +212,9 @@ PHONE_USED_PHRASES = [
     "already registered", "already been registered", "already exist", "already submitted",
     "already been submitted", "already applied", "already been used", "already in use", "already used",
     "already taken", "duplicate mobile", "number already",
+    # live 17 Nov 2026: the final form came back unchanged (hdfAdmissionFormId still 0) with "Please change
+    # the mobile number." for six numbers while another number booked fine - the site refuses that number
+    "change the mobile number", "change your mobile number", "change mobile number",
 ]
 PERMANENT_MOBILE_REFUSAL_PHRASES = [
     "enter valid mobile", "invalid mobile", "mobile no is invalid", "mobile number is invalid",
@@ -258,7 +261,10 @@ CONFLICT_ONLY_COMPLETION_PATTERNS = (
 COMPLETION_EVIDENCE_PATTERNS = AFFIRMATIVE_OUTCOME_PATTERNS + CONFLICT_ONLY_COMPLETION_PATTERNS
 AFFIRMATIVE_RECEIPT_SUFFIX = (
     r"(?:(?:,\s*|\.\s+)payment\s+(?:details|link)\s+(?:has|have)\s+been\s+sent"
-    r"(?:\s+(?:to|on)\s+(?:your\s+)?(?:registered\s+)?(?:email|email\s+id))?)?\.?"
+    r"(?:\s+(?:to|on)\s+(?:your\s+)?(?:registered\s+)?(?:email|email\s+id|mail\s+id))?"
+    # live 17 Nov 2026 (AdmissionFormSuccess.aspx): "Admission Form submitted successfully, Payment details
+    # have been sent on your registered email. Please finish the payment process within 12 hours.!"
+    r"(?:\.\s*please\s+(?:finish|complete)\s+the\s+payment(?:\s+process)?\s+within\s+\d+\s+hours)?)?[.!]*"
 )
 AGE_PHRASES = ["age allow", "not eligible", "age should", "age must", "age limit", "invalid date"]
 
